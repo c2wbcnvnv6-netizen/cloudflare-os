@@ -24,7 +24,6 @@
 // Usage: node scripts/release/promote-release.mjs --release-id <id>
 
 import { pathToFileURL } from "node:url";
-import { AwsClient } from "aws4fetch";
 
 /** The CI run number of an `r<run#>-<sha>` release id, or null for any other id shape
  *  (dev-<ts> releases carry no ordering claim). */
@@ -51,6 +50,21 @@ function requireEnv(name) {
   return value;
 }
 
+// Canonical workspace SigV4 R2 client (aws4fetch retired). Relative import of
+// the sibling stt-engine checkout, loaded lazily so this module stays
+// importable where that checkout is absent — release-promote.test.js pulls
+// ciRunNumber/supersededBy from here with no R2 access in this repo's CI.
+async function loadR2() {
+  try {
+    return await import("../../../stt-engine/src/r2.js");
+  } catch (err) {
+    throw new Error(
+      "cannot load ../../../stt-engine/src/r2.js — these release scripts expect " +
+      `a sibling stt-engine checkout next to this repo: ${err.message}`,
+      { cause: err });
+  }
+}
+
 function parseArgs(argv) {
   const args = { releaseId: undefined };
   for (let i = 0; i < argv.length; i++) {
@@ -61,24 +75,13 @@ function parseArgs(argv) {
   return args;
 }
 
-// Key names only (paginated ListObjectsV2, 1000 keys per round trip); manifest bodies are
-// never fetched.
-async function listPublishedReleaseIds(client, keyUrl) {
+// Key names only (paginated ListObjectsV2); manifest bodies are never fetched.
+async function listPublishedReleaseIds(r2) {
   const ids = [];
-  let token;
-  do {
-    const params = new URLSearchParams({ "list-type": "2", prefix: "releases/" });
-    if (token) params.set("continuation-token", token);
-    const response = await client.fetch(`${keyUrl("")}?${params}`, { method: "GET" });
-    if (!response.ok) {
-      throw new Error(`ListObjectsV2: ${response.status} ${await response.text()}`);
-    }
-    const xml = await response.text();
-    for (const match of xml.matchAll(/<Key>releases\/([^<]+)\/manifest\.json<\/Key>/g)) {
-      ids.push(match[1]);
-    }
-    token = /<NextContinuationToken>([^<]+)<\/NextContinuationToken>/.exec(xml)?.[1];
-  } while (token);
+  for (const obj of await r2.listObjects("releases/")) {
+    const match = /^releases\/([^/]+)\/manifest\.json$/.exec(obj.key);
+    if (match) ids.push(match[1]);
+  }
   return ids;
 }
 
@@ -86,37 +89,35 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const endpoint = requireEnv("R2_ENDPOINT").replace(/\/$/, "");
   const bucket = requireEnv("R2_BUCKET");
-  const client = new AwsClient({
+  const { R2Client, R2Error } = await loadR2();
+  const r2 = new R2Client({
+    endpoint,
+    bucket,
     accessKeyId: requireEnv("R2_ACCESS_KEY_ID"),
     secretAccessKey: requireEnv("R2_SECRET_ACCESS_KEY"),
-    service: "s3",
-    region: "auto",
   });
-  const keyUrl = (key) => `${endpoint}/${bucket}/${key}`;
 
   const publishedKey = `releases/${args.releaseId}/manifest.json`;
   const candidateKey = `candidates/${args.releaseId}/manifest.json`;
 
-  const publishedHead = await client.fetch(keyUrl(publishedKey), { method: "HEAD" });
-  if (publishedHead.status === 200) {
+  // headObject: falsy on 404, throws R2Error on any other failure.
+  if (await r2.headObject(publishedKey)) {
     console.log(`already promoted: ${publishedKey}`);
     return;
   }
-  if (publishedHead.status !== 404) {
-    throw new Error(`HEAD ${publishedKey}: unexpected status ${publishedHead.status}`);
+
+  let manifestBody;
+  try {
+    manifestBody = await r2.getObject(candidateKey);
+  } catch (err) {
+    if (err instanceof R2Error && err.status === 404) {
+      throw new Error(`candidate not found: ${candidateKey} — was the release uploaded ` +
+        "with --candidate?", { cause: err });
+    }
+    throw err;
   }
 
-  const candidate = await client.fetch(keyUrl(candidateKey), { method: "GET" });
-  if (candidate.status === 404) {
-    throw new Error(`candidate not found: ${candidateKey} — was the release uploaded ` +
-      "with --candidate?");
-  }
-  if (!candidate.ok) {
-    throw new Error(`GET ${candidateKey}: ${candidate.status} ${await candidate.text()}`);
-  }
-  const manifestBody = new Uint8Array(await candidate.arrayBuffer());
-
-  const superseder = supersededBy(args.releaseId, await listPublishedReleaseIds(client, keyUrl));
+  const superseder = supersededBy(args.releaseId, await listPublishedReleaseIds(r2));
   if (superseder) {
     console.warn(`WARNING: not promoting ${args.releaseId} — a newer release ` +
       `(${superseder}) is already published; promoting now would roll the deploy ` +
@@ -125,28 +126,17 @@ async function main() {
   }
 
   // Server-side CopyObject first (no second body transfer); the buffered GET above doubles as
-  // the fallback PUT body if the copy path is ever unavailable.
-  const copy = await client.fetch(keyUrl(publishedKey), {
-    method: "PUT",
-    headers: {
-      "x-amz-copy-source": `/${bucket}/${candidateKey}`,
-      "Content-Type": "application/json",
-    },
-  });
-  // S3 copies can answer 200 with an error document; a real copy answers with CopyObjectResult.
-  if (copy.ok && (await copy.text()).includes("<CopyObjectResult")) {
+  // the fallback PUT body if the copy path is ever unavailable. Only an R2Error falls back —
+  // a network-level failure propagates, exactly as a failed fetch did before.
+  try {
+    await r2.copyObject(publishedKey, candidateKey);
     console.log(`promoted (copy): ${candidateKey} -> ${publishedKey}`);
     return;
+  } catch (err) {
+    if (!(err instanceof R2Error)) throw err;
+    console.warn(`CopyObject unavailable (${err.message}); falling back to PUT`);
   }
-  console.warn(`CopyObject unavailable (status ${copy.status}); falling back to PUT`);
-  const put = await client.fetch(keyUrl(publishedKey), {
-    method: "PUT",
-    body: manifestBody,
-    headers: { "Content-Type": "application/json" },
-  });
-  if (!put.ok) {
-    throw new Error(`PUT ${publishedKey}: ${put.status} ${await put.text()}`);
-  }
+  await r2.putObject(publishedKey, manifestBody, "application/json");
   console.log(`promoted (put): ${candidateKey} -> ${publishedKey}`);
 }
 

@@ -17,7 +17,6 @@
 
 import { readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { AwsClient } from "aws4fetch";
 import { assetR2Key, moduleR2Key } from "./manifest-lib.mjs";
 
 const UPLOAD_CONCURRENCY = 8;
@@ -26,6 +25,27 @@ function requireEnv(name) {
   const value = process.env[name];
   if (!value) throw new Error(`missing required environment variable: ${name}`);
   return value;
+}
+
+// Canonical workspace SigV4 R2 client (aws4fetch retired). Relative import of
+// the sibling stt-engine checkout, not a package dep; loaded lazily so this
+// module stays importable where that checkout is absent.
+async function r2Client(endpoint, bucket) {
+  let R2Client;
+  try {
+    ({ R2Client } = await import("../../../stt-engine/src/r2.js"));
+  } catch (err) {
+    throw new Error(
+      "cannot load ../../../stt-engine/src/r2.js — these release scripts expect " +
+      `a sibling stt-engine checkout next to this repo: ${err.message}`,
+      { cause: err });
+  }
+  return new R2Client({
+    endpoint,
+    bucket,
+    accessKeyId: requireEnv("R2_ACCESS_KEY_ID"),
+    secretAccessKey: requireEnv("R2_SECRET_ACCESS_KEY"),
+  });
 }
 
 function parseArgs(argv) {
@@ -43,13 +63,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const endpoint = requireEnv("R2_ENDPOINT").replace(/\/$/, "");
   const bucket = requireEnv("R2_BUCKET");
-  const client = new AwsClient({
-    accessKeyId: requireEnv("R2_ACCESS_KEY_ID"),
-    secretAccessKey: requireEnv("R2_SECRET_ACCESS_KEY"),
-    service: "s3",
-    region: "auto",
-  });
-  const keyUrl = (key) => `${endpoint}/${bucket}/${key}`;
+  const r2 = await r2Client(endpoint, bucket);
 
   const manifest = JSON.parse(readFileSync(join(args.release, "manifest.json"), "utf8"));
 
@@ -71,21 +85,12 @@ async function main() {
     for (;;) {
       const blob = queue.shift();
       if (!blob) return;
-      const head = await client.fetch(keyUrl(blob.key), { method: "HEAD" });
-      if (head.status === 200) {
+      // headObject: null on 404 (upload below), throws on any other failure.
+      if (await r2.headObject(blob.key)) {
         skipped++;
         continue;
       }
-      if (head.status !== 404) {
-        throw new Error(`HEAD ${blob.key}: unexpected status ${head.status}`);
-      }
-      const put = await client.fetch(keyUrl(blob.key), {
-        method: "PUT",
-        body: readFileSync(blob.path),
-      });
-      if (!put.ok) {
-        throw new Error(`PUT ${blob.key}: ${put.status} ${await put.text()}`);
-      }
+      await r2.putObject(blob.key, readFileSync(blob.path));
       uploaded++;
     }
   }
@@ -94,14 +99,7 @@ async function main() {
 
   const manifestKey =
     `${args.candidate ? "candidates" : "releases"}/${manifest.releaseId}/manifest.json`;
-  const put = await client.fetch(keyUrl(manifestKey), {
-    method: "PUT",
-    body: readFileSync(join(args.release, "manifest.json")),
-    headers: { "Content-Type": "application/json" },
-  });
-  if (!put.ok) {
-    throw new Error(`PUT ${manifestKey}: ${put.status} ${await put.text()}`);
-  }
+  await r2.putObject(manifestKey, readFileSync(join(args.release, "manifest.json")), "application/json");
   console.log(args.candidate
     ? `candidate uploaded (not yet visible to the deploy service): ${manifestKey}`
     : `release complete: ${manifestKey}`);
