@@ -39,3 +39,7 @@ wrangler.dev.jsonc
 .dev.vars.*
 **/.dev.vars
 **/.dev.vars.*
+
+# secrets — never commit (added 2026-09-26 security pass)
+keyway.json
+.env.production.local
