@@ -62,9 +62,13 @@ function getBackendHost(): string {
   const backendHost = import.meta.env.VITE_BACKEND_HOST?.trim();
   if (backendHost) return backendHost;
 
-  // When opening the Vite dev server directly (localhost:3000), the backend is at localhost:8787.
-  // Otherwise, the API is on the same host as the frontend.
-  return window.location.hostname === 'localhost' ? 'localhost:8787' : window.location.host;
+  // Vite dev client (port 3000) talks to the wrangler backend (default 8787).
+  // When run-local serves the built frontend from the same origin as the API, use that host:port
+  // (e.g. localhost:8797). Never hardcode 8787 for all localhost — that hits unrelated services.
+  if (window.location.port === '3000') {
+    return 'localhost:8787';
+  }
+  return window.location.host;
 }
 
 function startConnection(): RpcStub<PublicApi> {
