@@ -2633,7 +2633,7 @@ function tabSnapshot(tabId: string, title: string) {
   return {
     tabId, title, index: 0, nestingLevel: 0,
     markdown: "shared\n", sourceMap: { blocks: [], protectedRanges: [] }, bodyEndIndex: 8,
-    images: [], styles: { named: {}, paragraphs: [] }, committedWriteIds: [],
+    images: [], styles: { named: {}, paragraphs: [], runLooks: [], tables: [] }, committedWriteIds: [],
   };
 }
 
