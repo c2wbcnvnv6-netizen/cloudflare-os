@@ -11,7 +11,7 @@ import {
 import { ActionJournal } from "@gadgets/gatekeeper-kit/actions";
 import {
   GoogleDocSession, DocMetadata, type GoogleDocEditSession, type DocCommentOptions, type DocSuggestEditOptions,
-  type GoogleDocReadSession, type GoogleDocTab,
+  type GoogleDocPendingChange, type GoogleDocPendingChanges, type GoogleDocReadSession, type GoogleDocTab,
 } from "./docs-types";
 import {
   DOC_COMMENT_ACTIONS, DocCommentSession, docsThreads, type DocCommentQueue,
@@ -48,7 +48,7 @@ import {
   ADD_DOCUMENT_TAB_ACTION, adoptedGoogleDocTabId, assertGoogleDocActionMarkdownSize,
   describeDocEdit, DOC_ADDED_TABS_KEY, DOC_METADATA_REVISION_KEY, DOC_SNAPSHOT_KEY,
   DOC_SNAPSHOT_TTL_MS, DOC_WRITE_RECEIPT_KEY, docDefinition, EDIT_DOCUMENT_ACTION,
-  findUniqueMarkdown, GoogleDocAction, GoogleDocAddTabAction, GoogleDocMetadataRevision,
+  findUniqueMarkdown, GoogleDocAction, googleDocActionCommitted, GoogleDocAddTabAction, GoogleDocMetadataRevision,
   GoogleDocPendingAction, googleDocPendingFingerprint, googleDocRevisionUnchanged,
   googleDocSimulatedContent, GoogleDocSimulatedContent, GoogleDocSimulation,
   GoogleDocSimulationCacheHolder, GoogleDocSnapshot, googleDocSnapshot, googleDocTabLabel,
@@ -788,7 +788,7 @@ export class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession 
    */
   #simulate(
     snapshot: GoogleDocSnapshot, tabId: string | undefined,
-    operation: "getContent" | "replaceText" | "appendText",
+    operation: "getContent" | "getPendingChanges" | "replaceText" | "appendText",
   ): GoogleDocSelectedContent {
     let { tabs, contentByTabId } = this.#replay(snapshot);
     let tab = resolveGoogleDocTab({ ...snapshot, tabs }, this.#simulatedTabId(tabs, tabId), operation);
@@ -930,6 +930,43 @@ export class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession 
         : `Read the current content of tab ${googleDocTabLabel(result.tab)} as Markdown.`,
     }));
     return selected.markdown;
+  }
+
+  async getPendingChanges(tabId?: string): Promise<GoogleDocPendingChanges> {
+    await this.#changes.afterTurns();
+    let { changes } = await this.#readDocument(async snapshot => {
+      try {
+        return await this.#settled(snapshot, taken => {
+          let { tab, markdown } = this.#simulate(taken, tabId, "getPendingChanges");
+          let adopted = (id: string | undefined) => this.#changes.adoptedTabId(id);
+          // Listed after the replay above, which is what marks an edit that no longer fits.
+          let listed = this.#changes.pending().flatMap(({ id, action }): GoogleDocPendingChange[] => {
+            // An added tab reads as saved and empty, and every edit to it is listed.
+            if (action.type === "addTab" || adopted(action.tabId) !== adopted(tab.tabId)) return [];
+            // Its write landed though the response was lost, so the saved content already holds it.
+            if (googleDocActionCommitted(taken, action)) return [];
+            let stale = action.invalidatedReason ? { stale: true as const } : {};
+            return [action.type === "replaceText"
+              ? { id, ...stale, type: action.type,
+                  oldMarkdown: action.oldMarkdown, newMarkdown: action.newMarkdown }
+              : { id, ...stale, type: action.type, markdown: action.markdown }];
+          });
+          return { tab, changes: { savedMarkdown: tab.markdown, markdown, changes: listed } };
+        });
+      } catch (error) {
+        return new ReadFailure(error);
+      }
+    }, ({ tab }) => ({
+      title: "Read Google Doc pending changes",
+      description:
+        `Read the saved and simulated content of tab ${googleDocTabLabel(tab)} as Markdown, ` +
+        `with its pending changes.`,
+    }), {
+      // As in getContent(), the error says whether that tab exists.
+      title: "Read Google Doc pending changes",
+      description: "Read the pending changes of one tab of the document.",
+    });
+    return changes;
   }
 
   async replaceText(oldMarkdown: string, newMarkdown: string, tabId?: string): Promise<void> {
