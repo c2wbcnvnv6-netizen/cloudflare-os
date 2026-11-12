@@ -9,6 +9,7 @@ import {
   GatekeeperUserVerifier, Gatekeeper, ResourceDescription, ApprovalQueue, ActionKind, GitCache,
 } from '@gadgets/workshop-shared/gatekeeper';
 import { ActionJournal } from "@gadgets/gatekeeper-kit/actions";
+import type { UiBundle } from "@gadgets/workshop-shared/api";
 import {
   GoogleDocSession, DocMetadata, type GoogleDocEditSession, type DocCommentOptions, type DocSuggestEditOptions,
   type GoogleDocPendingChange, type GoogleDocPendingChanges, type GoogleDocReadSession, type GoogleDocTab,
@@ -35,6 +36,7 @@ import { verifyGoogleSubresourceAccess, type GoogleVerifierApi } from "./google-
 import DOCS_READ_TYPES_CODE from "./docs-read-types.txt";
 import DOCS_TYPES_CODE from "./docs-types.txt";
 import COMMENT_TYPES_CODE from "./comment-types.txt";
+import DOCS_PREVIEW_CLIENT from "./docs-preview-client.txt";
 import { obsContext } from "./observability.js";
 import { AccessTokenCache, AccessTokenRequest } from "./auth-retry";
 import { Mutex } from "./mutex";
@@ -230,6 +232,7 @@ export class GoogleDocGatekeeperImpl
         snippet: `Google Doc: ${title} (not created yet)`,
         suggestedBindingName: "GOOGLE_DOC",
         tsType: "GoogleDocSession",
+        hasPreview: true,
       };
     }
     let api = new GoogleDocsApi(opts => this.#getAccessToken(opts));
@@ -245,11 +248,16 @@ export class GoogleDocGatekeeperImpl
       snippet: `Google Doc: ${doc.title}`,
       suggestedBindingName: "GOOGLE_DOC",
       tsType: "GoogleDocSession",
+      hasPreview: true,
     };
   }
 
   async getTypeScriptTypes(): Promise<string> {
     return getGoogleDocTypesCode();
+  }
+
+  async getPreviewUi(): Promise<UiBundle> {
+    return { jsCode: DOCS_PREVIEW_CLIENT };
   }
 
   async getAutoApprovableActions(): Promise<ActionKind[]> {
