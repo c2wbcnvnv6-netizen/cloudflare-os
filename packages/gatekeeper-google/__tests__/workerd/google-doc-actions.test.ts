@@ -2276,7 +2276,7 @@ describe("Google Doc images", () => {
       { id: "photo", width: 120, height: 80, readable: true },
       { id: "sketch", width: 120, height: 80, readable: false },
     ]);
-    expect(read).toEqual([{ mimeType: "image/png", size: 14, text: "bytes of photo" }]);
+    expect(read).toEqual([{ mimeType: "image/png", text: "bytes of photo" }]);
     expect(await hooks().lastObservations).toEqual([LISTED]);
   });
 
@@ -2287,7 +2287,7 @@ describe("Google Doc images", () => {
 
     let { read } = await hooks().readImages("images-unlisted", ["photo"], false);
 
-    expect(read).toEqual([{ mimeType: "image/png", size: 14, text: "bytes of photo" }]);
+    expect(read).toEqual([{ mimeType: "image/png", text: "bytes of photo" }]);
     expect(await hooks().lastObservations)
       .toEqual([`Read an image in tab "Main" (${MAIN_TAB}).`]);
   });
@@ -2315,7 +2315,7 @@ describe("Google Doc images", () => {
 
     let { read } = await hooks().readImages("images-lapsed", ["photo"], true);
 
-    expect(read).toEqual([{ mimeType: "image/png", size: 14, text: "bytes of photo" }]);
+    expect(read).toEqual([{ mimeType: "image/png", text: "bytes of photo" }]);
     expect(docs.documentFetches).toBe(2);
     expect(docs.imageFetches).toBe(2);
   });
