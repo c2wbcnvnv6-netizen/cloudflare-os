@@ -14,6 +14,8 @@ import {
   GitBranch,
   Pulse,
   UserPlus,
+  FileText,
+  ArrowSquareOut,
   type Icon,
 } from '@phosphor-icons/react'
 import { RpcStub, RpcTarget } from 'capnweb'
@@ -70,6 +72,8 @@ import { logRpcFailure } from './rpcErrors'
 import TopBarNotice from './TopBarNotice'
 import { WorkshopButton, WorkshopIconButton, WorkshopInput } from './components/WorkshopControls'
 import { useActionEntries, useActions } from './useActions'
+import { ConnectionPreviewPane } from './features/connection-preview/ConnectionPreviewPane'
+import type { ConnectionPreview } from './features/connection-preview/connectionPreview'
 import DeleteConfirmationDialog from './components/DeleteConfirmationDialog'
 import ReconnectingChip from './components/ReconnectingChip'
 import WorkspaceOpenErrorPage from './components/WorkspaceOpenErrorPage'
@@ -563,6 +567,9 @@ export default function GadgetEditor() {
   const activityReturnViewRef = useRef<WorkspaceView | null>(null)
   const [activityView, setActivityView] = useState<ActivityView>('history')
   const [activityClosing, setActivityClosing] = useState(false)
+  // SPIKE: a connection preview borrows the Activity pane's open and close handling, and shows
+  // in its place.
+  const [connectionPreview, setConnectionPreview] = useState<ConnectionPreview | null>(null)
   const [shareModalOpen, setShareModalOpen] = useState(false)
   // The gadget the share dialog shares, or null when it invites people to the whole workspace.
   const [sharedGadgetId, setSharedGadgetId] = useState<WorkpieceId | null>(null)
@@ -1041,8 +1048,14 @@ export default function GadgetEditor() {
     setActivityClosing(false)
     if (workspaceView?.mode !== 'activity') activityReturnViewRef.current = workspaceView
     setActivityView(initialView)
+    setConnectionPreview(null)
     setWorkspaceView({ mode: 'activity' })
   }, [workspaceView])
+
+  const openConnectionPreview = useCallback((preview: ConnectionPreview) => {
+    openActivity(activityView)
+    setConnectionPreview(preview)
+  }, [openActivity, activityView])
 
   const closeWorkspacePane = useCallback(() => {
     if (workspaceView?.mode !== 'activity') {
@@ -2113,7 +2126,9 @@ export default function GadgetEditor() {
             style={{ height: TABBAR_H }}
           >
             <div className="flex min-w-0 flex-1 items-center overflow-hidden">
-              {paneShowsActivity ? (
+              {paneShowsActivity && connectionPreview ? (
+                <PaneLabel icon={FileText} title={connectionPreview.title} />
+              ) : paneShowsActivity ? (
                 <PaneLabel icon={Pulse} title="Activity" />
               ) : visibleWorkpieces.length > 1 ? (
                 <PaneWorkpieceTabs
@@ -2142,7 +2157,18 @@ export default function GadgetEditor() {
             </div>
 
             <div className="flex flex-shrink-0 items-center gap-1.5">
-              <div className="flex items-center rounded-lg border border-kumo-line p-0.5">
+              {paneShowsActivity && connectionPreview?.url && (
+                <a
+                  href={connectionPreview.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-1 rounded-lg px-2 py-1 text-[13px] font-medium text-kumo-default hover:bg-kumo-tint"
+                >
+                  Open in Docs
+                  <ArrowSquareOut size={14} />
+                </a>
+              )}
+              <div className={paneShowsActivity && connectionPreview ? 'hidden' : 'flex items-center rounded-lg border border-kumo-line p-0.5'}>
                 {paneShowsActivity
                   ? ACTIVITY_TABS.map(tab => (
                     <PaneTab
@@ -2209,7 +2235,7 @@ export default function GadgetEditor() {
           </div>
 
           <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-            {paneShowsActivity && (
+            {paneShowsActivity && !connectionPreview && (
               <div className="flex h-11 items-center gap-1 overflow-x-auto border-b border-kumo-line px-2 md:hidden">
                 {ACTIVITY_TABS.map(tab => (
                   <PaneTab
@@ -2222,7 +2248,17 @@ export default function GadgetEditor() {
                 ))}
               </div>
             )}
-            {paneShowsActivity && (
+            {paneShowsActivity && connectionPreview && overseer && (
+              <div className="min-h-0 flex-1">
+                <ConnectionPreviewPane
+                  key={connectionPreview.gatekeeperId}
+                  overseer={overseer.stub}
+                  preview={connectionPreview}
+                  restricted={metadata?.containsRestrictedData === true}
+                />
+              </div>
+            )}
+            {paneShowsActivity && !connectionPreview && (
               <div className="min-h-0 flex-1">
                 <Activity
                   overseer={overseer.stub}
