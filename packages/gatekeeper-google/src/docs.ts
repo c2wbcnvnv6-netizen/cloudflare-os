@@ -12,7 +12,7 @@ import { ActionJournal } from "@gadgets/gatekeeper-kit/actions";
 import type { UiBundle } from "@gadgets/workshop-shared/api";
 import {
   GoogleDocSession, DocMetadata, type GoogleDocEditSession, type DocCommentOptions, type DocSuggestEditOptions,
-  type GoogleDocImage, type GoogleDocImageBytes,
+  type GoogleDocImage, type GoogleDocImageBytes, type GoogleDocStyles,
   type GoogleDocPendingChange, type GoogleDocPendingChanges, type GoogleDocReadSession, type GoogleDocTab,
 } from "./docs-types";
 import {
@@ -1031,16 +1031,29 @@ export class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession 
     return changes;
   }
 
-  /** The tab an image read names: one Google has saved, or an added one, empty until it is. */
-  #imageTab(
-    snapshot: GoogleDocSnapshot, tabId: string | undefined, operation: "listImages" | "readImage",
+  /** The tab a read of what is saved names: one Google has, or an added one, empty until it is. */
+  #savedTab(
+    snapshot: GoogleDocSnapshot, tabId: string | undefined,
+    operation: "getStyles" | "listImages" | "readImage",
   ): GoogleDocTabSnapshot {
     let { tabs } = this.#replay(snapshot);
     return resolveGoogleDocTab({ ...snapshot, tabs }, this.#simulatedTabId(tabs, tabId), operation);
   }
 
+  async getStyles(tabId?: string): Promise<GoogleDocStyles> {
+    let tab = await this.#readSettled(taken => this.#savedTab(taken, tabId, "getStyles"), tab => ({
+      title: "Read Google Doc styles",
+      description: `Read the styles of tab ${googleDocTabLabel(tab)}.`,
+    }), {
+      // As in getContent(), the error says whether that tab exists.
+      title: "Read Google Doc styles",
+      description: "Read the styles of one tab of the document.",
+    });
+    return tab.styles;
+  }
+
   async listImages(tabId?: string): Promise<GoogleDocImage[]> {
-    let tab = await this.#readSettled(taken => this.#imageTab(taken, tabId, "listImages"), tab => ({
+    let tab = await this.#readSettled(taken => this.#savedTab(taken, tabId, "listImages"), tab => ({
       title: "Read Google Doc images",
       description: `Read the images in tab ${googleDocTabLabel(tab)}.`,
     }), DOC_IMAGES_OBSERVATION);
@@ -1051,7 +1064,7 @@ export class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession 
   }
 
   async readImage(imageId: string, tabId?: string): Promise<GoogleDocImageBytes> {
-    let find = (snapshot: GoogleDocSnapshot) => this.#imageTab(snapshot, tabId, "readImage");
+    let find = (snapshot: GoogleDocSnapshot) => this.#savedTab(snapshot, tabId, "readImage");
     // listImages() has already reported reading this tab's images; a read without it reports here.
     let tab = this.#listedImages.has(`${tabId}\u0000${imageId}`)
       ? await this.#settled(() => this.#source.snapshot(), find)
