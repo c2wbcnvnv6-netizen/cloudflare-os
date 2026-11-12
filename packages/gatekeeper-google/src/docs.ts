@@ -12,6 +12,7 @@ import { ActionJournal } from "@gadgets/gatekeeper-kit/actions";
 import type { UiBundle } from "@gadgets/workshop-shared/api";
 import {
   GoogleDocSession, DocMetadata, type GoogleDocEditSession, type DocCommentOptions, type DocSuggestEditOptions,
+  type GoogleDocImage, type GoogleDocImageBytes,
   type GoogleDocPendingChange, type GoogleDocPendingChanges, type GoogleDocReadSession, type GoogleDocTab,
 } from "./docs-types";
 import {
@@ -597,6 +598,11 @@ function noDocChanges(): DocChangeQueue {
 export type DocSource = {
   /** The document to replay pending edits over. */
   snapshot(): Promise<GoogleDocSnapshot>;
+  /**
+   * The document read from Google again, for an image address in the last snapshot that lapsed.
+   * Absent on a source that keeps no snapshot.
+   */
+  refetched?(): Promise<GoogleDocSnapshot>;
   /** Called with the snapshot of every read once that read is authorized. */
   approved(snapshot: GoogleDocSnapshot): void;
   /** The document's title and modification time, before pending edits move the time. */
@@ -610,6 +616,39 @@ const DOC_CONTENT_OBSERVATION: NativeObservation = {
   title: "Read Google Doc content",
   description: "Read the content of one tab of the document.",
 };
+
+/** What a failed read of a tab's images says it read. */
+const DOC_IMAGES_OBSERVATION: NativeObservation = {
+  title: "Read Google Doc images",
+  description: "Read the images of one tab of the document.",
+};
+
+const DOC_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const MAX_DOC_IMAGE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Open the image Google serves at `contentUri`, or return undefined when it no longer serves it:
+ * the address lasts minutes, and a snapshot can outlive it.
+ */
+async function openGoogleDocImage(contentUri: string): Promise<GoogleDocImageBytes | undefined> {
+  let url = new URL(contentUri);
+  if (url.protocol !== "https:" || !/(^|\.)(google|googleusercontent)\.com$/.test(url.hostname)) {
+    throw new Error("Google Docs returned an image address outside Google");
+  }
+  let response = await fetch(url);
+  let refuse = async (reason: string | undefined) => {
+    await response.body?.cancel().catch(() => undefined);
+    if (reason) throw new Error(`readImage: ${reason}`);
+    return undefined;
+  };
+  if (!response.ok || !response.body) return refuse(undefined);
+  let mimeType = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() ?? "";
+  if (!DOC_IMAGE_TYPES.has(mimeType)) return refuse("this image's format cannot be read.");
+  // Google states an image's length; without it nothing bounds what the stream would carry.
+  let size = Number(response.headers.get("content-length") ?? NaN);
+  if (!(size <= MAX_DOC_IMAGE_BYTES)) return refuse("this image is larger than 10 MB.");
+  return { mimeType, size, content: response.body };
+}
 
 /** What a read of the tab list says it read. */
 const DOC_TABS_OBSERVATION: NativeObservation = {
@@ -657,6 +696,8 @@ export class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession 
   #changes: DocChangeQueue;
   #source: DocSource;
   #comments: DocCommentSession | undefined;
+  /** The images listImages() has returned, as the tab ID it was called with and image ID. */
+  #listedImages = new Set<string>();
 
   constructor(options: GoogleDocSessionOptions) {
     super();
@@ -741,6 +782,24 @@ export class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession 
     if (used) this.#source.approved(used);
     if (value instanceof ReadFailure) throw value.error;
     return value;
+  }
+
+  /**
+   * {@link #readDocument} of what `use` makes of the settled snapshot, behind the writes called
+   * before it. A refusal `use` throws is authorized as `failed`, since it says something of a tab.
+   */
+  async #readSettled<T>(
+    use: (snapshot: GoogleDocSnapshot) => T, observe: (value: T) => NativeObservation,
+    failed: NativeObservation,
+  ): Promise<T> {
+    await this.#changes.afterTurns();
+    return this.#readDocument(async snapshot => {
+      try {
+        return await this.#settled(snapshot, use);
+      } catch (error) {
+        return new ReadFailure(error);
+      }
+    }, observe, failed);
   }
 
   /**
@@ -941,29 +1000,22 @@ export class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession 
   }
 
   async getPendingChanges(tabId?: string): Promise<GoogleDocPendingChanges> {
-    await this.#changes.afterTurns();
-    let { changes } = await this.#readDocument(async snapshot => {
-      try {
-        return await this.#settled(snapshot, taken => {
-          let { tab, markdown } = this.#simulate(taken, tabId, "getPendingChanges");
-          let adopted = (id: string | undefined) => this.#changes.adoptedTabId(id);
-          // Listed after the replay above, which is what marks an edit that no longer fits.
-          let listed = this.#changes.pending().flatMap(({ id, action }): GoogleDocPendingChange[] => {
-            // An added tab reads as saved and empty, and every edit to it is listed.
-            if (action.type === "addTab" || adopted(action.tabId) !== adopted(tab.tabId)) return [];
-            // Its write landed though the response was lost, so the saved content already holds it.
-            if (googleDocActionCommitted(taken, action)) return [];
-            let stale = action.invalidatedReason ? { stale: true as const } : {};
-            return [action.type === "replaceText"
-              ? { id, ...stale, type: action.type,
-                  oldMarkdown: action.oldMarkdown, newMarkdown: action.newMarkdown }
-              : { id, ...stale, type: action.type, markdown: action.markdown }];
-          });
-          return { tab, changes: { savedMarkdown: tab.markdown, markdown, changes: listed } };
-        });
-      } catch (error) {
-        return new ReadFailure(error);
-      }
+    let { changes } = await this.#readSettled(taken => {
+      let { tab, markdown } = this.#simulate(taken, tabId, "getPendingChanges");
+      let adopted = (id: string | undefined) => this.#changes.adoptedTabId(id);
+      // Listed after the replay above, which is what marks an edit that no longer fits.
+      let listed = this.#changes.pending().flatMap(({ id, action }): GoogleDocPendingChange[] => {
+        // An added tab reads as saved and empty, and every edit to it is listed.
+        if (action.type === "addTab" || adopted(action.tabId) !== adopted(tab.tabId)) return [];
+        // Its write landed though the response was lost, so the saved content already holds it.
+        if (googleDocActionCommitted(taken, action)) return [];
+        let stale = action.invalidatedReason ? { stale: true as const } : {};
+        return [action.type === "replaceText"
+          ? { id, ...stale, type: action.type,
+              oldMarkdown: action.oldMarkdown, newMarkdown: action.newMarkdown }
+          : { id, ...stale, type: action.type, markdown: action.markdown }];
+      });
+      return { tab, changes: { savedMarkdown: tab.markdown, markdown, changes: listed } };
     }, ({ tab }) => ({
       title: "Read Google Doc pending changes",
       description:
@@ -975,6 +1027,52 @@ export class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession 
       description: "Read the pending changes of one tab of the document.",
     });
     return changes;
+  }
+
+  /** The tab an image read names: one Google has saved, or an added one, empty until it is. */
+  #imageTab(
+    snapshot: GoogleDocSnapshot, tabId: string | undefined, operation: "listImages" | "readImage",
+  ): GoogleDocTabSnapshot {
+    let { tabs } = this.#replay(snapshot);
+    return resolveGoogleDocTab({ ...snapshot, tabs }, this.#simulatedTabId(tabs, tabId), operation);
+  }
+
+  async listImages(tabId?: string): Promise<GoogleDocImage[]> {
+    let tab = await this.#readSettled(taken => this.#imageTab(taken, tabId, "listImages"), tab => ({
+      title: "Read Google Doc images",
+      description: `Read the images in tab ${googleDocTabLabel(tab)}.`,
+    }), DOC_IMAGES_OBSERVATION);
+    return tab.images.map(({ contentUri, ...image }) => {
+      this.#listedImages.add(`${tabId}\u0000${image.id}`);
+      return { ...image, readable: contentUri !== undefined };
+    });
+  }
+
+  async readImage(imageId: string, tabId?: string): Promise<GoogleDocImageBytes> {
+    let find = (snapshot: GoogleDocSnapshot) => this.#imageTab(snapshot, tabId, "readImage");
+    // listImages() has already reported reading this tab's images; a read without it reports here.
+    let tab = this.#listedImages.has(`${tabId}\u0000${imageId}`)
+      ? await this.#settled(() => this.#source.snapshot(), find)
+      : await this.#readSettled(find, tab => ({
+        title: "Read Google Doc images",
+        description: `Read an image in tab ${googleDocTabLabel(tab)}.`,
+      }), DOC_IMAGES_OBSERVATION);
+    let contentUri = (tab: GoogleDocTabSnapshot) => {
+      let uri = tab.images.find(image => image.id === imageId)?.contentUri;
+      if (!uri) {
+        throw new Error(
+          `readImage: tab "${tab.tabId}" has no readable image with ID "${imageId}". ` +
+          `Call listImages("${tab.tabId}") to see its images.`);
+      }
+      return uri;
+    };
+    let image = await openGoogleDocImage(contentUri(tab));
+    // The address has lapsed, so the document is read again for a current one.
+    image ??= await openGoogleDocImage(
+      contentUri(await this.#settled(
+        () => this.#source.refetched?.() ?? this.#source.snapshot(), find)));
+    if (!image) throw new Error("readImage: Google Docs did not return this image.");
+    return image;
   }
 
   async replaceText(oldMarkdown: string, newMarkdown: string, tabId?: string): Promise<void> {
@@ -1130,6 +1228,10 @@ function storedDocSource(
       } while (writes !== cache.writes);
       return snapshot;
     },
+    async refetched() {
+      await storage.delete(DOC_SNAPSHOT_KEY);
+      return this.snapshot();
+    },
     approved: () => {},
     /**
      * Google Docs exposes no modification time, so the moment this binding first saw the current
@@ -1211,6 +1313,10 @@ export function driveDocSource(
   };
   return {
     snapshot: () => inFlight ??= next().finally(() => { inFlight = undefined; }),
+    refetched: () => {
+      approved = undefined;
+      return next();
+    },
     // A slow guard must not republish its older revision over a newer one already approved.
     approved: snapshot => {
       if (snapshot.fetchedAt >= (approved?.fetchedAt ?? 0)) approved = snapshot;

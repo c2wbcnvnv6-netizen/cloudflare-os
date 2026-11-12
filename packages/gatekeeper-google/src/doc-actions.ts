@@ -238,7 +238,8 @@ export async function googleDocRevisionUnchanged(
 export function resolveGoogleDocTab(
   snapshot: GoogleDocSnapshot,
   tabId: string | undefined,
-  operation: "getContent" | "getPendingChanges" | "replaceText" | "appendText",
+  operation:
+    "getContent" | "getPendingChanges" | "listImages" | "readImage" | "replaceText" | "appendText",
 ): GoogleDocTabSnapshot {
   if (tabId === undefined) {
     if (snapshot.tabs.length !== 1) {
