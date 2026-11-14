@@ -891,7 +891,7 @@ The operation is the request's name, one of the closed list `GOOGLE_OPERATIONS` 
 
 | Service | Operations |
 |---|---|
-| `google-gmail` | `threads.list`, `threads.get`, `threads.modify`, `threads.trash`, `threads.untrash`, `messages.list`, `messages.get`, `messages.batchModify`, `messages.send`, `attachments.get`, `drafts.list`, `drafts.get`, `drafts.create`, `drafts.update`, `drafts.delete`, `drafts.send`, `labels.list`, `labels.get`, `labels.create`, `labels.update`, `labels.delete`, `users.getProfile`, `users.watch`, `history.list` |
+| `google-gmail` | `threads.list`, `threads.get`, `threads.modify`, `threads.trash`, `threads.untrash`, `messages.list`, `messages.get`, `messages.batchModify`, `messages.send`, `attachments.get`, `drafts.list`, `drafts.get`, `drafts.create`, `drafts.update`, `drafts.delete`, `drafts.send`, `labels.list`, `labels.get`, `labels.create`, `labels.patch`, `labels.delete`, `users.getProfile`, `users.watch`, `history.list` |
 | `google-drive` | `files.list`, `files.get`, `files.get.media`, `files.get.batch`, `files.generateIds`, `files.create`, `files.update`, `files.copy`, `drives.list`, `about.get`, `permissions.list`, `permissions.create`, `permissions.update`, `permissions.delete`, `comments.list`, `comments.get`, `comments.create`, `replies.list`, `replies.create` |
 | `google-calendar` | `calendarList.list`, `calendarList.get`, `events.list`, `events.get`, `events.insert`, `events.patch`, `events.delete`, `freebusy.query` |
 | `google-bigquery` | `projects.list`, `datasets.list`, `datasets.get`, `tables.list`, `tables.get`, `jobs.query`, `jobs.insert`, `jobs.getQueryResults`, `jobs.cancel` |

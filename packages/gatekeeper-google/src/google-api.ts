@@ -3434,22 +3434,22 @@ export class GmailApi {
 
   async renameLabel(labelId: string, name: string): Promise<GmailLabelRaw> {
     validateGmailId(labelId, "label ID");
-    const response = await this.authedFetch("labels.update",
+    const response = await this.authedFetch("labels.patch",
       `https://gmail.googleapis.com/gmail/v1/users/me/labels/${labelId}`, {
         method: "PATCH",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({name}),
     });
-    if (!response.ok) await gmailApiFailure("labels.update", response);
+    if (!response.ok) await gmailApiFailure("labels.patch", response);
     let value: unknown;
     try {
       value = await response.json();
     } catch {
-      throw new Error("Gmail labels.update returned invalid JSON.");
+      throw new Error("Gmail labels.patch returned invalid JSON.");
     }
     const label = parseGmailLabelResponse(value, "update");
     if (label.id !== labelId) {
-      throw new Error("Gmail labels.update returned a different label ID.");
+      throw new Error("Gmail labels.patch returned a different label ID.");
     }
     return label;
   }

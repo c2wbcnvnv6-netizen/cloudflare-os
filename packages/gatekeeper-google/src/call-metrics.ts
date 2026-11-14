@@ -58,7 +58,7 @@ export const GOOGLE_OPERATIONS = [
   "threads.list", "threads.get", "threads.modify", "threads.trash", "threads.untrash",
   "messages.list", "messages.get", "messages.batchModify", "messages.send", "attachments.get",
   "drafts.list", "drafts.get", "drafts.create", "drafts.update", "drafts.delete", "drafts.send",
-  "labels.list", "labels.get", "labels.create", "labels.update", "labels.delete",
+  "labels.list", "labels.get", "labels.create", "labels.patch", "labels.delete",
   "users.getProfile", "users.watch", "history.list",
   // Drive: `files.get.media` is a download of a file's content, and `files.get.batch` one batch
   // of `files.get` requests.
