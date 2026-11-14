@@ -17,6 +17,7 @@ import { HookRegistry, type HookCapabilities, type HookDelivery } from "@gadgets
 import { SingleFlight } from "@gadgets/gatekeeper-kit/single-flight";
 import type { HookController, HookInitiator, HookTargetMetadata } from "@gadgets/workshop-shared/gatekeeper";
 import { fetchWithAuthRetry, type AccessTokenProvider } from "./auth-retry";
+import type { GoogleOperation } from "./call-metrics";
 import { ChatApiError, chatApiFailure, type ChatMessageRaw } from "./chat-api";
 import type { ChatMessageHook } from "./chat-types";
 import { obsContext } from "./observability";
@@ -347,12 +348,14 @@ class WorkspaceEventsApi {
   }
 
   /** Subscription writes are long-running operations; wait briefly for one to finish. */
-  async #operation(operation: string, path: string, method: string, body: object): Promise<SubscriptionRaw> {
+  async #operation(
+    operation: GoogleOperation, path: string, method: string, body: object,
+  ): Promise<SubscriptionRaw> {
     let result = await this.#request<OperationRaw>(operation, path, { method, body: JSON.stringify(body) });
     for (let attempt = 0; !result.done; attempt++) {
       if (attempt === 5) throw new Error(`Google Workspace Events ${operation} did not finish in time.`);
       await new Promise(resolve => setTimeout(resolve, 500 * 2 ** attempt));
-      result = await this.#request<OperationRaw>(operation, `/${result.name}`);
+      result = await this.#request<OperationRaw>(operation, `/${result.name}`, {}, "operations.get");
     }
     if (!result.response) {
       throw new Error(`Google Workspace Events ${operation} failed [code=${result.error?.code ?? "unknown"}]`);
@@ -360,10 +363,14 @@ class WorkspaceEventsApi {
     return result.response;
   }
 
-  async #request<T>(operation: string, path: string, init: RequestInit = {}): Promise<T> {
+  // `counted` is the request in the metrics where a failure names it otherwise: a poll of a write
+  // fails under the write's name.
+  async #request<T>(
+    operation: GoogleOperation, path: string, init: RequestInit = {}, counted = operation,
+  ): Promise<T> {
     const response = await fetchWithAuthRetry(`${EVENTS_API_BASE}${path}`, {
       ...init, headers: { "Content-Type": "application/json" },
-    }, this.getAccessToken);
+    }, this.getAccessToken, { operation: counted });
     if (!response.ok) await chatApiFailure(operation, response);
     return response.json<T>();
   }

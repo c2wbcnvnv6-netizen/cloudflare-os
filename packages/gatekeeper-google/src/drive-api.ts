@@ -2,6 +2,7 @@
 
 import type { DriveUnit } from "./file-subresources";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import type { GoogleOperation } from "./call-metrics";
 import { obsContext } from "./observability";
 
 const logger = obsContext.createLogger({ component: "gatekeeper.google.drive", vendorId: "google" });
@@ -1151,7 +1152,7 @@ export class DriveApi {
     let corpus = options.corpus ?? { kind: "user" };
     params.set("corpora", corpus.kind);
     if (corpus.kind === "drive") params.set("driveId", corpus.driveId);
-    let body = await this.#getUnknown("/files", params);
+    let body = await this.#getUnknown("files.list", "/files", params);
     if (!isRecord(body)) throw new Error("Invalid Google Drive file-list response");
     // A cross-corpus search Drive could not finish is indistinguishable from a complete one.
     if (optionalBoolean(body.incompleteSearch, "incompleteSearch")) {
@@ -1169,12 +1170,14 @@ export class DriveApi {
   /** Current metadata for one file. */
   async getFile(fileId: string): Promise<DriveFile> {
     let params = new URLSearchParams({ fields: DRIVE_FILE_ITEM_FIELDS, supportsAllDrives: "true" });
-    return parseDriveFile(await this.#getUnknown(`/files/${encodeURIComponent(fileId)}`, params));
+    return parseDriveFile(
+      await this.#getUnknown("files.get", `/files/${encodeURIComponent(fileId)}`, params));
   }
 
   /** An ID Drive reserves for a file this account creates, which makes the create safe to resend. */
   async generateFileId(): Promise<string> {
-    let body = await this.#getUnknown("/files/generateIds", new URLSearchParams({ count: "1", space: "drive" }));
+    let body = await this.#getUnknown(
+      "files.generateIds", "/files/generateIds", new URLSearchParams({ count: "1", space: "drive" }));
     let id = isRecord(body) && Array.isArray(body.ids) ? body.ids[0] : undefined;
     if (typeof id !== "string") throw new Error("Invalid Google Drive generated ID response");
     return id;
@@ -1192,7 +1195,7 @@ export class DriveApi {
       method: "POST",
       headers: { Accept: "application/json", "Content-Type": "application/json" },
       body: JSON.stringify({ id, name, mimeType: FOLDER_MIME_TYPE, parents: [parentId] }),
-    }, this.getAccessToken, { idempotent: true });
+    }, this.getAccessToken, { operation: "files.create", idempotent: true });
     if (response.status !== 409 && !response.ok) throw await driveError(response);
     await response.body?.cancel();
     return response.ok;
@@ -1208,7 +1211,7 @@ export class DriveApi {
     let response = await fetchWithAuthRetry(
       `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?${params}`,
       { method: "PATCH", headers: { "Content-Type": "application/json" }, body: "{}" },
-      this.getAccessToken);
+      this.getAccessToken, { operation: "files.update" });
     if (!response.ok) throw await driveError(response);
     await response.body?.cancel();
   }
@@ -1221,7 +1224,7 @@ export class DriveApi {
       fields: "nextPageToken,drives(id,name,capabilities(canAddChildren))",
     });
     if (options.pageToken) params.set("pageToken", options.pageToken);
-    let body = await this.#getUnknown("/drives", params);
+    let body = await this.#getUnknown("drives.list", "/drives", params);
     let rawDrives = isRecord(body) ? body.drives ?? [] : undefined;
     if (!isRecord(body) || !Array.isArray(rawDrives)) {
       throw new Error("Invalid Google Drive shared-drive list response");
@@ -1301,7 +1304,7 @@ export class DriveApi {
     let params = new URLSearchParams({ alt: "media", supportsAllDrives: "true" });
     let response = await fetchWithAuthRetry(
       `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?${params}`, init,
-      this.getAccessToken, timeoutMs === undefined ? {} : { timeoutMs });
+      this.getAccessToken, { operation: "files.get.media", timeoutMs });
     if (!response.ok) throw await driveError(response);
     return response;
   }
@@ -1309,7 +1312,7 @@ export class DriveApi {
   /** Whether the connected account may edit a file's content, as Drive reports it. */
   async canEdit(fileId: string): Promise<boolean> {
     let params = new URLSearchParams({ fields: "capabilities(canEdit)", supportsAllDrives: "true" });
-    let body = await this.#getUnknown(`/files/${encodeURIComponent(fileId)}`, params);
+    let body = await this.#getUnknown("files.get", `/files/${encodeURIComponent(fileId)}`, params);
     let capabilities = isRecord(body) ? body.capabilities : undefined;
     if (capabilities !== undefined && !isRecord(capabilities)) {
       throw new Error("Invalid Google Drive file capabilities");
@@ -1320,13 +1323,15 @@ export class DriveApi {
   /** What converting `fileId` needs to know about it. */
   async getConversionSource(fileId: string): Promise<DriveConversionSource> {
     let params = new URLSearchParams({ fields: CONVERSION_SOURCE_FIELDS, supportsAllDrives: "true" });
-    return parseConversionSource(await this.#getUnknown(`/files/${encodeURIComponent(fileId)}`, params));
+    return parseConversionSource(
+      await this.#getUnknown("files.get", `/files/${encodeURIComponent(fileId)}`, params));
   }
 
   /** A copy {@link copyAsNative} may have made, with the app properties that say what from. */
   async getConvertedCopy(fileId: string): Promise<DriveConvertedCopy> {
     let params = new URLSearchParams({ fields: CONVERTED_COPY_FIELDS, supportsAllDrives: "true" });
-    return parseConvertedCopy(await this.#getUnknown(`/files/${encodeURIComponent(fileId)}`, params));
+    return parseConvertedCopy(
+      await this.#getUnknown("files.get", `/files/${encodeURIComponent(fileId)}`, params));
   }
 
   /**
@@ -1346,7 +1351,7 @@ export class DriveApi {
       supportsAllDrives: "true",
       includeItemsFromAllDrives: "true",
     });
-    let body = await this.#getUnknown("/files", params);
+    let body = await this.#getUnknown("files.list", "/files", params);
     if (!isRecord(body)) throw new Error("Invalid Google Drive file-list response");
     if (body.files === undefined) return [];
     if (!Array.isArray(body.files)) throw new Error("Invalid Google Drive file-list response");
@@ -1360,7 +1365,7 @@ export class DriveApi {
     let params = new URLSearchParams({
       fields: "capabilities(canAddChildren)", supportsAllDrives: "true",
     });
-    let body = await this.#getUnknown(`/files/${encodeURIComponent(folderId)}`, params);
+    let body = await this.#getUnknown("files.get", `/files/${encodeURIComponent(folderId)}`, params);
     let capabilities = isRecord(body) ? body.capabilities : undefined;
     if (capabilities !== undefined && !isRecord(capabilities)) {
       throw new Error("Invalid Google Drive file capabilities");
@@ -1370,7 +1375,8 @@ export class DriveApi {
 
   /** The largest file, in bytes, Drive converts into native `mimeType`, if it says. */
   async getMaxImportSize(mimeType: string): Promise<number | undefined> {
-    let body = await this.#getUnknown("/about", new URLSearchParams({ fields: "maxImportSizes" }));
+    let body = await this.#getUnknown(
+      "about.get", "/about", new URLSearchParams({ fields: "maxImportSizes" }));
     let sizes = isRecord(body) ? body.maxImportSizes : undefined;
     if (!isRecord(sizes)) return undefined;
     let size = Number(optionalString(sizes[mimeType], "maxImportSizes"));
@@ -1403,7 +1409,7 @@ export class DriveApi {
           appProperties: copy.appProperties,
         }),
       },
-      this.getAccessToken);
+      this.getAccessToken, { operation: "files.copy" });
     if (!response.ok) throw await driveError(response);
     let text = await readBoundedText(
       response, MAX_JSON_RESPONSE_BYTES, "Google Drive response was too large");
@@ -1473,7 +1479,7 @@ export class DriveApi {
     let params = new URLSearchParams({
       fields: `capabilities(${capability})`, supportsAllDrives: "true",
     });
-    let body = await this.#getUnknown(`/files/${encodeURIComponent(fileId)}`, params);
+    let body = await this.#getUnknown("files.get", `/files/${encodeURIComponent(fileId)}`, params);
     if (!isRecord(body)) throw new Error("Invalid Google Drive file response");
     return optionalCapability(body.capabilities, capability) === true;
   }
@@ -1487,7 +1493,7 @@ export class DriveApi {
   async getAccountIdentity(): Promise<{ permissionId: string; emailAddress?: string }> {
     // `about.get` takes no `supportsAllDrives`: the account is the same in every drive.
     let body = await this.#getUnknown(
-      "/about", new URLSearchParams({ fields: "user(permissionId,emailAddress)" }));
+      "about.get", "/about", new URLSearchParams({ fields: "user(permissionId,emailAddress)" }));
     let user = isRecord(body) ? body.user : undefined;
     if (!isRecord(user) || typeof user.permissionId !== "string" || !user.permissionId) {
       throw new Error("Invalid Google Drive account identity response");
@@ -1512,7 +1518,8 @@ export class DriveApi {
     });
     if (options.pageToken) params.set("pageToken", options.pageToken);
     let page = parseListPage(
-      await this.#getUnknown(`/files/${encodeURIComponent(fileId)}/permissions`, params),
+      await this.#getUnknown(
+        "permissions.list", `/files/${encodeURIComponent(fileId)}/permissions`, params),
       "permissions", parsePermission);
     return {
       permissions: page.permissions.filter(permission => permission !== undefined),
@@ -1552,7 +1559,8 @@ export class DriveApi {
     });
     if (options.message !== undefined) params.set("emailMessage", options.message);
     return parseWrittenPermission(await this.#writeJson(
-      "POST", `/files/${encodeURIComponent(fileId)}/permissions`, params, body));
+      "permissions.create", "POST", `/files/${encodeURIComponent(fileId)}/permissions`, params,
+      body));
   }
 
   /**
@@ -1567,7 +1575,7 @@ export class DriveApi {
     requireGivableRole(role);
     let params = new URLSearchParams({ fields: PERMISSION_FIELDS, supportsAllDrives: "true" });
     return parseWrittenPermission(await this.#writeJson(
-      "PATCH",
+      "permissions.update", "PATCH",
       `/files/${encodeURIComponent(fileId)}/permissions/${encodeURIComponent(permissionId)}`,
       params, { role }));
   }
@@ -1581,7 +1589,7 @@ export class DriveApi {
     requireDriveFileId(fileId);
     requireDrivePermissionId(permissionId);
     await this.#writeJson(
-      "DELETE",
+      "permissions.delete", "DELETE",
       `/files/${encodeURIComponent(fileId)}/permissions/${encodeURIComponent(permissionId)}`,
       new URLSearchParams({ supportsAllDrives: "true" }));
   }
@@ -1602,7 +1610,8 @@ export class DriveApi {
       addParents: move.addParent, removeParents: move.removeParent, fields: "id,parents",
       supportsAllDrives: "true",
     });
-    let body = await this.#writeJson("PATCH", `/files/${encodeURIComponent(fileId)}`, params, {});
+    let body = await this.#writeJson(
+      "files.update", "PATCH", `/files/${encodeURIComponent(fileId)}`, params, {});
     if (!isRecord(body) || body.id !== fileId) {
       throw new Error("Google Drive answered a move for a different file");
     }
@@ -1627,7 +1636,8 @@ export class DriveApi {
     if (options.pageToken) params.set("pageToken", options.pageToken);
     if (options.startModifiedTime) params.set("startModifiedTime", options.startModifiedTime);
     return parseListPage(
-      await this.#getUnknown(`/files/${encodeURIComponent(fileId)}/comments`, params),
+      await this.#getUnknown(
+        "comments.list", `/files/${encodeURIComponent(fileId)}/comments`, params),
       "comments", parseComment);
   }
 
@@ -1637,6 +1647,7 @@ export class DriveApi {
     requireDriveCommentId(commentId);
     let params = new URLSearchParams({ fields: COMMENT_FIELDS });
     let comment = parseComment(await this.#getUnknown(
+      "comments.get",
       `/files/${encodeURIComponent(fileId)}/comments/${encodeURIComponent(commentId)}`, params));
     if (comment.id !== commentId) throw new Error("Google Drive returned a different comment");
     return comment;
@@ -1653,6 +1664,7 @@ export class DriveApi {
     if (options.pageToken) params.set("pageToken", options.pageToken);
     return parseListPage(
       await this.#getUnknown(
+        "replies.list",
         `/files/${encodeURIComponent(fileId)}/comments/${encodeURIComponent(commentId)}/replies`,
         params),
       "replies", parseReply);
@@ -1669,7 +1681,7 @@ export class DriveApi {
     requireDriveFileId(fileId);
     checkCommentContent(content);
     return parseComment(await this.#writeJson(
-      "POST", `/files/${encodeURIComponent(fileId)}/comments`,
+      "comments.create", "POST", `/files/${encodeURIComponent(fileId)}/comments`,
       new URLSearchParams({ fields: COMMENT_FIELDS }), { content }));
   }
 
@@ -1690,7 +1702,7 @@ export class DriveApi {
       checkCommentContent(reply.content ?? "", "reply");
     }
     return parseReply(await this.#writeJson(
-      "POST",
+      "replies.create", "POST",
       `/files/${encodeURIComponent(fileId)}/comments/${encodeURIComponent(commentId)}/replies`,
       new URLSearchParams({ fields: REPLY_FIELDS }),
       {
@@ -1780,7 +1792,7 @@ export class DriveApi {
           "Content-Type": `multipart/mixed; boundary=${boundary}`,
         },
         body,
-      }, getToken, { idempotent: true });
+      }, getToken, { operation: "files.get.batch", idempotent: true });
       if (!response.ok) throw await driveError(response);
 
       let placed = await parseBatchAccessParts(response, fileIds.length);
@@ -1816,8 +1828,8 @@ export class DriveApi {
    * decided by the provider this client was built over.
    */
   async #writeJson(
-    method: "POST" | "PATCH" | "DELETE", path: string, params: URLSearchParams,
-    body?: Record<string, unknown>,
+    operation: GoogleOperation, method: "POST" | "PATCH" | "DELETE", path: string,
+    params: URLSearchParams, body?: Record<string, unknown>,
   ): Promise<unknown> {
     let response = await fetchWithAuthRetry(
       `${DRIVE_API_BASE}${path}?${params}`,
@@ -1829,7 +1841,7 @@ export class DriveApi {
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       },
-      this.getAccessToken, { timeoutMs: WRITE_TIMEOUT_MS });
+      this.getAccessToken, { operation, timeoutMs: WRITE_TIMEOUT_MS });
     if (!response.ok) throw await driveError(response);
     if (response.status === 204) return undefined;
     let text = await readBoundedText(
@@ -1837,11 +1849,13 @@ export class DriveApi {
     return parseDriveJson(text, "response");
   }
 
-  async #getUnknown(path: string, params: URLSearchParams): Promise<unknown> {
+  async #getUnknown(
+    operation: GoogleOperation, path: string, params: URLSearchParams,
+  ): Promise<unknown> {
     let response = await fetchWithAuthRetry(
       `${DRIVE_API_BASE}${path}?${params}`,
       { headers: { Accept: "application/json" } },
-      this.getAccessToken);
+      this.getAccessToken, { operation });
     if (!response.ok) throw await driveError(response);
     let text = await readBoundedText(
       response, MAX_JSON_RESPONSE_BYTES, "Google Drive response was too large");

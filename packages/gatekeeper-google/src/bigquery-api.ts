@@ -10,6 +10,7 @@ import type {
   BigQueryQueryOptions, BigQueryQueryResult, BigQueryTable,
 } from "./bigquery-types";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import type { GoogleOperation } from "./call-metrics";
 
 const API_BASE = "https://bigquery.googleapis.com/bigquery/v2";
 const REQUEST_TIMEOUT_MS = 60_000;
@@ -256,6 +257,7 @@ function buildQueryParameters(params: Record<string, BigQueryParam> | undefined)
 }
 
 async function callRest<T>(
+  operation: GoogleOperation,
   url: string,
   init: RequestInit,
   getAccessToken: AccessTokenProvider,
@@ -269,7 +271,7 @@ async function callRest<T>(
   let response = await fetchWithAuthRetry(url, {
     ...init,
     headers,
-  }, getAccessToken, { timeoutMs: REQUEST_ABORT_TIMEOUT_MS, retries: 1 });
+  }, getAccessToken, { operation, timeoutMs: REQUEST_ABORT_TIMEOUT_MS, retries: 1 });
 
   let contentType = response.headers.get("Content-Type") ?? "";
   let isJson = contentType.includes("application/json");
@@ -316,7 +318,7 @@ export class BigQueryApi {
       url.searchParams.set("maxResults", listMaxResults(options));
       if (pageToken) url.searchParams.set("pageToken", pageToken);
       let resp = await callRest<RestProjectsListResponse>(
-        url.toString(), { method: "GET" }, this.getAccessToken);
+        "projects.list", url.toString(), { method: "GET" }, this.getAccessToken);
       for (let p of resp.projects ?? []) {
         projects.push({
           projectId: p.projectReference?.projectId ?? p.id,
@@ -344,7 +346,7 @@ export class BigQueryApi {
     if (location) url.searchParams.set("location", location);
     if (maxResults !== undefined) url.searchParams.set("maxResults", String(maxResults));
     return callRest<RestQueryResultsResponse>(
-      url.toString(), { method: "GET" }, this.getAccessToken);
+      "jobs.getQueryResults", url.toString(), { method: "GET" }, this.getAccessToken);
   }
 
   async #cancelJob(projectId: string, jobId: string, location?: string): Promise<void> {
@@ -352,7 +354,7 @@ export class BigQueryApi {
         `${API_BASE}/projects/${encodeURIComponent(projectId)}` +
         `/jobs/${encodeURIComponent(jobId)}/cancel`);
     if (location) url.searchParams.set("location", location);
-    await callRest<unknown>(url.toString(), { method: "POST" }, this.getAccessToken);
+    await callRest<unknown>("jobs.cancel", url.toString(), { method: "POST" }, this.getAccessToken);
   }
 
   /** Run a synchronous query via jobs.query, as a job in `billingProject`. */
@@ -383,7 +385,7 @@ export class BigQueryApi {
     }
 
     let url = `${API_BASE}/projects/${encodeURIComponent(billingProject)}/queries`;
-    let resp = await callRest<RestQueryResultsResponse>(url, {
+    let resp = await callRest<RestQueryResultsResponse>("jobs.query", url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -464,7 +466,7 @@ export class BigQueryApi {
     };
 
     let url = `${API_BASE}/projects/${encodeURIComponent(billingProject)}/jobs`;
-    let resp = await callRest<RestJob>(url, {
+    let resp = await callRest<RestJob>("jobs.insert", url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -504,7 +506,7 @@ export class BigQueryApi {
       url.searchParams.set("maxResults", listMaxResults(options));
       if (pageToken) url.searchParams.set("pageToken", pageToken);
       let resp = await callRest<RestDatasetsListResponse & { nextPageToken?: string }>(
-        url.toString(), { method: "GET" }, this.getAccessToken);
+        "datasets.list", url.toString(), { method: "GET" }, this.getAccessToken);
       for (let d of resp.datasets ?? []) {
         datasets.push({
           datasetId: d.datasetReference.datasetId,
@@ -523,7 +525,8 @@ export class BigQueryApi {
     let url =
         `${API_BASE}/projects/${encodeURIComponent(projectId)}` +
         `/datasets/${encodeURIComponent(datasetId)}`;
-    let resp = await callRest<RestDatasetResource>(url, { method: "GET" }, this.getAccessToken);
+    let resp = await callRest<RestDatasetResource>(
+      "datasets.get", url, { method: "GET" }, this.getAccessToken);
     return {
       datasetId: resp.datasetReference.datasetId,
       projectId: resp.datasetReference.projectId,
@@ -545,7 +548,7 @@ export class BigQueryApi {
       url.searchParams.set("maxResults", listMaxResults(options));
       if (pageToken) url.searchParams.set("pageToken", pageToken);
       let resp = await callRest<RestTablesListResponse & { nextPageToken?: string }>(
-        url.toString(), { method: "GET" }, this.getAccessToken);
+        "tables.list", url.toString(), { method: "GET" }, this.getAccessToken);
       for (let t of resp.tables ?? []) {
         tables.push({
           tableId: t.tableReference.tableId,
@@ -568,7 +571,8 @@ export class BigQueryApi {
         `${API_BASE}/projects/${encodeURIComponent(projectId)}` +
         `/datasets/${encodeURIComponent(datasetId)}` +
         `/tables/${encodeURIComponent(tableId)}`;
-    let resp = await callRest<RestTableResource>(url, { method: "GET" }, this.getAccessToken);
+    let resp = await callRest<RestTableResource>(
+      "tables.get", url, { method: "GET" }, this.getAccessToken);
     return {
       table: {
         tableId: resp.tableReference.tableId,

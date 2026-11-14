@@ -1,5 +1,6 @@
 import { readBytesCapped, ResponseTooLargeError } from "@gadgets/gatekeeper-kit/response-body";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import { countedFetch, type GoogleOperation } from "./call-metrics";
 import { readGoogleJson } from "./google-response";
 import {
   LAYOUT_PAGE_FIELDS, OUTLINE_FIELDS, SLIDE_FIELDS, SUMMARY_FIELDS,
@@ -284,26 +285,32 @@ function pagePath(presentationId: string, pageId: string): string {
 export class GoogleSlidesApi {
   constructor(private getAccessToken: AccessTokenProvider) {}
 
-  async #send<T>(url: URL, init: RequestInit, operation: string, maxBytes: number): Promise<T> {
+  // `name` is the request in the metrics, `operation` what it does in the words of a failure.
+  async #send<T>(
+    name: GoogleOperation, url: URL, init: RequestInit, operation: string, maxBytes: number,
+  ): Promise<T> {
     let response = await fetchWithAuthRetry(
-      url.toString(), init, this.getAccessToken, { timeoutMs: REQUEST_TIMEOUT_MS },
+      url.toString(), init, this.getAccessToken,
+      { operation: name, timeoutMs: REQUEST_TIMEOUT_MS },
     );
     return readGoogleJson<T>(response, { provider: "Google Slides", operation, maxBytes });
   }
 
   async #get<T>(
-    path: string, params: Record<string, string>, operation: string, maxBytes = MAX_RESPONSE_BYTES,
+    name: GoogleOperation, path: string, params: Record<string, string>, operation: string,
+    maxBytes = MAX_RESPONSE_BYTES,
   ): Promise<T> {
     let url = new URL(`${API_BASE}/${path}`);
-    for (let [name, value] of Object.entries(params)) url.searchParams.set(name, value);
-    return this.#send<T>(url, {}, operation, maxBytes);
+    for (let [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+    return this.#send<T>(name, url, {}, operation, maxBytes);
   }
 
   /** Create a presentation titled `title` in the caller's My Drive, returning its ID. */
   async createPresentation(title: string): Promise<string> {
     let url = new URL(API_BASE);
     url.searchParams.set("fields", "presentationId");
-    let { presentationId } = await this.#send<{ presentationId?: unknown }>(url, {
+    let { presentationId } = await this.#send<{ presentationId?: unknown }>(
+        "presentations.create", url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title }),
@@ -318,7 +325,7 @@ export class GoogleSlidesApi {
     presentationId: string, fields: string, operation: string,
   ): Promise<RestPresentation> {
     let result = await this.#get<RestPresentation>(
-      encodeURIComponent(presentationId), { fields }, operation);
+      "presentations.get", encodeURIComponent(presentationId), { fields }, operation);
     if (result.presentationId !== presentationId) {
       throw new Error("Google Slides returned a different presentation");
     }
@@ -343,7 +350,8 @@ export class GoogleSlidesApi {
   /** Fetch one slide's content, whatever the size of the rest of the presentation. */
   async getSlide(presentationId: string, slideId: string): Promise<RestSlide> {
     let slide = await this.#get<RestSlide>(
-      pagePath(presentationId, slideId), { fields: SLIDE_FIELDS }, "get slide", MAX_SLIDE_BYTES);
+      "pages.get", pagePath(presentationId, slideId), { fields: SLIDE_FIELDS }, "get slide",
+      MAX_SLIDE_BYTES);
     if (slide.objectId !== slideId) throw new Error("Google Slides returned a different slide");
     return slide;
   }
@@ -351,7 +359,8 @@ export class GoogleSlidesApi {
   /** Fetch a layout's placeholders, as far as a slide made from it takes them. */
   async getLayout(presentationId: string, layoutId: string): Promise<RestPage> {
     let layout = await this.#get<RestPage>(
-      pagePath(presentationId, layoutId), { fields: LAYOUT_PAGE_FIELDS }, "get layout", MAX_SLIDE_BYTES);
+      "pages.get", pagePath(presentationId, layoutId), { fields: LAYOUT_PAGE_FIELDS }, "get layout",
+      MAX_SLIDE_BYTES);
     if (layout.objectId !== layoutId) throw new Error("Google Slides returned a different layout");
     return layout;
   }
@@ -370,11 +379,12 @@ export class GoogleSlidesApi {
     presentationId: string, pageId: string, size: ThumbnailSize,
   ): Promise<PageThumbnail> {
     let { contentUrl } = await this.#get<{ contentUrl?: string }>(
+      "pages.getThumbnail",
       `${pagePath(presentationId, pageId)}/thumbnail`,
       { "thumbnailProperties.mimeType": "PNG", "thumbnailProperties.thumbnailSize": size },
       "get thumbnail", MAX_THUMBNAIL_RESPONSE_BYTES);
     // No credentials: the URL itself is the authority. A redirect could leave Google's host.
-    let image = await fetch(thumbnailContentUrl(contentUrl), {
+    let image = await countedFetch("thumbnail.download", thumbnailContentUrl(contentUrl), {
       redirect: "manual", signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     if (!image.ok) {
@@ -405,7 +415,8 @@ export class GoogleSlidesApi {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ requests, writeControl: { requiredRevisionId } }),
       },
-      this.getAccessToken, { timeoutMs: REQUEST_TIMEOUT_MS },
+      this.getAccessToken,
+      { operation: "presentations.batchUpdate", timeoutMs: REQUEST_TIMEOUT_MS },
     );
     if (response.ok) {
       await response.body?.cancel();

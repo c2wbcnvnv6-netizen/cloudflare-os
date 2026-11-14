@@ -11,6 +11,7 @@ import type {
   PersonAvailability,
 } from "./calendar-types";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import type { GoogleOperation } from "./call-metrics";
 
 const CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3";
 
@@ -223,7 +224,7 @@ export class GoogleCalendarApiError extends Error {
 export class GoogleCalendarApi {
   constructor(private getAccessToken: AccessTokenProvider) {}
 
-  async #fetch<T>(path: string, init?: RequestInit): Promise<T> {
+  async #fetch<T>(operation: GoogleOperation, path: string, init?: RequestInit): Promise<T> {
     // Built from the caller's headers so anything they set wins; these are only defaults. Note a
     // plain `{...init?.headers}` would silently drop everything if a caller passed a Headers.
     let headers = new Headers(init?.headers);
@@ -235,7 +236,7 @@ export class GoogleCalendarApi {
     let response = await fetchWithAuthRetry(`${CALENDAR_API_BASE}${path}`, {
       ...init,
       headers,
-    }, this.getAccessToken);
+    }, this.getAccessToken, { operation });
 
     if (!response.ok) {
       let text = await response.text();
@@ -262,7 +263,7 @@ export class GoogleCalendarApi {
       if (pageToken) params.set("pageToken", pageToken);
 
       let body = await this.#fetch<{items?: GoogleCalendarInfo[]; nextPageToken?: string}>(
-        `/users/me/calendarList?${params}`);
+        "calendarList.list", `/users/me/calendarList?${params}`);
       calendars.push(...(body.items ?? []));
       pageToken = body.nextPageToken;
     } while (pageToken && calendars.length < cap);
@@ -276,7 +277,7 @@ export class GoogleCalendarApi {
 
   async getCalendar(calendarId: string): Promise<GoogleCalendarInfo> {
     let cal = await this.#fetch<GoogleCalendarInfo>(
-      `/users/me/calendarList/${encodeCalendarId(calendarId)}`,
+      "calendarList.get", `/users/me/calendarList/${encodeCalendarId(calendarId)}`,
     );
     return {
       id: cal.id,
@@ -318,7 +319,7 @@ export class GoogleCalendarApi {
       if (pageToken) params.set("pageToken", pageToken);
 
       let body = await this.#fetch<{items?: GoogleCalendarEvent[]; nextPageToken?: string}>(
-        `/calendars/${encodeCalendarId(calendarId)}/events?${params}`);
+        "events.list", `/calendars/${encodeCalendarId(calendarId)}/events?${params}`);
       let items = body.items ?? [];
       if (events.length + items.length > MAX_LIST_EVENTS) {
         throw new Error(
@@ -346,7 +347,7 @@ export class GoogleCalendarApi {
     }
     let body = await this.#fetch<{
       calendars?: Record<string, { busy?: { start: string; end: string }[]; errors?: {reason?: string; domain?: string}[] }>;
-    }>("/freeBusy", {
+    }>("freebusy.query", "/freeBusy", {
       method: "POST",
       body: JSON.stringify({
         timeMin: opts.timeMin.toISOString(),
@@ -400,6 +401,7 @@ export class GoogleCalendarApi {
     sendUpdates: CalendarSendUpdates = "all",
   ): Promise<CalendarEvent> {
     let created = await this.#fetch<GoogleCalendarEvent>(
+      "events.insert",
       `/calendars/${encodeCalendarId(calendarId)}/events?sendUpdates=${encodeURIComponent(sendUpdates)}`,
       { method: "POST", body: JSON.stringify(googleEventFromDraft(event)) },
     );
@@ -418,6 +420,7 @@ export class GoogleCalendarApi {
     ifMatch?: string,
   ): Promise<CalendarEvent> {
     let updated = await this.#fetch<GoogleCalendarEvent>(
+      "events.patch",
       `/calendars/${encodeCalendarId(calendarId)}/events/${encodeURIComponent(eventId)}?sendUpdates=${encodeURIComponent(sendUpdates)}`,
       {
         method: "PATCH",
@@ -430,6 +433,7 @@ export class GoogleCalendarApi {
 
   async getEvent(calendarId: string, eventId: string): Promise<LiveCalendarEvent> {
     let event = await this.#fetch<GoogleCalendarEvent>(
+      "events.get",
       `/calendars/${encodeCalendarId(calendarId)}/events/${encodeURIComponent(eventId)}`,
     );
     return {
@@ -447,6 +451,7 @@ export class GoogleCalendarApi {
     sendUpdates: CalendarSendUpdates = "all",
   ): Promise<void> {
     await this.#fetch<void>(
+      "events.delete",
       `/calendars/${encodeCalendarId(calendarId)}/events/${encodeURIComponent(eventId)}?sendUpdates=${encodeURIComponent(sendUpdates)}`,
       { method: "DELETE" },
     );

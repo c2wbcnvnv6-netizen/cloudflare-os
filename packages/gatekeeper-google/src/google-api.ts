@@ -10,6 +10,7 @@ import { createMimeMessage } from "mimetext/browser";
 import PostalMime, { addressParser } from "postal-mime";
 import type {Attachment as PostalAttachment} from "postal-mime";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import { countedFetch, type GoogleOperation } from "./call-metrics";
 
 /**
  * Internal type for parsed message info with raw label IDs (not yet resolved
@@ -115,8 +116,8 @@ export async function exchangeAuthCode(
   params.set("redirect_uri", redirectUri);
   params.set("grant_type", "authorization_code");
 
-  let response = await fetch(
-      "https://oauth2.googleapis.com/token",
+  let response = await countedFetch(
+      "token.exchange", "https://oauth2.googleapis.com/token",
       {method: "POST", body: params, ...(signal ? { signal } : {})});
 
   let contentType = response.headers.get("Content-Type");
@@ -160,7 +161,7 @@ export type AccessTokenResult = { ok: true; token: GoogleAccessToken } | Refresh
 export async function getAccessToken(
     refreshToken: string, clientId: string, clientSecret: string, signal?: AbortSignal)
     : Promise<AccessTokenResult> {
-  const response = await fetch('https://oauth2.googleapis.com/token', {
+  const response = await countedFetch("token.refresh", 'https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -221,7 +222,8 @@ export async function getGoogleAccountProfile(accessToken: string | AccessTokenP
   const response = await fetchWithAuthRetry('https://www.googleapis.com/oauth2/v3/userinfo', {
     method: 'GET',
     headers: { 'Accept': 'application/json' },
-  }, typeof accessToken === "string" ? async () => accessToken : accessToken);
+  }, typeof accessToken === "string" ? async () => accessToken : accessToken,
+  { operation: "userinfo.get" });
 
   if (!response.ok) {
     await response.body?.cancel();
@@ -256,7 +258,7 @@ export async function getGoogleAccountDescription(accessToken: string)
  * unverified address.
  */
 export async function getGoogleVerifiedEmail(accessToken: string): Promise<string | null> {
-  const response = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+  const response = await countedFetch("userinfo.get", 'https://www.googleapis.com/oauth2/v3/userinfo', {
     method: 'GET',
     headers: {
       'Authorization': `Bearer ${accessToken}`,
@@ -282,7 +284,7 @@ export async function revokeGoogleToken(
   const body = new URLSearchParams();
   body.append('token', refreshToken);
 
-  const response = await fetch('https://oauth2.googleapis.com/revoke', {
+  const response = await countedFetch("token.revoke", 'https://oauth2.googleapis.com/revoke', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -2490,8 +2492,9 @@ export class GmailApi {
   // All Gmail API calls go through this for auth + retry: it injects the Bearer token, retries
   // once on a 401 with a force-refreshed token, and retries transient failures (429 / 5xx) with
   // backoff on GETs only. Callers must not set the Authorization header themselves.
-  private authedFetch(url: string, init?: RequestInit): Promise<Response> {
-    return fetchWithAuthRetry(url, init ?? {}, this.getAccessToken);
+  private authedFetch(
+      operation: GoogleOperation, url: string, init?: RequestInit): Promise<Response> {
+    return fetchWithAuthRetry(url, init ?? {}, this.getAccessToken, { operation });
   }
 
   // ─────────────────────────────────────────────────────────────────
@@ -2517,7 +2520,7 @@ export class GmailApi {
     }
     if (shouldIncludeSpamTrash(query, labelIds)) url += "&includeSpamTrash=true";
 
-    const response = await this.authedFetch(url);
+    const response = await this.authedFetch("threads.list", url);
 
     if (!response.ok) {
       await gmailApiFailure("threads.list", response);
@@ -2540,7 +2543,7 @@ export class GmailApi {
   async getThread(threadId: string): Promise<GmailThreadRaw> {
     validateGmailId(threadId, "thread ID");
 
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("threads.get",
       `https://gmail.googleapis.com/gmail/v1/users/me/threads/${threadId}?format=minimal`,
     );
 
@@ -2574,7 +2577,7 @@ export class GmailApi {
     for (const header of ["From", "To", "Cc", "Bcc", "Subject"]) {
       url.searchParams.append("metadataHeaders", header);
     }
-    const response = await this.authedFetch(url.toString());
+    const response = await this.authedFetch("threads.get", url.toString());
 
     if (!response.ok) {
       await gmailApiFailure("threads.get", response);
@@ -2596,7 +2599,7 @@ export class GmailApi {
   ): Promise<void> {
     validateGmailId(threadId, "thread ID");
 
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("threads.modify",
       `https://gmail.googleapis.com/gmail/v1/users/me/threads/${threadId}/modify`,
       {
         method: 'POST',
@@ -2620,7 +2623,7 @@ export class GmailApi {
   async trashThread(threadId: string): Promise<void> {
     validateGmailId(threadId, "thread ID");
 
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("threads.trash",
       `https://gmail.googleapis.com/gmail/v1/users/me/threads/${threadId}/trash`,
       { method: 'POST' }
     );
@@ -2634,7 +2637,7 @@ export class GmailApi {
   /** Restore a thread from trash. */
   async untrashThread(threadId: string): Promise<void> {
     validateGmailId(threadId, "thread ID");
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("threads.untrash",
       `https://gmail.googleapis.com/gmail/v1/users/me/threads/${threadId}/untrash`,
       {method: "POST"});
     if (!response.ok) await gmailApiFailure("threads.untrash", response);
@@ -2661,7 +2664,7 @@ export class GmailApi {
     if (shouldIncludeSpamTrash(query, labelIds)) {
       url.searchParams.set("includeSpamTrash", "true");
     }
-    const response = await this.authedFetch(url.toString());
+    const response = await this.authedFetch("messages.list", url.toString());
     if (!response.ok) await gmailApiFailure("messages.list", response);
     const data = await response.json() as {
       messages?: GmailMessageRef[];
@@ -2741,7 +2744,7 @@ export class GmailApi {
     ]) {
       url.searchParams.append("metadataHeaders", header);
     }
-    const response = await this.authedFetch(url.toString());
+    const response = await this.authedFetch("messages.get", url.toString());
     if (!response.ok) await gmailApiFailure("messages.get", response);
     return await response.json() as GmailMessageFull;
   }
@@ -2749,7 +2752,7 @@ export class GmailApi {
   /** Fetch the MIME tree while leaving detached attachment data lazy. */
   async getMessageFull(messageId: string): Promise<GmailMessageFull> {
     validateGmailId(messageId, "message ID");
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("messages.get",
       `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=full`);
     if (!response.ok) await gmailApiFailure("messages.get", response);
     return await response.json() as GmailMessageFull;
@@ -2764,7 +2767,7 @@ export class GmailApi {
     if (snapshot.attachmentId) {
       validateGmailId(snapshot.messageId, "message ID");
       validateGmailId(snapshot.attachmentId, "attachment ID");
-      const response = await this.authedFetch(
+      const response = await this.authedFetch("attachments.get",
         `https://gmail.googleapis.com/gmail/v1/users/me/messages/${snapshot.messageId}/attachments/${snapshot.attachmentId}`);
       if (!response.ok) await gmailApiFailure("attachments.get", response);
       encoded = (await response.json() as {data?: string}).data;
@@ -2796,7 +2799,7 @@ export class GmailApi {
         GMAIL_ATTACHMENT_OPEN_TIMEOUT_MS);
       let response: Response;
       try {
-        response = await this.authedFetch(
+        response = await this.authedFetch("attachments.get",
           `https://gmail.googleapis.com/gmail/v1/users/me/messages/${snapshot.messageId}/attachments/${snapshot.attachmentId}?fields=data`,
           {signal: begin.signal});
       } finally {
@@ -2902,7 +2905,7 @@ export class GmailApi {
       url.searchParams.append("metadataHeaders", header);
     }
 
-    const response = await this.authedFetch(url.toString());
+    const response = await this.authedFetch("messages.get", url.toString());
     if (!response.ok) {
       await gmailApiFailure("messages.get", response);
     }
@@ -2924,7 +2927,7 @@ export class GmailApi {
   async getMessage(messageId: string): Promise<GmailMessageRaw> {
     validateGmailId(messageId, "message ID");
 
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("messages.get",
       `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=raw`,
     );
 
@@ -2949,7 +2952,7 @@ export class GmailApi {
     }
     for (const id of messageIds) validateGmailId(id, "message ID");
     for (const id of [...addLabelIds, ...removeLabelIds]) validateGmailId(id, "label ID");
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("messages.batchModify",
       "https://gmail.googleapis.com/gmail/v1/users/me/messages/batchModify", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -3261,7 +3264,7 @@ export class GmailApi {
     const message: { raw: string; threadId?: string } =
       threadId !== undefined ? { raw, threadId } : { raw };
 
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("messages.send",
       'https://gmail.googleapis.com/gmail/v1/users/me/messages/send',
       {
         method: 'POST',
@@ -3294,7 +3297,7 @@ export class GmailApi {
     const url = new URL("https://gmail.googleapis.com/gmail/v1/users/me/drafts");
     url.searchParams.set("maxResults", String(count));
     if (pageToken) url.searchParams.set("pageToken", pageToken);
-    const response = await this.authedFetch(url.toString());
+    const response = await this.authedFetch("drafts.list", url.toString());
     if (!response.ok) await gmailApiFailure("drafts.list", response);
     const data = await response.json() as {drafts?: GmailDraftRef[]; nextPageToken?: string};
     return {
@@ -3305,7 +3308,7 @@ export class GmailApi {
 
   async getDraft(draftId: string): Promise<GmailDraftRaw> {
     validateGmailId(draftId, "draft ID");
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("drafts.get",
       `https://gmail.googleapis.com/gmail/v1/users/me/drafts/${draftId}?format=raw`);
     if (!response.ok) await gmailApiFailure("drafts.get", response);
     const draft = await response.json() as GmailDraftRaw;
@@ -3318,7 +3321,7 @@ export class GmailApi {
   /** Fetch a draft MIME tree while retaining detached attachment bodies as lazy IDs. */
   async getDraftFull(draftId: string): Promise<GmailDraftFull> {
     validateGmailId(draftId, "draft ID");
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("drafts.get",
       `https://gmail.googleapis.com/gmail/v1/users/me/drafts/${draftId}?format=full`);
     if (!response.ok) await gmailApiFailure("drafts.get", response);
     const draft = await response.json() as GmailDraftFull;
@@ -3329,7 +3332,7 @@ export class GmailApi {
   async createDraft(
       raw: string, threadId?: string): Promise<{id: string; message: {id: string; threadId?: string}}> {
     if (threadId) validateGmailId(threadId, "thread ID");
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("drafts.create",
       "https://gmail.googleapis.com/gmail/v1/users/me/drafts", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -3344,7 +3347,7 @@ export class GmailApi {
       Promise<{id: string; message: {id: string; threadId?: string}}> {
     validateGmailId(draftId, "draft ID");
     if (threadId) validateGmailId(threadId, "thread ID");
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("drafts.update",
       `https://gmail.googleapis.com/gmail/v1/users/me/drafts/${draftId}`, {
         method: "PUT",
         headers: {"Content-Type": "application/json"},
@@ -3356,7 +3359,7 @@ export class GmailApi {
 
   async deleteDraft(draftId: string): Promise<void> {
     validateGmailId(draftId, "draft ID");
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("drafts.delete",
       `https://gmail.googleapis.com/gmail/v1/users/me/drafts/${draftId}`, {method: "DELETE"});
     if (!response.ok) await gmailApiFailure("drafts.delete", response);
     await response.body?.cancel();
@@ -3366,7 +3369,7 @@ export class GmailApi {
       draftId: string, raw: string, threadId?: string): Promise<{id: string; threadId: string}> {
     validateGmailId(draftId, "draft ID");
     if (threadId) validateGmailId(threadId, "thread ID");
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("drafts.send",
       "https://gmail.googleapis.com/gmail/v1/users/me/drafts/send", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -3386,7 +3389,7 @@ export class GmailApi {
   // ─────────────────────────────────────────────────────────────────
 
   async listLabelRecords(): Promise<GmailLabelRaw[]> {
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("labels.list",
       'https://gmail.googleapis.com/gmail/v1/users/me/labels',
     );
 
@@ -3404,7 +3407,7 @@ export class GmailApi {
 
   async getLabel(labelId: string): Promise<GmailLabelRaw> {
     validateGmailId(labelId, "label ID");
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("labels.get",
       `https://gmail.googleapis.com/gmail/v1/users/me/labels/${labelId}`);
     if (!response.ok) await gmailApiFailure("labels.get", response);
     const label = parseGmailLabelResponse(await response.json(), "get");
@@ -3413,7 +3416,7 @@ export class GmailApi {
   }
 
   async createLabel(name: string): Promise<GmailLabelRaw> {
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("labels.create",
       "https://gmail.googleapis.com/gmail/v1/users/me/labels", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -3431,7 +3434,7 @@ export class GmailApi {
 
   async renameLabel(labelId: string, name: string): Promise<GmailLabelRaw> {
     validateGmailId(labelId, "label ID");
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("labels.update",
       `https://gmail.googleapis.com/gmail/v1/users/me/labels/${labelId}`, {
         method: "PATCH",
         headers: {"Content-Type": "application/json"},
@@ -3453,7 +3456,7 @@ export class GmailApi {
 
   async deleteLabel(labelId: string): Promise<void> {
     validateGmailId(labelId, "label ID");
-    const response = await this.authedFetch(
+    const response = await this.authedFetch("labels.delete",
       `https://gmail.googleapis.com/gmail/v1/users/me/labels/${labelId}`, {method: "DELETE"});
     if (!response.ok) await gmailApiFailure("labels.delete", response);
     await response.body?.cancel();
@@ -3465,7 +3468,8 @@ export class GmailApi {
 
   /** The mailbox's primary address and its current history ID. */
   async getProfile(): Promise<{emailAddress: string; historyId: string}> {
-    const response = await this.authedFetch("https://gmail.googleapis.com/gmail/v1/users/me/profile");
+    const response = await this.authedFetch(
+      "users.getProfile", "https://gmail.googleapis.com/gmail/v1/users/me/profile");
     if (!response.ok) await gmailApiFailure("users.getProfile", response);
     const profile = await response.json() as {emailAddress?: unknown; historyId?: unknown};
     if (typeof profile.emailAddress !== "string") throw new Error("Gmail returned an invalid profile.");
@@ -3477,7 +3481,7 @@ export class GmailApi {
    * Cloud project already has on it. Unfiltered: readers decide which changes matter.
    */
   async watch(topicName: string): Promise<{historyId: string; expiration: number}> {
-    const response = await this.authedFetch("https://gmail.googleapis.com/gmail/v1/users/me/watch", {
+    const response = await this.authedFetch("users.watch", "https://gmail.googleapis.com/gmail/v1/users/me/watch", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({topicName}),
@@ -3502,7 +3506,7 @@ export class GmailApi {
     url.searchParams.set("historyTypes", "messageAdded");
     url.searchParams.set("maxResults", "500");
     if (pageToken) url.searchParams.set("pageToken", pageToken);
-    const response = await this.authedFetch(url.toString());
+    const response = await this.authedFetch("history.list", url.toString());
     if (!response.ok) await gmailApiFailure("history.list", response);
     const data = await response.json() as {
       history?: Array<{

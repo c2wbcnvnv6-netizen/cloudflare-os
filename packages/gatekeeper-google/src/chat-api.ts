@@ -12,6 +12,7 @@
 // user could reach in the Chat UI.
 
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import type { GoogleOperation } from "./call-metrics";
 import { chatCardsFromRaw } from "./chat-cards";
 import { readGoogleJson } from "./google-response";
 import type {
@@ -638,7 +639,7 @@ export class ChatApi {
   constructor(private getAccessToken: AccessTokenProvider) {}
 
   async #request<T>(
-    operation: string,
+    operation: GoogleOperation,
     path: string,
     init?: RequestInit & { idempotent?: boolean },
   ): Promise<T> {
@@ -842,7 +843,8 @@ export class ChatApi {
     });
     if (options.pageToken) params.set("pageToken", options.pageToken);
     const response = await fetchWithAuthRetry(`${PEOPLE_API_BASE}/people:searchDirectoryPeople?${params}`,
-      { headers: { Accept: "application/json" } }, this.getAccessToken);
+      { headers: { Accept: "application/json" } }, this.getAccessToken,
+      { operation: "people.searchDirectoryPeople" });
     const body = await readGoogleJson<{ people?: DirectoryPersonRaw[]; nextPageToken?: string }>(response, {
       provider: "Google People", operation: "people.searchDirectoryPeople", maxBytes: 256 * 1024,
     });
@@ -1045,7 +1047,8 @@ export class ChatApi {
     const params = new URLSearchParams({ personFields: "names", sources: "READ_SOURCE_TYPE_PROFILE" });
     for (const resource of byResource.keys()) params.append("resourceNames", resource);
     const response = await fetchWithAuthRetry(`${PEOPLE_API_BASE}/people:batchGet?${params}`,
-      { headers: { Accept: "application/json" } }, this.getAccessToken);
+      { headers: { Accept: "application/json" } }, this.getAccessToken,
+      { operation: "people.batchGet" });
     if (!response.ok) {
       await response.body?.cancel();
       return names;
@@ -1120,7 +1123,7 @@ export class ChatApi {
       `${CHAT_API_BASE}/media/${resourceName.split("/").map(encodeURIComponent).join("/")}` +
         "?alt=media",
       {},
-      this.getAccessToken);
+      this.getAccessToken, { operation: "media.download" });
     if (!response.ok) await chatApiFailure("media.download", response);
     const declared = Number(response.headers.get("Content-Length") ?? "");
     if (Number.isFinite(declared) && declared > MAX_CHAT_DOWNLOAD_BYTES) {

@@ -4,6 +4,7 @@
 // It follows the same pattern as google-api.ts (which wraps the Gmail API).
 
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import type { GoogleOperation } from "./call-metrics";
 import { GoogleApiError, readGoogleJson } from "./google-response";
 
 // ---------------------------------------------------------------------------
@@ -275,13 +276,15 @@ export class DocsCommentNotSavedError extends Error {}
 export class GoogleDocsApi {
   constructor(private getAccessToken: AccessTokenProvider) {}
 
+  // `name` is the request in the metrics, `operation` what it does in the words of a failure.
   async #request<T>(
+    name: GoogleOperation,
     url: string,
     init: RequestInit,
     operation: string,
   ): Promise<T> {
     let response = await fetchWithAuthRetry(
-      url, init, this.getAccessToken, { timeoutMs: REQUEST_TIMEOUT_MS },
+      url, init, this.getAccessToken, { operation: name, timeoutMs: REQUEST_TIMEOUT_MS },
     );
     return readGoogleJson<T>(response, {
       provider: "Google Docs", operation, maxBytes: MAX_RESPONSE_BYTES,
@@ -291,6 +294,7 @@ export class GoogleDocsApi {
   /** Create an empty document titled `title` in the caller's My Drive, returning its ID. */
   async createDocument(title: string): Promise<string> {
     let { documentId } = await this.#request<{ documentId?: unknown }>(
+      "documents.create",
       `${DOCS_API_BASE}?fields=documentId`,
       {
         method: "POST",
@@ -308,6 +312,7 @@ export class GoogleDocsApi {
   /** Fetch a document and flatten its tab tree. */
   async getDocument(documentId: string): Promise<GoogleDocsDocument> {
     let { documentId: id, title, revisionId, tabs } = await this.#request<GoogleDocsResponse>(
+      "documents.get",
       `${DOCS_API_BASE}/${encodeURIComponent(documentId)}?includeTabsContent=true`,
       {},
       "get document",
@@ -330,6 +335,7 @@ export class GoogleDocsApi {
     let document = await this.#request<
       Pick<GoogleDocsDocument, "documentId" | "title" | "revisionId">
     >(
+      "documents.get",
       `${DOCS_API_BASE}/${encodeURIComponent(documentId)}?fields=documentId,title,revisionId`,
       {},
       "get document metadata",
@@ -348,6 +354,7 @@ export class GoogleDocsApi {
    */
   async getRevisionId(documentId: string): Promise<string | undefined> {
     let data = await this.#request<{ revisionId?: string }>(
+      "documents.get",
       `${DOCS_API_BASE}/${encodeURIComponent(documentId)}?fields=revisionId`,
       {},
       "get revision ID",
@@ -391,6 +398,7 @@ export class GoogleDocsApi {
       replies?: ({ createNamedRange?: { namedRangeId?: string } } & DocsBatchReply)[];
       writeControl?: { requiredRevisionId?: string };
     }>(
+      "documents.batchUpdate",
       `${DOCS_API_BASE}/${encodeURIComponent(documentId)}:batchUpdate`,
       {
         method: "POST",
@@ -417,6 +425,7 @@ export class GoogleDocsApi {
    */
   async deleteNamedRange(documentId: string, namedRangeId: string, tabId: string): Promise<void> {
     await this.#request(
+      "documents.batchUpdate",
       `${DOCS_API_BASE}/${encodeURIComponent(documentId)}:batchUpdate`,
       {
         method: "POST",
@@ -438,6 +447,7 @@ export class GoogleDocsApi {
     documentId: string,
   ): Promise<{ document: GoogleDocsDocument; suggestions: DocsSuggestionRecord[] }> {
     let raw = await this.#request<GoogleDocsResponse & { suggestions?: unknown }>(
+      "documents.get",
       `${DOCS_API_BASE}/${encodeURIComponent(documentId)}?includeTabsContent=true&` +
         "suggestionsViewMode=SUGGESTIONS_INLINE&commentsViewMode=COMMENTS_VIEW_MODE_INCLUDED",
       {},
@@ -502,6 +512,7 @@ export class GoogleDocsApi {
    */
   async getCommentThreads(documentId: string): Promise<DocsCommentRecord[]> {
     let raw = await this.#request<{ documentId?: unknown; comments?: unknown }>(
+      "documents.get",
       `${DOCS_API_BASE}/${encodeURIComponent(documentId)}?includeTabsContent=true&` +
         "suggestionsViewMode=SUGGESTIONS_INLINE&commentsViewMode=COMMENTS_VIEW_MODE_INCLUDED&" +
         `fields=${encodeURIComponent(COMMENT_THREADS_FIELDS)}`,
@@ -545,6 +556,7 @@ export class GoogleDocsApi {
       suggestionResponses?: { createdSuggestionIds?: unknown[] }[];
       commentUpdateState?: unknown;
     }>(
+      "documents.batchUpdate",
       `${DOCS_API_BASE}/${encodeURIComponent(documentId)}:batchUpdate`,
       {
         method: "POST",

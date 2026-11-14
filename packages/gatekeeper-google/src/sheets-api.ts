@@ -3,6 +3,7 @@ import type {
   SpreadsheetValueMode,
 } from "./sheets-read-types";
 import { AccessTokenProvider, fetchWithAuthRetry } from "./auth-retry";
+import type { GoogleOperation } from "./call-metrics";
 import { readGoogleJson } from "./google-response";
 import {
   baseFormats, FORMAT_READ_FIELDS, type BaseFormats, type RestFormatSheet,
@@ -238,9 +239,13 @@ const BLANK_SHEET = { sheetId: 0, title: "Sheet1", rowCount: 1000, columnCount: 
 export class GoogleSheetsApi {
   constructor(private getAccessToken: AccessTokenProvider) {}
 
-  async #request<T>(url: URL, operation: string, init: RequestInit = {}): Promise<T> {
+  // `name` is the request in the metrics, `operation` what it does in the words of a failure.
+  async #request<T>(
+    name: GoogleOperation, url: URL, operation: string, init: RequestInit = {},
+  ): Promise<T> {
     let response = await fetchWithAuthRetry(
-      url.toString(), init, this.getAccessToken, { timeoutMs: REQUEST_TIMEOUT_MS },
+      url.toString(), init, this.getAccessToken,
+      { operation: name, timeoutMs: REQUEST_TIMEOUT_MS },
     );
     return readGoogleJson<T>(response, {
       provider: "Google Sheets", operation, maxBytes: MAX_RESPONSE_BYTES,
@@ -252,7 +257,8 @@ export class GoogleSheetsApi {
     let url = new URL(API_BASE);
     url.searchParams.set("fields", "spreadsheetId");
     let { sheetId, title: sheetTitle, rowCount, columnCount } = BLANK_SHEET;
-    let { spreadsheetId } = await this.#request<{ spreadsheetId?: unknown }>(url, "create spreadsheet", {
+    let { spreadsheetId } = await this.#request<{ spreadsheetId?: unknown }>(
+        "spreadsheets.create", url, "create spreadsheet", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -269,7 +275,8 @@ export class GoogleSheetsApi {
   async getSpreadsheet(spreadsheetId: string): Promise<SpreadsheetInfo> {
     let url = new URL(`${API_BASE}/${encodeURIComponent(spreadsheetId)}`);
     url.searchParams.set("fields", `${SPREADSHEET_FIELDS},sheets(${SHEET_PROPERTIES_FIELDS})`);
-    return spreadsheetInfo(await this.#request<RestSpreadsheet>(url, "get spreadsheet"));
+    return spreadsheetInfo(
+      await this.#request<RestSpreadsheet>("spreadsheets.get", url, "get spreadsheet"));
   }
 
   /** A spreadsheet's metadata and the ranges it protects, but not who may edit them. */
@@ -277,7 +284,8 @@ export class GoogleSheetsApi {
     let url = new URL(`${API_BASE}/${encodeURIComponent(spreadsheetId)}`);
     url.searchParams.set(
       "fields", `${SPREADSHEET_FIELDS},sheets(${METADATA_PROPERTIES_FIELDS},${PROTECTED_RANGE_FIELDS})`);
-    let result = await this.#request<RestSpreadsheet>(url, "get spreadsheet metadata");
+    let result = await this.#request<RestSpreadsheet>(
+      "spreadsheets.get", url, "get spreadsheet metadata");
     let protectedRanges = (result.sheets ?? []).flatMap(sheet => {
       let sheetId = sheet.properties?.sheetId;
       if (sheetId === undefined) return [];
@@ -315,6 +323,7 @@ export class GoogleSheetsApi {
     if (valueMode === "raw") url.searchParams.set("dateTimeRenderOption", "SERIAL_NUMBER");
 
     let result = await this.#request<{ valueRanges?: RestValueRange[] }>(
+      "values.batchGet",
       url,
       "read ranges",
     );
@@ -355,7 +364,8 @@ export class GoogleSheetsApi {
         }),
       },
       // A read, however it is sent.
-      this.getAccessToken, { timeoutMs: REQUEST_TIMEOUT_MS, idempotent: true },
+      this.getAccessToken,
+      { operation: "spreadsheets.getByDataFilter", timeoutMs: REQUEST_TIMEOUT_MS, idempotent: true },
     );
     let result = await readGoogleJson<{ sheets?: RestGridSheet[] }>(response, {
       provider: "Google Sheets", operation: "read entered values", maxBytes: MAX_RESPONSE_BYTES,
@@ -415,7 +425,8 @@ export class GoogleSheetsApi {
         }),
       },
       // A read, however it is sent.
-      this.getAccessToken, { timeoutMs: REQUEST_TIMEOUT_MS, idempotent: true },
+      this.getAccessToken,
+      { operation: "values.batchGetByDataFilter", timeoutMs: REQUEST_TIMEOUT_MS, idempotent: true },
     );
     let result = await readGoogleJson<{
       valueRanges?: { valueRange?: RestValueRange; dataFilters?: { gridRange?: RestGridRange }[] }[];
@@ -443,7 +454,8 @@ export class GoogleSheetsApi {
     url.searchParams.set("fields", FORMAT_READ_FIELDS);
     // Each colour comes back in two forms, so a pretty-printed answer reaches the size cap early.
     url.searchParams.set("prettyPrint", "false");
-    let result = await this.#request<{ sheets?: RestFormatSheet[] }>(url, "read formats");
+    let result = await this.#request<{ sheets?: RestFormatSheet[] }>(
+      "spreadsheets.get", url, "read formats");
     let sheets = (result.sheets ?? []).map(sheet => ({
       sheet,
       title: sheet.properties?.title ?? "",
@@ -502,7 +514,8 @@ export class GoogleSheetsApi {
         }),
       },
       // A read, however it is sent.
-      this.getAccessToken, { timeoutMs: REQUEST_TIMEOUT_MS, idempotent: true },
+      this.getAccessToken,
+      { operation: "spreadsheets.getByDataFilter", timeoutMs: REQUEST_TIMEOUT_MS, idempotent: true },
     );
     let result = await readGoogleJson<{ sheets?: RestFormatSheet[] }>(response, {
       provider: "Google Sheets", operation: "read formats", maxBytes: MAX_RESPONSE_BYTES,
@@ -525,7 +538,8 @@ export class GoogleSheetsApi {
       `${API_BASE}/${encodeURIComponent(spreadsheetId)}/developerMetadata/${metadataId}`);
     url.searchParams.set("fields", "metadataValue");
     let response = await fetchWithAuthRetry(
-      url.toString(), {}, this.getAccessToken, { timeoutMs: REQUEST_TIMEOUT_MS },
+      url.toString(), {}, this.getAccessToken,
+      { operation: "developerMetadata.get", timeoutMs: REQUEST_TIMEOUT_MS },
     );
     if (response.status === 404) {
       await response.body?.cancel();
@@ -549,7 +563,8 @@ export class GoogleSheetsApi {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ requests }),
       },
-      this.getAccessToken, { timeoutMs: REQUEST_TIMEOUT_MS },
+      this.getAccessToken,
+      { operation: "spreadsheets.batchUpdate", timeoutMs: REQUEST_TIMEOUT_MS },
     );
     if (response.ok) {
       await response.body?.cancel();

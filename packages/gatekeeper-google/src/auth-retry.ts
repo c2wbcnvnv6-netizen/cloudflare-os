@@ -26,7 +26,7 @@
 // Both concerns share a single attempt counter, so the worst case is a predictable `retries + 2`
 // requests: `retries` transient attempts plus one each for the 401 refresh and the 403 reload.
 
-import { GOOGLE_API_SOURCE, googleService, recordCall } from "./call-metrics";
+import { recordRequest, type GoogleOperation } from "./call-metrics";
 
 /**
  * Options for requesting an access token.
@@ -62,8 +62,8 @@ export type FetchWithAuthRetryOptions = {
    * is still just a read (Drive's batch `files.get` envelope).
    */
   idempotent?: boolean;
-  /** What the request does, a literal, for the metrics. The HTTP method unless given. */
-  operation?: string;
+  /** What the request does, for the metrics: its name in the closed list, a literal. */
+  operation: GoogleOperation;
 };
 
 const BASE_DELAY_MS = 500;
@@ -92,30 +92,6 @@ function backoffDelayMs(attempt: number, retryAfter: string | null): number {
   return Math.random() * capped;
 }
 
-// Counts one request: `answer` is the status it was answered with, or why it threw. Nothing here
-// may throw, since a metric cannot fail the request it counts.
-function recordAttempt(
-  url: string, operation: string, startedAt: number, answer: number | "timeout" | "network",
-): void {
-  try {
-    let call = {
-      source: GOOGLE_API_SOURCE, service: googleService(url), operation,
-      durationMs: Date.now() - startedAt,
-    };
-    if (typeof answer !== "number") {
-      recordCall({ ...call, outcome: "error", reason: answer });
-    } else if (answer < 400) {
-      recordCall({ ...call, outcome: "success", httpStatus: answer });
-    } else if (answer === 429) {
-      recordCall({ ...call, outcome: "refused", reason: "rate", httpStatus: answer });
-    } else {
-      recordCall({ ...call, outcome: "error", reason: "http", httpStatus: answer });
-    }
-  } catch {
-    // The request goes uncounted.
-  }
-}
-
 /**
  * Perform an authenticated fetch, injecting a Bearer token and applying both retry concerns
  * described at the top of this file. The `Authorization` header is set from the (possibly
@@ -126,12 +102,12 @@ export async function fetchWithAuthRetry(
   url: string,
   init: RequestInit,
   getAccessToken: AccessTokenProvider,
-  opts: FetchWithAuthRetryOptions = {},
+  opts: FetchWithAuthRetryOptions,
 ): Promise<Response> {
   let method = (init.method ?? "GET").toUpperCase();
   let retries = opts.retries ?? 3;
   let idempotent = method === "GET" || opts.idempotent === true;
-  let operation = opts.operation ?? method;
+  let operation = opts.operation;
   // A request can only be replayed if its body can be sent again. A string or byte-array body
   // (what the call sites use today) re-serializes fine; a stream is consumed by the first
   // attempt, so retrying it would send an empty or errored body. Nothing to replay is likewise
@@ -174,7 +150,7 @@ export async function fetchWithAuthRetry(
       // reason's name is read.
       let waitedOut = init.signal?.reason?.name === "TimeoutError";
       if (!unsent && (!init.signal?.aborted || waitedOut)) {
-        recordAttempt(
+        recordRequest(
           url, operation, startedAt, timeout?.aborted || waitedOut ? "timeout" : "network");
       }
       // Network error or timeout: ambiguous, so retry only when the request is safe to replay,
@@ -187,7 +163,7 @@ export async function fetchWithAuthRetry(
       throw error;
     }
     // Every answer is counted, one that is then retried with another token included.
-    recordAttempt(url, operation, startedAt, response.status);
+    recordRequest(url, operation, startedAt, response.status);
 
     if (response.status === 401 && !refreshed && replayable) {
       // Deliberately does not touch `attempt`: the refresh is one-shot, so it can add at most one
