@@ -1,6 +1,7 @@
 // Fixture for the suites that need real Durable Object storage rather than the cloning Node fake.
 
 import { DurableObject, RpcTarget, WorkerEntrypoint, type RpcStub } from "cloudflare:workers";
+import { ChunkedValues } from "../../src/chunked-value";
 import { HookRegistry } from "../../src/hook-registry";
 import { ObserverTracker } from "../../src/observers";
 export { ConformanceAccount, ConformanceResource, ConformanceVerifier } from "./conformance/gatekeeper";
@@ -127,6 +128,62 @@ export class HookHost extends DurableObject {
   received(message: string): void {
     this.#received.push(message);
   }
+}
+
+/**
+ * Chunked values over a real DO's storage. Large byte arrays stay inside the Durable Object: a
+ * test passes a length and a seed, and reads back small results.
+ */
+export class ChunkedValueHost extends DurableObject {
+  readonly #values = new ChunkedValues(this.ctx.storage, { prefix: "values:" });
+
+  /** Puts `length` bytes made from `seed`, with a meta storage refuses unless `storableMeta`. */
+  put(name: string, length: number, seed: number, storableMeta = true): void {
+    this.#values.put(name, fixtureBytes(length, seed), storableMeta ? { seed } : () => {});
+  }
+
+  /** Whether the value reads back as exactly what `put` stored, or `undefined` when it is missing. */
+  matches(name: string, length: number, seed: number): boolean | undefined {
+    const value = this.#values.get(name);
+    if (!value) return undefined;
+    const expected = fixtureBytes(length, seed);
+    return JSON.stringify(value.meta) === JSON.stringify({ seed }) &&
+      value.bytes.byteLength === length &&
+      value.bytes.every((byte, index) => byte === expected[index]);
+  }
+
+  /** Every key of the value. `buffer` is what a chunk key really holds: `bytes` is only its view. */
+  stored(name: string): { key: string; bytes: number; buffer: number }[] {
+    return [...this.ctx.storage.kv.list<unknown>({ prefix: `values:${name}:` })].map(([key, value]) =>
+      value instanceof Uint8Array
+        ? { key, bytes: value.byteLength, buffer: value.buffer.byteLength }
+        : { key, bytes: 0, buffer: 0 });
+  }
+
+  /** Reads the value at every step of a scan this method holds open; answers the keys it was given. */
+  readDuringScan(name: string): string[] {
+    const visited: string[] = [];
+    for (const [key] of this.ctx.storage.kv.list({ prefix: `values:${name}:` })) {
+      this.#values.get(name);
+      this.#values.meta(name);
+      visited.push(key);
+    }
+    return visited;
+  }
+
+  /** Puts inside a transaction of the caller's that then fails. */
+  putThenFail(name: string, length: number, seed: number): void {
+    this.ctx.storage.transactionSync(() => {
+      this.put(name, length, seed);
+      throw new Error("The transaction around the put failed.");
+    });
+  }
+}
+
+function fixtureBytes(length: number, seed: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  for (let index = 0; index < length; index++) bytes[index] = (index * 31 + seed) % 251;
+  return bytes;
 }
 
 export default {

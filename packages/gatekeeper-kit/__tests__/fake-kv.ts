@@ -1,6 +1,7 @@
 /**
  * Durable Object KV fake. Cloning catches in-place mutation and reference comparisons; sorted scans
  * match KV's key order rather than `Map` insertion order. Writes are recorded for ordering assertions.
+ * `fakeStorage()` is the same fake with the synchronous transaction surface, which rolls back.
  */
 export type FakeKv = {
   get<T>(key: string): T | undefined;
@@ -13,11 +14,17 @@ export type FakeKv = {
   keys(): string[];
 };
 
+/** Test-only: a `fakeKv()` with the synchronous transaction surface, which rolls back. */
+export type FakeStorage = {
+  readonly kv: FakeKv;
+  /** Runs `callback`; a throw restores every key to what it held on entry, and is rethrown. Nests. */
+  transactionSync<T>(callback: () => T): T;
+};
+
 const byKey = ([a]: [string, unknown], [b]: [string, unknown]): number =>
   a < b ? -1 : a > b ? 1 : 0;
 
-export function fakeKv(): FakeKv {
-  const values = new Map<string, unknown>();
+function fakeKvOver(values: Map<string, unknown>): FakeKv {
   const writes: string[] = [];
   return {
     get: <T>(key: string) => {
@@ -40,5 +47,28 @@ export function fakeKv(): FakeKv {
     },
     writes,
     keys: () => [...values.keys()].toSorted(),
+  };
+}
+
+export function fakeKv(): FakeKv {
+  return fakeKvOver(new Map());
+}
+
+/** A `fakeKv()` whose `transactionSync` undoes the writes of a callback that throws. */
+export function fakeStorage(): FakeStorage {
+  const values = new Map<string, unknown>();
+  return {
+    kv: fakeKvOver(values),
+    transactionSync<T>(callback: () => T): T {
+      // Stored values are clones nothing changes in place, so a copy of the map is a snapshot.
+      const onEntry = new Map(values);
+      try {
+        return callback();
+      } catch (error) {
+        values.clear();
+        for (const [key, value] of onEntry) values.set(key, value);
+        throw error;
+      }
+    },
   };
 }

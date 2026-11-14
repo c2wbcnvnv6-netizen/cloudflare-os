@@ -4,18 +4,24 @@
 // `ctx.exports` from `GlobalProps.mainModule`, so both are declared here: the kit ships no
 // wrangler.jsonc of its own, so there is no generated `worker-configuration.d.ts` to carry them.
 
-import type { HookHost, TrackerHost } from "./workerd/worker.js";
+import type { ChunkedValueHost, HookHost, TrackerHost } from "./workerd/worker.js";
 import type { ConformanceAccount, ConformanceResource } from "./workerd/conformance/gatekeeper.js";
 
 declare global {
   namespace Cloudflare {
     interface GlobalProps {
       mainModule: typeof import("./workerd/worker.js");
-      durableNamespaces: "TrackerHost" | "HookHost" | "ConformanceAccount" | "ConformanceResource";
+      durableNamespaces:
+        | "TrackerHost"
+        | "HookHost"
+        | "ChunkedValueHost"
+        | "ConformanceAccount"
+        | "ConformanceResource";
     }
     interface Env {
       TRACKER_HOST: DurableObjectNamespace<TrackerHost>;
       HOOK_HOST: DurableObjectNamespace<HookHost>;
+      CHUNKED_VALUE_HOST: DurableObjectNamespace<ChunkedValueHost>;
       CONFORMANCE_ACCOUNT: DurableObjectNamespace<ConformanceAccount>;
       CONFORMANCE_RESOURCE: DurableObjectNamespace<ConformanceResource>;
     }
