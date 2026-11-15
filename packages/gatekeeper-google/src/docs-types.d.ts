@@ -245,6 +245,12 @@ export type GoogleDocStyles = {
     /** The named style the paragraph has. */
     style: string;
 
+    /**
+     * What a link to this heading names it by: such a link reads `#heading=<headingId>` in the
+     * Markdown, after `?tab=<tabId>` when it is to another tab.
+     */
+    headingId?: string;
+
     /** What the paragraph, or all of its text, sets differently from that named style. */
     look?: GoogleDocLook;
 

@@ -68,7 +68,7 @@ export type MarkdownRange = { mdStart: number; mdEnd: number };
  * produces changes, so callers caching a {@link DocTabSnapshot} discard entries built by older
  * code. It lives here because edits to this file are what invalidate them.
  */
-export const MARKDOWN_RENDERING_VERSION = 9;
+export const MARKDOWN_RENDERING_VERSION = 10;
 
 type ListType = "bullet" | "numbered";
 

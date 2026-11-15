@@ -817,6 +817,7 @@ describe("Google Docs tables", () => {
     let paragraphs = tab.body.content.filter(element => element.paragraph).map(element => element.paragraph!);
     // The title repeats what its named style says; the last paragraph departs from Normal text.
     paragraphs[0].paragraphStyle.alignment = "START";
+    paragraphs[0].paragraphStyle.headingId = "h.report";
     paragraphs[2].paragraphStyle.alignment = "CENTER";
     paragraphs[2].elements[0].textRun!.textStyle = { foregroundColor: { color: { rgbColor: { red: 1 } } } };
 
@@ -845,7 +846,8 @@ describe("Google Docs tables", () => {
         },
       },
       paragraphs: [
-        { line: expect.any(Number), style: "TITLE" },
+        // What a link to the heading names it by.
+        { line: expect.any(Number), style: "TITLE", headingId: "h.report" },
         { line: expect.any(Number), style: "NORMAL_TEXT" },
         { line: expect.any(Number), style: "NORMAL_TEXT", look: { color: "#ff0000", alignment: "center" } },
         // A stretch drawn differently from the rest of its line, by where it is in the line.

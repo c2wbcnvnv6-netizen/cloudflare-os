@@ -174,8 +174,10 @@ export function docTabStyles(
       if (last?.look === index && last.end === start) last.end = end;
       else runs.push({ start, end, look: index });
     }
+    let { headingId } = paragraph.paragraphStyle;
     return {
       line, style,
+      ...headingId ? { headingId } : {},
       ...own.length ? { look: Object.fromEntries(own) as DocLook } : {},
       ...runs.length ? { runs } : {},
     };
