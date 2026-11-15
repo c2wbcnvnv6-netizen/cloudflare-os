@@ -2,7 +2,8 @@
 // runs in the gadget UI frame, where `gadget` is a GoogleDocSession rather than a gadget server.
 //
 // Everything the document says is set as text or built node by node. Nothing from it is parsed
-// as HTML into this document, and links are shown but not followed.
+// as HTML into this document, and a link is shown but not followed unless it is to a tab or a
+// heading of this document.
 
 const style = document.createElement('style');
 style.textContent = `
@@ -19,10 +20,6 @@ style.textContent = `
     font: 11pt/1.5 Arial, Helvetica, sans-serif; }
   button { font: inherit; color: inherit; cursor: pointer; }
   [hidden] { display: none !important; }
-  #tabs { display: flex; gap: 4px; padding: 8px 16px 0; flex-wrap: wrap; }
-  #tabs button { font-size: 12px; padding: 4px 10px; border: 1px solid var(--line);
-    border-radius: 999px; background: transparent; color: var(--dim); transition: background .15s; }
-  #tabs button[aria-pressed="true"] { background: var(--page); color: var(--ink); }
   #page { box-sizing: border-box; max-width: var(--width); min-height: calc(100% - 32px);
     margin: 16px auto 120px; padding: var(--pad); background: var(--page); border-radius: 2px;
     box-shadow: var(--paper); overflow-wrap: anywhere; overflow-x: clip; animation: arrive .25s ease-out; }
@@ -42,6 +39,7 @@ style.textContent = `
   .item > :last-child { flex: 1; min-width: 0; padding: 0; }
   .b { font-weight: 700; } .i { font-style: italic; } .s { text-decoration: line-through; }
   .link { color: var(--link); text-decoration: underline; cursor: help; }
+  .link[title*="#heading="], .link[title^="?tab="] { cursor: pointer; }
   .link.s { text-decoration: underline line-through; }
   .chip { display: inline-block; padding: 0 8px; border-radius: 999px; background: var(--chip);
     color: var(--dim); font-size: 9pt; line-height: 1.7; user-select: none; }
@@ -94,30 +92,62 @@ style.textContent = `
     color: var(--dim); transition: background .15s, color .15s; }
   #outline-toggle:hover, #outline-toggle[aria-expanded="true"] { background: var(--chip); color: var(--ink); }
   #outline { position: fixed; z-index: 2; inset: 0 auto 0 0; box-sizing: border-box; width: 240px;
-    padding: 0 10px 24px 14px; overflow-y: auto; scrollbar-width: thin; background: var(--desk);
+    padding: 0 10px 24px 14px; overflow-y: auto; scrollbar-width: thin;
+    scrollbar-color: var(--line) transparent; background: var(--desk);
     font-size: 12px; animation: slide .2s ease-out; }
   #outline h2 { position: sticky; z-index: 1; top: 0; margin: 0 -10px 6px -14px; padding: 0 0 0 48px;
     background: inherit; font-size: 11px; font-weight: 700; line-height: 40px; letter-spacing: .08em;
     text-transform: uppercase; color: var(--dim); }
+  /* The document's tabs, as Docs lists them: the one shown holds its headings. */
+  #outline .tab { display: flex; align-items: center; margin: 2px 0; padding: 0 6px 0 4px;
+    border-radius: 999px; color: var(--dim); transition: background .12s, color .12s;
+    scroll-margin: 46px 0 8px; }
+  #outline .tab:hover { background: var(--chip); color: var(--ink); }
+  #outline .tab.on { background: color-mix(in srgb, var(--link) 14%, transparent); color: var(--ink); }
+  .tab .name { display: flex; flex: 1; align-items: center; gap: 8px; min-width: 0; padding: 7px 4px;
+    border: 0; background: none; color: inherit; text-align: left; }
+  .tab.on .name { font-weight: 700; }
+  .tab.on .name > svg { color: var(--link); }
+  .name > svg { flex: none; }
+  .name > span, .entry > span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; }
+  #outline .tab + #rail { margin: 4px 0 8px 14px; }
+  /* The arrow that folds a tab's headings, or a heading's own, away. Only it folds: the name
+     beside it still goes to the tab or the heading. */
+  .fold, .gap { flex: none; width: 20px; height: 20px; }
+  .fold { display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%;
+    background: none; color: var(--dim); opacity: .6; transition: background .12s, opacity .12s; }
+  .fold:hover { background: var(--shine); color: var(--ink); opacity: 1; }
+  .fold > svg { transition: transform .15s ease-out; }
+  .fold[aria-expanded="false"] > svg { transform: rotate(-90deg); }
   /* One rail down the headings, and a thumb on it that slides to the one being read. */
   #rail { position: relative; border-left: 1px solid var(--line); }
   #thumb { position: absolute; top: 0; left: -2px; width: 3px; border-radius: 3px;
     background: var(--link); transition: transform .2s ease-out, height .2s ease-out; }
-  #rail button { display: flex; align-items: center; gap: 6px; width: 100%; padding: 5px 8px;
-    border: 0; border-radius: 0 6px 6px 0; background: none; color: var(--dim); line-height: 1.4;
+  /* Clear of the panel's header when the outline scrolls to the heading being read. */
+  #rail .row { display: flex; align-items: center; scroll-margin: 46px 0 8px; }
+  .entry { display: flex; flex: 1; align-items: center; gap: 6px; min-width: 0; padding: 5px 8px 5px 4px;
+    border: 0; border-radius: 6px; background: none; color: var(--dim); line-height: 1.4;
     text-align: left; transition: background .12s, color .12s; }
-  #rail button > span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  #rail button.top { color: var(--ink); font-weight: 700; }
-  #rail button:hover { background: var(--chip); color: var(--ink); }
-  #rail button[aria-current="true"] { color: var(--link); }
-  #rail .touched::after { content: ''; flex: none; width: 6px; height: 6px; margin-right: 3px;
+  .entry.top { color: var(--ink); font-weight: 700; }
+  .entry:hover { background: var(--chip); color: var(--ink); }
+  .entry[aria-current="true"] { color: var(--link); }
+  .entry.touched::after { content: ''; flex: none; width: 6px; height: 6px; margin-right: 3px;
     border-radius: 50%; background: var(--mark-ink); box-shadow: 0 0 0 3px var(--mark); }
   @keyframes slide { from { opacity: 0; transform: translateX(-12px); } }
   body { transition: padding-left .2s ease-out; }
-  .has-outline #tabs { padding-left: 48px; }
-  .outlined { padding-left: 240px; }
+  /* Where there is room the outline is a sheet of its own beside the page: level with it, and
+     kept to its edge rather than the frame's. Its button stays where that sheet's corner is. */
+  :root { --outline: 240px; --top: 16px; }
+  @media (min-width: 1400px) { :root { --outline: 296px; } }
+  @media (min-width: 1000px) {
+    body { --dock: calc(8px + max(0px, (100% - var(--outline) - 20px - var(--width)) / 2)); }
+    .outlined { padding-left: calc(var(--outline) + 20px); }
+    #outline { inset: var(--top) auto 16px var(--dock); width: var(--outline); border-radius: 8px;
+      background: var(--page); box-shadow: var(--paper); }
+    #outline-toggle { top: calc(var(--top) + 6px); left: calc(var(--dock) + 10px); }
+  }
   @media (max-width: 999px) {
-    .outlined { padding-left: 0; }
     #outline { background: var(--page); border-radius: 0 12px 12px 0;
       box-shadow: var(--paper), 8px 0 32px rgb(0 0 0 / .18); }
   }
@@ -136,34 +166,37 @@ const make = (tag, className, text) => {
   return element;
 };
 
-const tabBar = document.body.appendChild(make('div'));
-tabBar.id = 'tabs';
 const staleNote = document.body.appendChild(make('div'));
 staleNote.id = 'stale';
 staleNote.hidden = true;
 const page = document.body.appendChild(make('div'));
 page.id = 'page';
-const outlineToggle = document.body.appendChild(make('button'));
-outlineToggle.id = 'outline-toggle';
-{
+/** A line icon drawn from one path. */
+function lineIcon(path, size = 18) {
   const SVG = 'http://www.w3.org/2000/svg';
-  const icon = outlineToggle.appendChild(document.createElementNS(SVG, 'svg'));
-  for (const [name, value] of Object.entries({ viewBox: '0 0 20 20', width: 18, height: 18,
-    fill: 'none', stroke: 'currentColor', 'stroke-width': 1.7, 'stroke-linecap': 'round' })) {
+  const icon = document.createElementNS(SVG, 'svg');
+  for (const [name, value] of Object.entries({ viewBox: '0 0 20 20', width: size, height: size,
+    fill: 'none', stroke: 'currentColor', 'stroke-width': 1.7, 'stroke-linecap': 'round',
+    'stroke-linejoin': 'round' })) {
     icon.setAttribute(name, value);
   }
-  icon.appendChild(document.createElementNS(SVG, 'path'))
-    .setAttribute('d', 'M4 5h.5M8 5h8M4 10h.5M8 10h8M4 15h.5M8 15h8');
+  icon.appendChild(document.createElementNS(SVG, 'path')).setAttribute('d', path);
+  return icon;
 }
+
+const outlineToggle = document.body.appendChild(make('button'));
+outlineToggle.id = 'outline-toggle';
+outlineToggle.append(lineIcon('M4 5h.5M8 5h8M4 10h.5M8 10h8M4 15h.5M8 15h8'));
 outlineToggle.hidden = true;
-outlineToggle.setAttribute('aria-label', 'Document outline');
+outlineToggle.setAttribute('aria-label', 'Tabs and outline');
 outlineToggle.addEventListener('click', () => showOutline(outlineChosen = outline.hidden));
 const outline = document.body.appendChild(make('nav'));
 outline.id = 'outline';
 outline.hidden = true;
-outline.setAttribute('aria-label', 'Document outline');
-outline.appendChild(make('h2', '', 'Outline'));
-const rail = outline.appendChild(make('div'));
+outline.setAttribute('aria-label', 'Tabs and outline');
+const outlineTitle = outline.appendChild(make('h2'));
+const outlineList = outline.appendChild(make('div'));
+const rail = make('div');
 rail.id = 'rail';
 const thumb = make('div');
 thumb.id = 'thumb';
@@ -663,6 +696,7 @@ function lookUp(words, was, styles) {
 function applyLook(element, block, was, mark, styles) {
   if (block.line === undefined) return;
   const paragraph = styles.lines.get(was?.line);
+  if (paragraph?.headingId) element.dataset.heading = paragraph.headingId;
   const style = paragraph?.style ?? styleOf(block);
   const look = { ...styles.named[style], ...paragraph?.look };
   const text = block.type === 'p' ? element : element.lastChild;
@@ -771,8 +805,8 @@ function showError(error, retry) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The outline: the tab's headings as Docs lists them beside the page, with a dot on each whose
-// section holds a change.
+// The outline: the document's tabs and, under the one shown, its headings, as Docs lists them
+// beside the page, with a dot on each heading whose section holds a change.
 
 const HEADINGS = 'h1, h2, h3, h4, h5, h6';
 const roomForOutline = () => matchMedia('(min-width: 1000px)').matches;
@@ -780,6 +814,8 @@ const roomForOutline = () => matchMedia('(min-width: 1000px)').matches;
 let outlineChosen;
 let headings = [];
 let entries = [];
+// What has been folded away: a tab by its ID, a heading by its tab, level and text.
+const folded = new Set();
 let reading = -1;
 
 function showOutline(open) {
@@ -789,20 +825,36 @@ function showOutline(open) {
   markHeading();
 }
 
+/** The arrow that folds away what `key` names, or the gap one would fill when there is nothing to fold. */
+function foldArrow(key, label) {
+  if (!key) return make('span', 'gap');
+  const arrow = make('button', 'fold');
+  arrow.append(lineIcon('M6 8l4 4.5L14 8', 14));
+  arrow.setAttribute('aria-label', label);
+  arrow.setAttribute('aria-expanded', String(!folded.has(key)));
+  arrow.addEventListener('click', () => {
+    if (!folded.delete(key)) folded.add(key);
+    renderOutline();
+  });
+  return arrow;
+}
+
 function renderOutline() {
   // As in Docs, a heading inside a table is not listed; one being removed is no longer there.
   headings = [...page.querySelectorAll(HEADINGS)]
     .filter(heading => !heading.closest('.removed, table') && heading.textContent.trim());
   const blocks = headings.map(heading => heading.closest('#page > *'));
   const top = Math.min(...headings.map(heading => Number(heading.tagName[1])));
+  const levels = headings.map(heading => Number(heading.tagName[1]) - top);
+  // The heading whose headings are folded away, while the ones under it are passed.
+  let folder;
   entries = headings.map((heading, index) => {
     const copy = heading.cloneNode(true);
     for (const gone of copy.querySelectorAll('del')) gone.remove();
-    const level = Number(heading.tagName[1]) - top;
-    const entry = make('button', level ? '' : 'top');
+    const level = levels[index];
+    const entry = make('button', level ? 'entry' : 'entry top');
     entry.appendChild(make('span', '', copy.textContent.trim()));
     entry.title = entry.textContent;
-    entry.style.paddingLeft = `${8 + level * 12}px`;
     // A heading that has just arrived arrives here as it does on the page.
     if (heading.closest('.fresh')) entry.classList.add('fresh');
     for (let block = blocks[index]; block; block = block.nextElementSibling) {
@@ -813,48 +865,88 @@ function renderOutline() {
       heading.scrollIntoView({ block: 'start', behavior: motion() });
       if (!roomForOutline()) showOutline(outlineChosen = false);
     });
+    const key = `${tabId}\u0000${level}\u0000${entry.textContent}`;
+    const row = make('div', 'row');
+    row.style.paddingLeft = `${level * 12}px`;
+    row.append(foldArrow(levels[index + 1] > level && key, 'Headings under this one'), entry);
+    if (folder && level <= folder.level) folder = undefined;
+    row.hidden = !!folder;
+    // A change in a section folded away still shows, on the heading it is folded under.
+    if (folder && entry.matches('.touched')) folder.entry.classList.add('touched');
+    else if (!folder && folded.has(key)) folder = { level, entry };
     return entry;
   });
-  rail.replaceChildren(thumb, ...entries);
+  rail.replaceChildren(thumb, ...entries.map(entry => entry.parentElement));
+  thumb.hidden = entries.length === 0;
+  // A document of one tab lists only its headings.
+  const several = tabs.length > 1;
+  outlineTitle.textContent = several ? 'Document tabs' : 'Outline';
+  outlineList.replaceChildren(...!several ? [rail] : tabs.flatMap(tab => {
+    const on = tab.id === tabId;
+    const row = make('div', on ? 'tab on' : 'tab');
+    const name = make('button', 'name');
+    name.append(lineIcon('M6 3h5.5L15 6.5V17H6zM11.5 3v3.5H15M8.5 10.5h4M8.5 13.5h4'), make('span', '', tab.title));
+    name.title = tab.title;
+    name.setAttribute('aria-pressed', String(on));
+    name.addEventListener('click', () => {
+      if (on) return void document.scrollingElement.scrollTo({ top: 0, behavior: motion() });
+      selectTab(tab.id);
+      void load();
+      renderOutline();
+    });
+    row.style.marginLeft = `${tab.nestingLevel * 12}px`;
+    row.append(foldArrow(on && entries.length > 0 && tab.id, 'Headings in this tab'), name);
+    return on && !folded.has(tab.id) ? [row, rail] : [row];
+  }));
+  // Level with the page, which a note above it moves.
+  document.documentElement.style.setProperty('--top', `${page.offsetTop}px`);
   reading = -1;
-  outlineToggle.hidden = headings.length === 0;
-  document.body.classList.toggle('has-outline', headings.length > 0);
-  showOutline(headings.length > 0 && (outlineChosen ?? roomForOutline()));
+  const any = several || headings.length > 0;
+  outlineToggle.hidden = !any;
+  showOutline(any && (outlineChosen ?? roomForOutline()));
 }
 
-/** Marks the heading the top of the view is under. */
+/** Marks the heading the top of the view is under, or the one it is folded under. */
 function markHeading() {
-  if (outline.hidden) return;
+  if (outline.hidden || !rail.isConnected) return;
   let current = 0;
   headings.forEach((heading, index) => {
     if (heading.getBoundingClientRect().top <= 96) current = index;
   });
+  while (current > 0 && entries[current].parentElement.hidden) current--;
   entries.forEach((entry, index) => entry.setAttribute('aria-current', String(index === current)));
-  const entry = entries[current];
-  if (!entry) return;
-  thumb.style.transform = `translateY(${entry.offsetTop}px)`;
-  thumb.style.height = `${entry.offsetHeight}px`;
-  // The outline follows the reading, so the heading being read stays in it.
-  if (current !== reading) entry.scrollIntoView({ block: 'nearest' });
+  const row = entries[current]?.parentElement;
+  if (!row) return;
+  thumb.style.transform = `translateY(${row.offsetTop}px)`;
+  thumb.style.height = `${row.offsetHeight}px`;
+  // The outline follows the reading, so the heading being read stays in it. At the first
+  // heading that is the top of the outline, where the tabs are.
+  if (current === 0) outline.scrollTop = 0;
+  else if (current !== reading) row.scrollIntoView({ block: 'nearest' });
   reading = current;
 }
 
 addEventListener('scroll', () => requestAnimationFrame(markHeading), { passive: true });
 
-function renderTabs() {
-  tabBar.replaceChildren();
-  if (tabs.length < 2) return;
-  for (const tab of tabs) {
-    const button = tabBar.appendChild(make('button', '', tab.title));
-    button.style.marginLeft = `${tab.nestingLevel * 12}px`;
-    button.setAttribute('aria-pressed', String(tab.id === tabId));
-    button.addEventListener('click', () => {
-      selectTab(tab.id);
-      renderTabs();
-      void load();
-    });
+// A link to a tab of this document, or to a heading in one, is followed here. Any other link is
+// only shown: the frame goes nowhere else.
+page.addEventListener('click', async event => {
+  const address = event.target.closest?.('.link')?.title ?? '';
+  const [, tab, heading] = /^(?:\?tab=([^#]*))?(?:#heading=(.*))?$/.exec(address) ?? [];
+  if (tab === undefined && heading === undefined) return;
+  const to = tab && decodeURIComponent(tab);
+  if (to && to !== tabId && tabs.some(({ id }) => id === to)) {
+    selectTab(to);
+    await load();
   }
-}
+  const target = heading && [...page.querySelectorAll('[data-heading]')]
+    .find(element => element.dataset.heading === decodeURIComponent(heading));
+  if (!target) return;
+  target.scrollIntoView({ block: 'start', behavior: motion() });
+  target.classList.remove('fresh', 'flash');
+  void target.offsetWidth;
+  target.classList.add('flash');
+});
 
 function selectTab(id) {
   tabId = id;
@@ -886,7 +978,7 @@ async function load() {
       selectTab((tabs.find(tab => tab.title === title) ?? tabs[0])?.id);
       showLoading();
     }
-    renderTabs();
+    renderOutline();
     // One read: the tab as saved, the tab with its pending changes, and those changes.
     const { savedMarkdown, markdown, changes } = await gadget.getPendingChanges(tabId);
     if (current !== generation) return;
@@ -899,7 +991,7 @@ async function load() {
     const rows = pairEdits(diff(saved, parseBlocks(markdown), blockKey));
     const { width, marginTop, marginRight, marginLeft } = styles?.sheet ?? {};
     if (width) {
-      page.style.setProperty('--width', `${width}pt`);
+      document.documentElement.style.setProperty('--width', `${width}pt`);
       page.style.setProperty('--pad', `${marginTop}pt ${marginRight}pt ${marginTop}pt ${marginLeft}pt`);
     }
     const scrollTop = document.scrollingElement.scrollTop;

@@ -142,7 +142,7 @@ it('draws a page break as the gap between two sheets', async () => {
 
 it('lists the tabs again on a refresh, and leaves a tab that has gone for the first', async () => {
   const { page, refresh } = await draw({ savedMarkdown: '', tabs: ['t.0', 'pending-tab-1'] })
-  const buttons = () => [...frame!.contentDocument!.querySelectorAll<HTMLElement>('#tabs button')]
+  const buttons = () => [...frame!.contentDocument!.querySelectorAll<HTMLElement>('#outline .tab .name')]
   buttons()[1].click()
   await expect.poll(() => page.textContent).toBe('pending-tab-1')
 
@@ -159,7 +159,7 @@ it('lists the headings in an outline, marks a section that holds a change, and s
   const savedMarkdown = `# Intro\n\n${filler}\n\n## Details\n\nOld text\n\n# Last\n\nEnd\n`
   const { page } = await draw({ savedMarkdown, markdown: savedMarkdown.replace('Old text', 'New text') })
   const outline = frame!.contentDocument!.getElementById('outline')!
-  const entries = () => [...outline.querySelectorAll('button')]
+  const entries = () => [...outline.querySelectorAll<HTMLElement>('#rail .entry')]
 
   // The frame is too narrow for the outline to stand beside the page, so it starts closed.
   expect(outline.hidden).toBe(true)
@@ -167,10 +167,58 @@ it('lists the headings in an outline, marks a section that holds a change, and s
 
   expect(entries().map(entry => entry.textContent)).toEqual(['Intro', 'Details', 'Last'])
   expect(entries().map(entry => entry.classList.contains('touched'))).toEqual([false, true, false])
-  expect(entries().map(entry => entry.style.paddingLeft)).toEqual(['8px', '20px', '8px'])
+  expect(entries().map(entry => entry.parentElement!.style.paddingLeft)).toEqual(['0px', '12px', '0px'])
 
   entries()[1].click()
   const details = page.querySelector('h2')!
   await expect.poll(() => Math.round(details.getBoundingClientRect().top)).toBeLessThan(40)
   expect(outline.hidden).toBe(true)
+})
+
+it('folds a heading\'s own headings away from its arrow, and still goes to it from its name', async () => {
+  const filler = Array.from({ length: 60 }, (_, line) => `Line ${line}`).join('\n\n')
+  const savedMarkdown = `# Intro\n\n${filler}\n\n## Details\n\nOld text\n\n# Last\n\nEnd\n`
+  const { page } = await draw({ savedMarkdown, markdown: savedMarkdown.replace('Old text', 'New text') })
+  const outline = frame!.contentDocument!.getElementById('outline')!
+  const rows = () => [...outline.querySelectorAll<HTMLElement>('#rail .row')]
+  const arrows = () => rows().map(row => row.querySelector<HTMLElement>('.fold'))
+
+  // Only a heading with headings under it has an arrow.
+  expect(arrows().map(arrow => arrow?.getAttribute('aria-expanded'))).toEqual(['true', undefined, undefined])
+  const scrolled = () => page.ownerDocument.scrollingElement!.scrollTop
+  const before = scrolled()
+  arrows()[0]!.click()
+
+  expect(rows().map(row => row.hidden)).toEqual([false, true, false])
+  expect(arrows()[0]!.getAttribute('aria-expanded')).toBe('false')
+  // The change under the folded heading shows on it.
+  expect(rows()[0].querySelector('.entry')!.classList.contains('touched')).toBe(true)
+  // Folding goes nowhere.
+  expect(scrolled()).toBe(before)
+
+  rows()[2].querySelector<HTMLElement>('.entry')!.click()
+  const last = page.querySelectorAll('h1')[1]
+  await expect.poll(() => Math.round(last.getBoundingClientRect().top)).toBeLessThan(400)
+  arrows()[0]!.click()
+  expect(rows().map(row => row.hidden)).toEqual([false, false, false])
+})
+
+it('follows a link to a heading of the document, and no other link', async () => {
+  const filler = Array.from({ length: 60 }, (_, line) => `Line ${line}`).join('\n\n')
+  const savedMarkdown = `# Intro\n\nSee [the end](#heading=h.last) or [the web](https://example.com/).\n\n${filler}\n\n# Last\n\nEnd\n`
+  const paragraphs = [
+    { line: 0, style: 'HEADING_1', headingId: 'h.intro' },
+    { line: savedMarkdown.split('\n').indexOf('# Last'), style: 'HEADING_1', headingId: 'h.last' },
+  ]
+  const { page } = await draw({ savedMarkdown, styles: { named: {}, paragraphs, runLooks: [], tables: [] } })
+  const [inside, outside] = [...page.querySelectorAll<HTMLElement>('.link')]
+  const last = page.querySelectorAll('h1')[1]
+  const top = () => Math.round(last.getBoundingClientRect().top)
+  const far = top()
+
+  outside.click()
+  expect(top()).toBe(far)
+
+  inside.click()
+  await expect.poll(top).toBeLessThan(40)
 })
