@@ -2,9 +2,11 @@ import * as fc from "fast-check";
 import { describe, expect, it, vi } from "vitest";
 import { PROPERTY_RUN_OPTIONS } from "@gadgets/scripts/property-runs";
 import { ChunkedValues } from "../src/chunked-value";
+import type { CursorInjection } from "../src/cursors";
 import { createSimulationView, ProvisionalIds, type SimulationRecord } from "../src/simulation";
 import {
   createSimulationStore,
+  simulatedList,
   StoredBase,
   type EntityContext,
   type EntityFold,
@@ -2604,5 +2606,235 @@ describe("StoredBase", () => {
     await fold();
     expect(w.fetches).toBe(3);
     expect(reduced).toBe(2);
+  });
+});
+
+// The fixture is a listing of tasks, newest first, that leaves finished tasks out. A pending
+// `open` makes a task under a temporary id, which later records may name.
+type Task = {
+  readonly id: string;
+  readonly at: number;
+  readonly title: string;
+  readonly done?: true;
+};
+type Change =
+  | { kind: "open"; ref: string; title: string; at: number }
+  | { kind: "retitle"; tasks: readonly string[]; title: string }
+  | { kind: "finish"; task: string }
+  | { kind: "discard"; task: string };
+type Staged = SimulationRecord<Change>;
+
+const task = (id: string, at: number, title = `task ${id}`): Task => ({ id, at, title });
+const opens = (id: number, ref: string, at: number, title = `task ${ref}`): Staged =>
+  ({ id, action: { kind: "open", ref, title, at } });
+const retitles = (id: number, title: string, ...tasks: string[]): Staged =>
+  ({ id, action: { kind: "retitle", tasks, title } });
+const finishes = (id: number, target: string): Staged =>
+  ({ id, action: { kind: "finish", task: target } });
+const discards = (id: number, target: string): Staged =>
+  ({ id, action: { kind: "discard", task: target } });
+
+const taskIds = (action: Change): readonly string[] =>
+  action.kind === "open" ? [action.ref] : action.kind === "retitle" ? action.tasks : [action.task];
+const newestFirst = (a: Task, b: Task): number => b.at - a.at;
+const unfinished = (row: Task): boolean => !row.done;
+
+/**
+ * A listing over a `journal` the test changes as a gatekeeper's would change: the view is built
+ * on each call from `journal.staged`, and `journal.created` is read as it then is.
+ */
+function listing(staged: Staged[], created: string[] = []) {
+  const journal = { staged, created };
+  const reduced: number[] = [];
+  let views = 0;
+  const store = createSimulationStore<string, Task, Task, Staged>({
+    initial: row => row,
+    reduce: (row, { id, action }) => {
+      reduced.push(id);
+      if (action.kind === "open") {
+        return row === undefined
+          ? { kind: "applied", value: task(action.ref, action.at, action.title) }
+          : { kind: "known-no-effect" };
+      }
+      if (row === undefined) return { kind: "known-no-effect" };
+      if (action.kind === "discard") return { kind: "deleted" };
+      return {
+        kind: "applied",
+        value: action.kind === "finish" ? { ...row, done: true } : { ...row, title: action.title },
+      };
+    },
+  });
+  const list = simulatedList({
+    store,
+    view: () => {
+      views++;
+      return createSimulationView(journal.staged, taskIds);
+    },
+    id: row => row.id,
+    compare: newestFirst,
+    keeps: unfinished,
+    created: () => journal.created,
+  });
+  return { journal, store, list, reduced, views: () => views };
+}
+
+describe("simulatedList", () => {
+  it("folds a provider row and drops one its records delete or the listing no longer keeps", () => {
+    const { list } = listing([retitles(1, "renamed", "a"), discards(2, "b"), finishes(3, "c")]);
+    const untouched = task("d", 4);
+
+    expect(list.overlay(task("a", 1))).toEqual([task("a", 1, "renamed")]);
+    expect(list.overlay(task("b", 2))).toEqual([]);
+    expect(list.overlay(task("c", 3))).toEqual([]);
+    // A row no record targets is served as the provider gave it.
+    expect(list.overlay(untouched)[0]).toBe(untouched);
+    expect(Object.isFrozen(list)).toBe(true);
+    expect(Object.isFrozen(list.inject)).toBe(true);
+    expect(Object.isFrozen(list.inject.items)).toBe(true);
+  });
+
+  it("shows every row when the listing has no filter", () => {
+    const store = createSimulationStore<string, Task, Task, Staged>({
+      initial: row => row,
+      reduce: row => ({ kind: "applied", value: { ...row!, done: true } }),
+    });
+    const list = simulatedList({
+      store,
+      view: () => createSimulationView([finishes(1, "a")], taskIds),
+      id: row => row.id,
+      compare: newestFirst,
+    });
+
+    expect(list.overlay(task("a", 1))).toEqual([{ ...task("a", 1), done: true }]);
+    expect(list.inject.items).toEqual([]);
+  });
+
+  it("lists a stand-in for a pending create, with the later records on it folded in", () => {
+    const { list } = listing([opens(1, "~1", 5, "draft"), retitles(2, "final", "~1")], ["~1"]);
+
+    expect(list.inject.items).toEqual([task("~1", 5, "final")]);
+    expect(list.inject.revalidate(list.inject.items[0])).toEqual(task("~1", 5, "final"));
+  });
+
+  it("sorts the stand-ins with the caller's compare", () => {
+    const staged = [opens(1, "~1", 5), opens(2, "~2", 9), opens(3, "~3", 7)];
+    const { list } = listing(staged, ["~1", "~2", "~3"]);
+
+    expect(list.inject.items.map(({ id }) => id)).toEqual(["~2", "~3", "~1"]);
+    expect(list.inject.compare).toBe(newestFirst);
+  });
+
+  it("revalidates a stand-in to null once its create is no longer pending", () => {
+    const { journal, list } = listing([opens(1, "~1", 5)], ["~1"]);
+    const [standIn] = list.inject.items;
+
+    // The create applied: its record left the queue, and its id the pending creates.
+    journal.staged = [];
+    journal.created = [];
+    // A stand-in is what the last refresh left.
+    expect(list.inject.revalidate(standIn)).toEqual(task("~1", 5));
+    list.refresh();
+    expect(list.inject.revalidate(standIn)).toBeNull();
+  });
+
+  it("revalidates a stand-in to null once a later record deletes it", () => {
+    const { journal, list } = listing([opens(1, "~1", 5)], ["~1"]);
+    const [standIn] = list.inject.items;
+
+    journal.staged = [...journal.staged, discards(2, "~1")];
+    list.refresh();
+    expect(list.inject.revalidate(standIn)).toBeNull();
+  });
+
+  it("revalidates a stand-in to null once the listing no longer keeps it", () => {
+    const { journal, list } = listing([opens(1, "~1", 5)], ["~1"]);
+    const [standIn] = list.inject.items;
+
+    journal.staged = [...journal.staged, finishes(2, "~1")];
+    list.refresh();
+    expect(list.inject.revalidate(standIn)).toBeNull();
+  });
+
+  it("revalidates a stand-in as the records staged since leave it", () => {
+    const { journal, list } = listing([opens(1, "~1", 5)], ["~1"]);
+    const [standIn] = list.inject.items;
+
+    journal.staged = [...journal.staged, retitles(2, "renamed", "~1")];
+    list.refresh();
+    expect(list.inject.revalidate(standIn)).toEqual(task("~1", 5, "renamed"));
+    // What a cursor read when it was built stays as it was.
+    expect(list.inject.items).toEqual([task("~1", 5)]);
+  });
+
+  it("revalidates any row that is not a stand-in to null", () => {
+    const { list } = listing([opens(1, "~1", 5), retitles(2, "renamed", "a")], ["~1"]);
+
+    expect(list.inject.revalidate(task("a", 1))).toBeNull();
+    expect(list.inject.revalidate(task("b", 2))).toBeNull();
+  });
+
+  it("forgets the fold of a stand-in whose create is no longer pending", () => {
+    const first = [opens(1, "~1", 5), retitles(2, "final", "~1", "a")];
+    const { journal, store, list, reduced } = listing([...first, opens(3, "~2", 7)], ["~1", "~2"]);
+    const provided = task("a", 1);
+    expect(list.overlay(provided)).toEqual([task("a", 1, "final")]);
+    // The two stand-ins, then the provider's row.
+    expect(reduced).toEqual([1, 2, 3, 2]);
+
+    // While the creates are pending, the stand-ins' folds are remembered.
+    list.refresh();
+    expect(reduced).toEqual([1, 2, 3, 2]);
+
+    // One create leaves. The other stand-in and the provider's row are served from memory.
+    journal.created = ["~2"];
+    list.refresh();
+    expect(list.inject.revalidate(task("~2", 7))).toEqual(task("~2", 7));
+    expect(list.overlay(provided)).toEqual([task("a", 1, "final")]);
+    expect(reduced).toEqual([1, 2, 3, 2]);
+
+    // The one that left is folded from the beginning.
+    expect(store.fold("~1", undefined, first).entity).toEqual(task("~1", 5, "final"));
+    expect(reduced).toEqual([1, 2, 3, 2, 1, 2]);
+  });
+
+  it("gives a cursor's inject its items, compare and revalidate", () => {
+    const { list } = listing([opens(1, "~1", 5)], ["~1"]);
+    const inject: Pick<CursorInjection<Task>, "items" | "compare" | "revalidate"> = list.inject;
+    const complete: CursorInjection<Task> = { ...list.inject, authorize: true, identity: row => row.id };
+
+    expect(inject.items).toEqual([task("~1", 5)]);
+    expect(complete.revalidate?.(inject.items[0])).toEqual(task("~1", 5));
+  });
+
+  it("reads the view at every fold, and the pending creates only at refresh", () => {
+    const { journal, list, views } = listing([opens(1, "~1", 5)], ["~1"]);
+    // One fold made the stand-in.
+    expect(views()).toBe(1);
+
+    // A view that answers other records is seen by the next fold, with no refresh.
+    journal.staged = [...journal.staged, retitles(2, "renamed", "a")];
+    expect(list.overlay(task("a", 1))).toEqual([task("a", 1, "renamed")]);
+    expect(list.overlay(task("b", 2))).toEqual([task("b", 2)]);
+    expect(views()).toBe(3);
+
+    // A create staged since is listed once the gatekeeper refreshes.
+    journal.staged = [...journal.staged, opens(3, "~2", 8)];
+    journal.created = ["~1", "~2"];
+    expect(list.inject.revalidate(task("~2", 8))).toBeNull();
+    expect(views()).toBe(3);
+    list.refresh();
+    expect(list.inject.revalidate(task("~2", 8))).toEqual(task("~2", 8));
+    // One fold for each stand-in.
+    expect(views()).toBe(5);
+  });
+
+  it("folds a record that targets several rows into each", () => {
+    const staged = [opens(1, "~1", 5), retitles(2, "shared", "a", "b", "~1")];
+    const { list } = listing(staged, ["~1"]);
+
+    expect(list.overlay(task("a", 1))).toEqual([task("a", 1, "shared")]);
+    expect(list.overlay(task("b", 2))).toEqual([task("b", 2, "shared")]);
+    expect(list.overlay(task("c", 3))).toEqual([task("c", 3)]);
+    expect(list.inject.items).toEqual([task("~1", 5, "shared")]);
   });
 });

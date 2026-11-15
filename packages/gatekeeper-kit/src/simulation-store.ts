@@ -1,11 +1,11 @@
 /**
- * A remembered fold of pending actions over one entity at a time, and a stored,
- * revision-checked base.
+ * A remembered fold of pending actions over one entity at a time, a stored, revision-checked
+ * base, and the values a kit cursor takes for a listing folded that way.
  */
 
 import type { ChunkedValues } from "./chunked-value";
 import { requirePositiveInt } from "./positive-int";
-import type { SimulationRecord, SimulationStep } from "./simulation";
+import type { SimulationRecord, SimulationStep, SimulationView } from "./simulation";
 import { SingleFlight } from "./single-flight";
 
 /**
@@ -755,4 +755,161 @@ export class StoredBase<Base, Part> {
   #putIndex(index: Index): void {
     this.#values.put(this.#name, EMPTY, index);
   }
+}
+
+/** What `simulatedList` needs of a listing whose rows are entities of a simulation store. */
+export type SimulatedListOptions<
+  Id extends string,
+  Row extends object,
+  R extends SimulationRecord<unknown>,
+> = {
+  /**
+   * The store that folds a row: its base and its entity are both the listing's row. Where its
+   * reducer reads what only this listing knows (who is asking, the folder listed, names read
+   * ahead of the walk), build the store with the listing.
+   */
+  readonly store: SimulationStore<Id, Row, Row, R, unknown>;
+  /**
+   * The index of the pending records by the entity each targets, ids resolved. Read each time
+   * a row is folded (every `overlay`, every stand-in) and never kept. A gatekeeper whose
+   * targets cannot change between two refreshes answers a view it keeps and rebuilds in its
+   * own refresh. One whose targets resolve provisional ids that a create applied mid-walk
+   * binds answers a view built on the call, so a pending record on a provisional id reaches
+   * the provider's row as soon as the id is bound.
+   */
+  readonly view: () => SimulationView<R, Id>;
+  /** The entity a row is. A folded row is the entity its provider row was. */
+  readonly id: (row: Row) => Id;
+  /** The provider's sort order, as `CursorInjection.compare` takes it. */
+  readonly compare: (a: Row, b: Row) => number;
+  /**
+   * Whether the listing shows a row as folded: the gatekeeper's own filter. Read at serve
+   * time, so it may close over state the gatekeeper refreshes. Absent, every row is shown.
+   */
+  readonly keeps?: (row: Row) => boolean;
+  /**
+   * The entities pending creates will make that this listing may show, by their provisional
+   * ids, oldest first. Read when the hooks are made and at every `refresh()`; the gatekeeper
+   * leaves out an id whose create has applied (`ProvisionalIds.isResolved`).
+   */
+  readonly created?: () => readonly Id[];
+};
+
+/** The values a kit cursor takes for a listing with pending changes. */
+export type SimulatedList<Row> = {
+  /**
+   * For `overlay`: a provider row with its pending records folded in, none when a record
+   * deleted it or `keeps` no longer holds. A gatekeeper also passes it the provider rows it
+   * read itself because a pending change moves them into the listing.
+   */
+  readonly overlay: (row: Row) => readonly Row[];
+  /** For `inject`. The caller adds `authorize` and `identity`, which are its own to decide. */
+  readonly inject: {
+    /**
+     * The stand-ins of the pending creates as the hooks were made: each folded from nothing
+     * with the records that target it, kept when `keeps` holds, sorted by `compare`.
+     */
+    readonly items: readonly Row[];
+    /** The caller's `compare`. */
+    readonly compare: (a: Row, b: Row) => number;
+    /**
+     * A stand-in as the last `refresh()` left it, or `null` once its create is no longer
+     * pending, a record deleted it or `keeps` no longer holds. `null` for any other row: a
+     * gatekeeper that injects rows of its own revalidates those itself.
+     */
+    readonly revalidate: (row: Row) => Row | null;
+  };
+  /**
+   * Reads the pending creates again, folds their stand-ins again, and forgets the fold of a
+   * stand-in whose id left `created`. Call it from the cursor's `refresh`, after whatever the
+   * gatekeeper refreshes itself (what `view`, `keeps` and `created` read).
+   */
+  readonly refresh: () => void;
+};
+
+/**
+ * The stand-in, per-row fold and hide mechanics of a listing over a simulation store, as the
+ * values a kit cursor's `inject`, `overlay` and `refresh` take. It holds no filter, order or
+ * paging of its own: `keeps` and `compare` are the gatekeeper's, and so is every decision
+ * about which provider rows to read.
+ * @param options The store, the index of the pending records, and the listing's own id,
+ *   order, filter and pending creates.
+ * @returns The frozen hooks.
+ *
+ * @example
+ * ```ts
+ * // Built with the listing: the reducer assigns an acknowledged incident to whoever is asking.
+ * const store = createSimulationStore<string, Incident, Incident, Queued>({
+ *   initial: row => row,
+ *   reduce: (incident, { action }) => step(incident, action, me),
+ * });
+ * // A pending create targets its temporary id until the provider's takes its place.
+ * const targets = (action: IncidentAction) => action.kind === "createIncident"
+ *   ? ids.isResolved(action.ref) ? [] : [action.ref]
+ *   : [ids.resolve(action.incident.id)];
+ * const list = simulatedList({
+ *   store,
+ *   // Built on the call, so a record on a temporary id follows it once it is bound.
+ *   view: () => createSimulationView(pending, targets),
+ *   id: row => row.id,
+ *   compare: newestFirst,
+ *   keeps: row => matchesFilter(row, filter),
+ *   created: () => pending.flatMap(({ action }) =>
+ *     action.kind === "createIncident" && !ids.isResolved(action.ref) ? [action.ref] : []),
+ * });
+ * return new OffsetCursor<Incident>({
+ *   pageSize,
+ *   fetchPage,
+ *   authorizePage,
+ *   overlay: list.overlay,
+ *   inject: { ...list.inject, authorize: true, identity: row => ids.resolve(row.id) },
+ *   refresh: async () => {
+ *     pending = journal.listPending();
+ *     list.refresh();
+ *   },
+ * });
+ * ```
+ */
+export function simulatedList<
+  Id extends string,
+  Row extends object,
+  R extends SimulationRecord<unknown>,
+>(options: SimulatedListOptions<Id, Row, R>): SimulatedList<Row> {
+  const { store, view, id, compare, keeps, created } = options;
+
+  // A row as its pending records leave it, when the listing shows it.
+  const shown = (entity: Id, base: Row | undefined): Row | undefined => {
+    const row = store.fold(entity, base, view().forTarget(entity)).entity;
+    return row !== undefined && (keeps?.(row) ?? true) ? row : undefined;
+  };
+
+  // The pending creates as last read, and the stand-ins of those the listing shows.
+  let creates: ReadonlySet<Id> = new Set();
+  let standIns = new Map<Id, Row>();
+  const refresh = (): void => {
+    const now = new Set(created?.() ?? []);
+    // The fold of a stand-in has no base to be collected with, so it is dropped by its id.
+    for (const gone of creates) if (!now.has(gone)) store.forget(gone);
+    creates = now;
+    standIns = new Map(
+      [...now].flatMap((entity): [Id, Row][] => {
+        const row = shown(entity, undefined);
+        return row === undefined ? [] : [[entity, row]];
+      }),
+    );
+  };
+  refresh();
+
+  return Object.freeze({
+    overlay: (row: Row) => {
+      const folded = shown(id(row), row);
+      return folded === undefined ? [] : [folded];
+    },
+    inject: Object.freeze({
+      items: Object.freeze([...standIns.values()].toSorted(compare)),
+      compare,
+      revalidate: (row: Row) => standIns.get(id(row)) ?? null,
+    }),
+    refresh,
+  });
 }
