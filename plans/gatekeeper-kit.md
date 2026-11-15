@@ -2895,7 +2895,7 @@ Who uses what:
 | Docs | a tab; and the tab tree as one outline entity, which a pending tab create targets beside its provisional tab id | the bound document's copy: a partition per tab and one for the outline | none | planned |
 | Sheets | one: the grid | none: cells are unbounded and fetched by range | none | planned |
 | Slides | one: the deck | later, once it loads per slide | none | planned |
-| PagerDuty | incidents | none | the incident listing | planned |
+| PagerDuty | incidents | none | the incident listing | in the tree |
 | Outlook | messages | none | the message listing | planned |
 
 A list gatekeeper that moves onto the store serves what its own overlay serves only under these
