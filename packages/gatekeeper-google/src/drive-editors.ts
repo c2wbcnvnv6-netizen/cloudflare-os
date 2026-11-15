@@ -16,12 +16,14 @@ import {
 import { ActionDescriptionBuilder } from "@gadgets/gatekeeper-kit/action-description";
 import type { GoogleDocsApi } from "./docs-api";
 import {
-  DOC_DEFINITIONS, googleDocSnapshot, invalidateUnreplayableGoogleDocActions,
-  parseGoogleDocWriteReceipt,
-  type DocHost, type GoogleDocAction, type GoogleDocEdits, type GoogleDocInvalidator,
-  type GoogleDocPendingAction, type GoogleDocSimulationCacheHolder, type GoogleDocWriteReceipt,
+  DOC_DEFINITIONS, googleDocSnapshot, invalidateTableChangesBehind, parseGoogleDocWriteReceipt,
+  replayGoogleDocActions,
+  type DocHost, type GoogleDocAction, type GoogleDocEditAction, type GoogleDocEdits,
+  type GoogleDocInvalidator, type GoogleDocPendingAction, type GoogleDocReplayQueue,
+  type GoogleDocSimulationCacheHolder, type GoogleDocWriteReceipt,
 } from "./doc-actions";
-import type { DocChangeQueue, DocFreshness } from "./docs";
+import { closesTableGate } from "./docs-tables";
+import type { DocChangeQueue, DocFreshness, DocSource } from "./docs";
 import type { DriveApi, DriveScopeNode } from "./drive-api";
 import {
   GOOGLE_DOC_MIME_TYPE, GOOGLE_SHEET_MIME_TYPE, GOOGLE_SLIDES_MIME_TYPE,
@@ -190,9 +192,11 @@ const DOCS_EDITOR: DriveEditor<DocHost> = {
 /** The Doc edits a Drive binding queues: the text edits, since a Drive binding adds no tabs. */
 export type DriveDocEdits = Omit<GoogleDocEdits, "addTab">;
 
+const { addTab: _addTab, ...DOC_EDIT_DEFINITIONS } = DOC_DEFINITIONS;
+
 /** The Doc edits a Drive binding queues, by the names the editor's definitions have. */
 export const DRIVE_DOCS_DEFINITIONS = onDriveFiles<DriveDocEdits, DocHost>(
-  { replaceText: DOC_DEFINITIONS.replaceText, appendText: DOC_DEFINITIONS.appendText }, DOCS_EDITOR);
+  DOC_EDIT_DEFINITIONS, DOCS_EDITOR);
 
 /** Each editor, with the kind tag of each of its definitions by the definition's name. */
 const EDITORS: { editor: { name: DriveEditorName; mimeType: string }; tags: Record<string, string> }[] = [
@@ -275,6 +279,9 @@ const MAX_APPLIED = 100;
 /** How many spreadsheets' states a sweep keeps beyond those it must. */
 const MAX_IDLE_SHEETS = 20;
 
+/** How many documents' sources a binding keeps: each holds one document whole, in memory. */
+const MAX_DOC_SOURCES = 4;
+
 /**
  * What a Drive binding keeps of one spreadsheet, as its own binding keeps it for its one file: the
  * markers its batches left, the numbers of its last applied changes, and the numbers allocated for
@@ -332,9 +339,10 @@ export class DriveFileEditors {
   /**
    * Each document's replay and writes landed, kept beside its QueuedChanges for the activation:
    * a read waiting on Google when a write lands reads again, and no session reuses a snapshot
-   * from before it.
+   * from before it. `source` is the snapshot its sessions share, held for the documents opened
+   * most recently, which the map's order tells.
    */
-  #docCaches = new Map<string, GoogleDocSimulationCacheHolder>();
+  #docCaches = new Map<string, { cache: GoogleDocSimulationCacheHolder; source?: DocSource }>();
 
   constructor(options: DriveFileEditorsOptions) {
     this.#options = options;
@@ -409,9 +417,7 @@ export class DriveFileEditors {
     let { fileId } = target;
     let changes = this.#changes<{ payload: GoogleDocAction }>("docs", fileId);
     return {
-      pending: () => this.#docsPending(fileId),
-      invalidate: this.#docsInvalidator(),
-      cache: this.#docCache(fileId),
+      ...this.#docQueue(fileId),
       queue: prepare => changes.queue(
         async () => {
           await this.#requireEditable("docs", target);
@@ -428,12 +434,31 @@ export class DriveFileEditors {
     };
   }
 
-  /** What a session open on document `fileId` learns of the document's other sessions. */
-  docsFreshness(fileId: string): DocFreshness {
+  /** What document `fileId`'s source learns of the binding's writes to it and of its queue. */
+  #docsFreshness(fileId: string): DocFreshness {
     return {
       writes: () => this.#docCache(fileId).writes,
       newestQueued: () => Math.max(0, ...this.#docsPending(fileId).map(({ id }) => id)),
     };
+  }
+
+  /**
+   * The source of document `fileId`, which `open` makes when the binding holds none: every session
+   * this binding opens on the document reads the snapshot the last authorized read approved, so
+   * their replays share one copy and one fold. A source holds a whole document, so the binding
+   * keeps those of the `MAX_DOC_SOURCES` documents opened most recently; a session opened on
+   * another keeps the source it was given.
+   */
+  docsSource(fileId: string, open: (freshness: DocFreshness) => DocSource): DocSource {
+    let entry = this.#docEntry(fileId);
+    // Insertion order is recency: the entry moves to the end, and only its source is ever cleared,
+    // since a session still open on a source let go compares the writes counted in `cache`.
+    this.#docCaches.delete(fileId);
+    this.#docCaches.set(fileId, entry);
+    entry.source ??= open(this.#docsFreshness(fileId));
+    let held = [...this.#docCaches.values()].filter(({ source }) => source);
+    for (let stale of held.slice(0, -MAX_DOC_SOURCES)) stale.source = undefined;
+    return entry.source;
   }
 
   /** The host an approved edit to document `fileId` is written with. */
@@ -455,15 +480,44 @@ export class DriveFileEditors {
         if (marker) {
           kv.put<GoogleDocWriteReceipt>(key, { actionId: id, markerId: marker.id, tabId: marker.tabId });
         }
-        let cache = this.#docCache(fileId);
-        cache.writes++;
-        cache.current = undefined;
+        this.#docCache(fileId).writes++;
       },
-      // The action set fails this edit; the edits behind it are replayed by the next read.
-      unapplyable: async () => {
-        this.#docCache(fileId).current = undefined;
+      // The action set fails this edit. The text edits behind it stay queued for what replays their
+      // tab next: a read of that tab or a write to it, or the next approval that leaves changes
+      // queued.
+      unapplyable: async (id, action) => {
+        if (action.type === "addTab") throw new Error("A Drive binding adds no Doc tabs.");
+        this.#failTableChangesBehind(
+          fileId, id, action, `Pending Google Doc edit could not be applied after edit ${id} failed`);
       },
     };
+  }
+
+  /**
+   * Fails the table changes queued behind `edit`, edit `id` of document `fileId`, which leaves
+   * the queue unapplied: they recorded their tables as it left them, and this binding stores no
+   * copy to replay them over. Does nothing behind an edit that changes no table's structure or
+   * cell text.
+   */
+  #failTableChangesBehind(
+    fileId: string, id: number, edit: GoogleDocEditAction, context: string,
+  ): void {
+    invalidateTableChangesBehind(
+      this.#docQueue(fileId), closesTableGate(edit) ? edit.tabId : undefined, id, context);
+  }
+
+  /**
+   * {@link #failTableChangesBehind} for edit `id` of document `fileId`, refused for good before
+   * any Docs request: the file or the connection is out of reach, and a file can come back, when
+   * the changes behind would be approved over a document this edit never changed.
+   */
+  #docEditRefused(fileId: string, id: number): void {
+    let record = this.#options.journal.get(id);
+    let edit = record &&
+      editOf<{ payload: GoogleDocAction }>("docs", fileId, record.action)?.payload;
+    if (!edit || edit.type === "addTab") return;
+    this.#failTableChangesBehind(
+      fileId, id, edit, `Pending Google Doc edit could not be applied after edit ${id} was refused`);
   }
 
   /**
@@ -484,20 +538,20 @@ export class DriveFileEditors {
         });
       }
     }
-    this.#docCache(fileId).current = undefined;
     if (this.#docsPending(fileId).length === 0) return;
     try {
       // An edit queued, or a write landed, while the request is out may have been checked against a
       // newer revision than the one it answers, so the document is read again. A queue that keeps
-      // moving is left to the next read, which replays it too.
-      let freshness = this.docsFreshness(fileId);
+      // moving is left to what replays it next: a read of a tab or a write to it replays that tab's
+      // edits, and the next approval that leaves changes queued replays every tab that has some.
+      let freshness = this.#docsFreshness(fileId);
       for (let attempt = 0; attempt < MAX_REFRESHES; attempt++) {
         let writes = freshness.writes();
         let queued = freshness.newestQueued();
         let snapshot = googleDocSnapshot(await this.#options.docs.getDocument(fileId));
         if (writes !== freshness.writes() || queued !== freshness.newestQueued()) continue;
-        invalidateUnreplayableGoogleDocActions(
-          this.#docsInvalidator(), snapshot, this.#docsPending(fileId),
+        replayGoogleDocActions(
+          this.#docQueue(fileId), snapshot.copy,
           `Pending Google Doc edits could not be replayed after edit ${actionId} was applied`);
         return;
       }
@@ -527,10 +581,23 @@ export class DriveFileEditors {
     return parseGoogleDocWriteReceipt(this.#options.kv.get<unknown>(`${DOC_RECEIPT_PREFIX}${fileId}`));
   }
 
+  #docEntry(fileId: string) {
+    let entry = this.#docCaches.get(fileId);
+    if (!entry) this.#docCaches.set(fileId, entry = { cache: { writes: 0 } });
+    return entry;
+  }
+
   #docCache(fileId: string): GoogleDocSimulationCacheHolder {
-    let cache = this.#docCaches.get(fileId);
-    if (!cache) this.#docCaches.set(fileId, cache = { writes: 0 });
-    return cache;
+    return this.#docEntry(fileId).cache;
+  }
+
+  /** Document `fileId`'s edits awaiting a decision, as a replay lists, fails and folds them. */
+  #docQueue(fileId: string): GoogleDocReplayQueue {
+    return {
+      pending: () => this.#docsPending(fileId),
+      invalidate: this.#docsInvalidator(),
+      cache: this.#docCache(fileId),
+    };
   }
 
   /**
@@ -590,6 +657,7 @@ export class DriveFileEditors {
           if (!refusal.liftable) {
             this.#options.journal.markSubmitted(actionId);
             this.#options.journal.markFailed(actionId, refusal.message, { undispatched: true });
+            if (editor === "docs") this.#docEditRefused(target.fileId, actionId);
           }
           throw new Error(refusal.message);
         }
@@ -604,6 +672,7 @@ export class DriveFileEditors {
     let refusal = await this.#refusal(editor, target);
     if (!refusal) return;
     if (refusal.liftable) throw new Error(refusal.message);
+    if (editor === "docs") this.#docEditRefused(target.fileId, id);
     throw new ActionApplyError(refusal.message);
   }
 
@@ -613,10 +682,17 @@ export class DriveFileEditors {
     if (!edited) return undefined;
     let { editor, target } = edited;
     return this.#changes(editor, target.fileId).reject(actionId, async () => {
+      // Read before the action set removes the record: one already failed leaves nothing to
+      // settle behind it.
+      let waiting = editor === "docs"
+        ? this.#docsPending(target.fileId).find(({ id }) => id === actionId)?.action : undefined;
       let result = await this.#options.reject(actionId);
-      // As on a Doc's own binding, an edit behind it that no longer replays is failed by the next
-      // read's replay.
-      if (editor === "docs") this.#docCache(target.fileId).current = undefined;
+      // The text edits behind it stay queued, as on a Doc's own binding, for what replays their tab
+      // next: a read of that tab or a write to it, or the next approval that leaves changes queued.
+      if (waiting && waiting.type !== "addTab") {
+        this.#failTableChangesBehind(target.fileId, actionId, waiting,
+          `Pending Google Doc edits could not be replayed after edit ${actionId} was rejected`);
+      }
       return result;
     });
   }

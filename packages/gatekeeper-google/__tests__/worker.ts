@@ -101,6 +101,9 @@ type TestGoogleDocGatekeeper = GoogleDocGatekeeperImpl & {
   testStoredValueJsonLength(key: string): number | undefined;
 };
 
+/** The methods of a Google Doc session that queue an edit. */
+type DocWriteMethod = "replaceText" | "appendText";
+
 /** An action the queue received: its ID and its card's title. */
 type SubmittedAction = { actionId: number; title: string };
 
@@ -217,6 +220,10 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
   readonly submitted: SubmittedAction[] = [];
   /** Holds the next submission open until `released`, calling `reach` once it has arrived. */
   holdSubmission?: { reach(): void; released: Promise<void> };
+  /** Whether every observation is refused, as for a document its observers cannot read. */
+  refuseObservations = false;
+  /** Holds the next observation open until `released`, calling `reach` once it has arrived. */
+  holdObservation?: { reach(): void; released: Promise<void> };
 
   async authorizeObservation(description: ObservationDescription): Promise<void> {
     this.observations.push(description.description);
@@ -224,6 +231,14 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
       title: description.title,
       ...(description.subresources ? { subresources: description.subresources } : {}),
     });
+    if (this.refuseObservations) throw new Error("Reads of this document are refused.");
+    let held = this.holdObservation;
+    if (held) {
+      // One hold, so a later observation of the same call is never held twice.
+      this.holdObservation = undefined;
+      held.reach();
+      await held.released;
+    }
   }
 
   async getGitCache(): Promise<GitCache> {
@@ -265,6 +280,7 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
 }
 
 export class TestHooks extends DurableObject<Env> {
+  #lastActionTitle = "";
   #lastActionDescription = "";
   #lastActionFields: ActionField[] = [];
   #lastActionVerdict: { actionKind?: ActionKind; autoApprovable?: boolean } = {};
@@ -273,6 +289,11 @@ export class TestHooks extends DurableObject<Env> {
   #classes = new Map<string, DurableObjectClass<Gatekeeper<any>>>();
   /** The class each facet's applyCreation() returned, until adoptCreated() switches to it. */
   #created = new Map<string, DurableObjectClass<Gatekeeper<any>>>();
+
+  /** The approval title of the edit most recently submitted through these hooks. */
+  get lastActionTitle(): string {
+    return this.#lastActionTitle;
+  }
 
   /** The approval description of the edit most recently submitted through these hooks. */
   get lastActionDescription(): string {
@@ -433,6 +454,7 @@ export class TestHooks extends DurableObject<Env> {
       // Awaited inside the scope: `return body(...)` would dispose both stubs mid-call.
       return await body(session, queue);
     } finally {
+      this.#lastActionTitle = queue.action?.title ?? "";
       this.#lastActionDescription = queue.actionDescription ?? "";
       this.#lastActionFields = queue.actionFields;
       this.#lastActionVerdict = {
@@ -465,6 +487,65 @@ export class TestHooks extends DurableObject<Env> {
       facetName, session => session.replaceText(oldMarkdown, newMarkdown, tabId));
   }
 
+  /**
+   * Call one write method of a fresh session, returning the ID of the action it queued and what
+   * it resolved to. With `refuseRead`, the session's approval queue refuses every observation
+   * made once the session is open.
+   */
+  async submitEdit(
+    facetName: string, method: DocWriteMethod, args: unknown[],
+    options: { refuseRead?: boolean } = {},
+  ): Promise<{ actionId: number; returned?: number }> {
+    return this.#withSession(facetName, async (session, queue) => {
+      queue.refuseObservations = options.refuseRead === true;
+      let returned = await (session[method] as (...args: unknown[]) => Promise<unknown>)(...args);
+      if (queue.actionId === undefined) throw new Error("Action was not submitted");
+      return {
+        actionId: queue.actionId,
+        ...(typeof returned === "number" ? { returned } : {}),
+      };
+    });
+  }
+
+  /** The session {@link holdDoc} keeps open, with what closes it and its approval queue. */
+  #heldDoc?: { session: GoogleDocSession } & Disposable;
+
+  /**
+   * Opens a session of doc-1 as every hook here opens one (bound, or through Drive for a
+   * `drive:` facet) and keeps it open until {@link releaseDoc}, so that reads made on it between
+   * other calls are one session's. Throws while another is held.
+   */
+  async holdDoc(facetName: string): Promise<void> {
+    if (this.#heldDoc) throw new Error("A Doc session is already held.");
+    let approvalQueue = new RpcStub<ApprovalQueue>(new TestApprovalQueue());
+    try {
+      let opened = await this.#openDoc(facetName, approvalQueue);
+      this.#heldDoc = {
+        session: opened.session,
+        [Symbol.dispose]: () => {
+          opened[Symbol.dispose]();
+          approvalQueue[Symbol.dispose]();
+        },
+      };
+    } catch (error) {
+      approvalQueue[Symbol.dispose]();
+      throw error;
+    }
+  }
+
+  /** Reads a tab on the session {@link holdDoc} keeps open. */
+  async readHeldDoc(tabId?: string): Promise<string> {
+    if (!this.#heldDoc) throw new Error("No Doc session is held.");
+    return this.#heldDoc.session.getContent(tabId);
+  }
+
+  /** Closes the session {@link holdDoc} opened; does nothing when none is held. */
+  async releaseDoc(): Promise<void> {
+    let held = this.#heldDoc;
+    this.#heldDoc = undefined;
+    held?.[Symbol.dispose]();
+  }
+
   /** The `lastModified` a metadata read reports, as epoch milliseconds. */
   async readMetadata(facetName: string): Promise<number> {
     return this.#withSession(
@@ -483,6 +564,14 @@ export class TestHooks extends DurableObject<Env> {
   async applyStorage(facetName: string, operations: StorageOperation[]): Promise<void> {
     await (this.#gatekeeper(facetName) as unknown as TestGoogleDocGatekeeper)
       .applyTestStorage(operations);
+  }
+
+  /**
+   * Ends the Doc gatekeeper `facetName` names: the next call starts another activation over the
+   * same storage, so its constructor runs again on whatever a test stored.
+   */
+  async restartDoc(facetName: string): Promise<void> {
+    this.ctx.facets.abort(facetName, new Error("Restarted by the test."));
   }
 
   async storedValueJsonLength(facetName: string, key: string): Promise<number | undefined> {

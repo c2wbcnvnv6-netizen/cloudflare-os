@@ -259,6 +259,33 @@ export interface GoogleDocEditSession extends GoogleDocReadSession {
    * - Plain paragraphs (separated by blank lines)
    * - Line breaks within a paragraph (`\u000b`, as `getContent()` returns them)
    *
+   * A list item is nested by indenting its line two spaces for each level, as `getContent()`
+   * writes it, and each new item is written at the nesting level it is given. A list has nine
+   * levels: an item indented eighteen or more spaces is refused, so write it at most sixteen spaces
+   * in. A new item shallower than the list item before it is refused where placing it would rewrite
+   * an item that holds a positioned image. Write it at the level of the item before it, or move
+   * the image in Google Docs first. To remove a list item, replace its line, marker included,
+   * with nothing: the item goes with its line, with or without the line break after it in
+   * `oldMarkdown`. A nested item's line starts with its indentation: leave it out of
+   * `oldMarkdown` only together with the line break, since quoted from its marker with the line
+   * break the item leaves its indentation in front of the next line, which nests an item there
+   * deeper. An item that is the only one of its list leaves an empty paragraph: to remove
+   * that too, replace the item together with the blank line after it, or, where the item is the
+   * last paragraph of the tab, together with the two line breaks before it. An empty paragraph
+   * also stays where the line break cannot go with the item: the item ends the tab or stands
+   * before a table, behind an item of another level or list, or a line beside it holds an
+   * image, a smart chip or a footnote. Quoted with its line break, that removal is refused or
+   * leaves the paragraph too. A list item's text may start with a tab character. A new item
+   * shallower than the list item before it is refused
+   * where an item it has to pass (that item, or one between it and an item as shallow) starts
+   * with a tab and stands before the first line the replacement changes or, for `appendText()`,
+   * anywhere before the appended text: remove the tab from that item first, or write the new
+   * item at its level. A paragraph break written inside a paragraph, a heading or a list item
+   * splits it, and the text after the break becomes a normal paragraph unless it is written with
+   * a heading or list marker. Inside a subtitle, text written with a paragraph break after it
+   * can be refused where the break is not at the subtitle's end: write the break at the
+   * subtitle's end, or replace the whole subtitle.
+   *
    * Unsupported Markdown features (tables, images, code blocks, etc.) are inserted as plain text.
    * Existing structural content and paragraphs containing elements such as smart chips are
    * read-only. Narrow the match to plain text in another paragraph.
@@ -270,7 +297,10 @@ export interface GoogleDocEditSession extends GoogleDocReadSession {
   /**
    * Append Markdown content to the end of tab `tabId`. The same Markdown features and tab
    * selection rules as `replaceText()` apply. The tab must end in a paragraph; add one after a
-   * final table or other structural element before appending.
+   * final table or other structural element before appending. The append is checked when it is
+   * called, against the tab with every queued change applied: where it cannot be made there
+   * (the tab would not then end in a paragraph, or its result cannot be shown before approval),
+   * the call is refused and nothing is queued.
    */
   appendText(markdown: string, tabId?: string): Promise<void>;
 }

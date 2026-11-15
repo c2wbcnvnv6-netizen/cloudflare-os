@@ -2723,8 +2723,8 @@ export class GoogleDriveSessionImpl extends RpcTarget
         ? new GoogleDocEditSessionImpl({
           docsApi: this.#docsApi, driveApi: this.#driveApi, documentId, approvalQueue: queue, read,
           changes: editors.docs(target, queue),
-          source: driveDocSource(
-            this.#docsApi, this.#driveApi, documentId, editors.docsFreshness(documentId)),
+          source: editors.docsSource(documentId, freshness =>
+            driveDocSource(this.#docsApi, this.#driveApi, documentId, freshness)),
         })
         : new GoogleDocReadSessionImpl(this.#docsApi, this.#driveApi, documentId, queue, read));
   }

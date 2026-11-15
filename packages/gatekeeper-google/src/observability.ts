@@ -16,6 +16,12 @@ export type GoogleObservabilityFields = {
   httpStatus: number;
   messageId: string;
   method: string;
+  /** Whether a shape the model of Google Docs has no answer for is one nothing the gatekeeper sends should reach. */
+  modelInvariant: boolean;
+  /** The shape the model of Google Docs has no answer for, as the model names it; never document text. */
+  modelShape: string;
+  /** Where the model of Google Docs threw: the frames of the error's stack, without its message. */
+  modelStack: string;
   operation: string;
   /** How an operation ended, as a class rather than a message. */
   outcome: string;

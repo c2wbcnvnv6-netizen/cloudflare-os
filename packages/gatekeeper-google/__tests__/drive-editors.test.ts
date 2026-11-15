@@ -8,7 +8,7 @@ import {
   type DriveEdit, type DriveEditorsHost,
 } from "../src/drive-editors";
 import { GOOGLE_DOC_MIME_TYPE, GOOGLE_SLIDES_MIME_TYPE } from "../src/drive-session";
-import { MARKDOWN_RENDERING_VERSION } from "../src/markdown-replay";
+import { MARKDOWN_RENDERING_VERSION } from "../src/markdown-converter";
 import { buildTab } from "./doc-fixture";
 import { DEPLOYMENT_READ_ONLY, WRITES_GRANT_MISSING } from "../src/drive-writes";
 import { SLIDES_DEFINITIONS, type SlidesHost } from "../src/slides-actions";

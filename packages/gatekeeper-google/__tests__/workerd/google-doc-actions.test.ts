@@ -1,50 +1,46 @@
 import { abortAllDurableObjects, env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActionField } from "@gadgets/workshop-shared/gatekeeper";
-import { googleDocActionTab } from "../../src/doc-actions";
-import { MARKDOWN_RENDERING_VERSION } from "../../src/markdown-replay";
+import {
+  docTabToMarkdown, LIST_LEVEL_TOO_DEEP, MARKDOWN_RENDERING_VERSION, POSITIONED_ITEM_BEFORE,
+  TABBED_ITEM_BEFORE,
+} from "../../src/markdown-converter";
 import { officeFileError } from "../../src/office-conversion";
 import { DRIVE_WRITES_GRANT, GOOGLE_DRIVE_RESOURCE } from "../../src/resources";
-import type { GoogleDocsTab } from "../../src/docs-api";
+import {
+  blankDocsTab, type DocsRange, type GoogleDocsAddTabRequest, type GoogleDocsBatchRequest,
+  type GoogleDocsRequest, type GoogleDocsTab, type NestingLevel, type Paragraph,
+} from "../../src/docs-api";
 import type { GoogleDocSession } from "../../src/docs-types";
-import { buildTab } from "../doc-fixture";
+import { applyDocsRequests, replayCost, unindexedTabRefusal } from "../../src/docs-model";
+import { pruneTab } from "../../src/docs-replica";
+import type { ModelParagraphStyle } from "../../src/docs-model";
+import {
+  buildTab, cardField, grid, para, presetLevels,
+} from "../doc-fixture";
 import { DriveFiles, DOC_MIME as DRIVE_DOC_MIME, FOLDER_MIME } from "../drive-files";
 import { serveFakes, type ProviderFake } from "../slides-provider";
 import { GoogleDocEditSessionImpl } from "../../src/docs";
 
-/** Every write coordinate names the tab it applies to; tab bodies index independently. */
-type DocCoordinate = { tabId?: string };
+/**
+ * A request the gatekeeper sends in a batch: one that changes content, the add of a tab, or one
+ * of the two that create and delete a write marker.
+ */
+type BatchRequest =
+  | GoogleDocsBatchRequest
+  | { createNamedRange: { name: string; range: DocsRange } }
+  | { deleteNamedRange: { namedRangeId: string; tabsCriteria?: { tabIds: string[] } } };
 
-type BatchRequest = {
-  createNamedRange?: { name: string; range: DocCoordinate };
-  deleteNamedRange?: { namedRangeId: string; tabsCriteria?: { tabIds: string[] } };
-  insertText?: { location: DocCoordinate & { index: number }; text: string };
-  deleteContentRange?: { range: DocCoordinate & { startIndex: number; endIndex: number } };
-  updateParagraphStyle?: {
-    range: DocCoordinate & { startIndex: number; endIndex: number };
-    paragraphStyle: { namedStyleType?: string };
-    fields: string;
+/** A comment write: a comment attached to text, or a reply to a comment or a suggestion. */
+type CommentRequest =
+  | { insertComment: { content: string; range: DocsRange } }
+  | {
+    addCommentReply: {
+      commentId?: string;
+      suggestionId?: string;
+      post: { content?: string; commentAction?: "RESOLVE" | "REOPEN" };
+    };
   };
-  createParagraphBullets?: {
-    range: DocCoordinate & { startIndex: number; endIndex: number };
-    bulletPreset: string;
-  };
-  deleteParagraphBullets?: {
-    range: DocCoordinate & { startIndex: number; endIndex: number };
-  };
-  updateTextStyle?: {
-    range: DocCoordinate & { startIndex: number; endIndex: number };
-    textStyle?: { link?: { url: string } };
-    fields?: string;
-  };
-  insertComment?: { content: string; range: DocCoordinate & { startIndex: number; endIndex: number } };
-  addCommentReply?: {
-    commentId?: string;
-    suggestionId?: string;
-    post: { content?: string; commentAction?: "RESOLVE" | "REOPEN" };
-  };
-  addDocumentTab?: { tabProperties: { title?: string; parentTabId?: string; index?: number } };
-};
 
 /** One post of a comment thread, as Docs returns it. */
 type ModelPost = {
@@ -65,52 +61,57 @@ type ModelThread = {
   replies: ModelPost[];
 };
 
-type ModelListItem = { id: string; preset: string };
-/** `"indented"` is the indent Google leaves on a paragraph whose bullet was removed. */
-type ModelListSlot = ModelListItem | "indented" | null;
-
-function isListItem(slot: ModelListSlot | undefined): slot is ModelListItem {
-  return typeof slot === "object" && slot !== null;
+/**
+ * The tab a request names. Every write coordinate names the tab it applies to, since tab bodies
+ * index independently; a request that leaves it out has none.
+ */
+function requestTabId(
+  request: Exclude<BatchRequest, { deleteNamedRange: unknown } | GoogleDocsAddTabRequest>,
+): string | undefined {
+  if ("createNamedRange" in request) return request.createNamedRange.range.tabId;
+  if ("insertText" in request) return request.insertText.location.tabId;
+  if ("deleteContentRange" in request) return request.deleteContentRange.range.tabId;
+  if ("updateTextStyle" in request) return request.updateTextStyle.range.tabId;
+  if ("updateParagraphStyle" in request) return request.updateParagraphStyle.range.tabId;
+  if ("createParagraphBullets" in request) return request.createParagraphBullets.range.tabId;
+  if ("deleteParagraphBullets" in request) return request.deleteParagraphBullets.range.tabId;
+  if ("insertTable" in request) return request.insertTable.location.tabId;
+  if ("pinTableHeaderRows" in request) return request.pinTableHeaderRows.tableStartLocation.tabId;
+  if ("updateTableColumnProperties" in request) {
+    return request.updateTableColumnProperties.tableStartLocation.tabId;
+  }
+  if ("updateTableRowStyle" in request) return request.updateTableRowStyle.tableStartLocation.tabId;
+  if ("mergeTableCells" in request) {
+    return request.mergeTableCells.tableRange.tableCellLocation.tableStartLocation.tabId;
+  }
+  if ("unmergeTableCells" in request) {
+    return request.unmergeTableCells.tableRange.tableCellLocation.tableStartLocation.tabId;
+  }
+  if ("updateTableCellStyle" in request) {
+    return request.updateTableCellStyle.tableRange.tableCellLocation.tableStartLocation.tabId;
+  }
+  // A row or column request names its table, and the table's start names the tab.
+  let cell = "insertTableRow" in request ? request.insertTableRow.tableCellLocation
+    : "insertTableColumn" in request ? request.insertTableColumn.tableCellLocation
+    : "deleteTableRow" in request ? request.deleteTableRow.tableCellLocation
+    : request.deleteTableColumn.tableCellLocation;
+  return cell.tableStartLocation.tabId;
 }
 
-/** One tab of the model document: its own text, and its place in the tab tree. */
+/** One tab of the fake document: its content as Google returns it, and its place in the tab tree. */
 type ModelTab = {
   id: string;
   title: string;
   parentId?: string;
-  text: string;
-  table?: { before: string; rows: string[][]; after: string };
-  body?: GoogleDocsTab["body"];
-  links: { start: number; end: number; url: string }[];
-  paragraphStyles?: string[];
-  paragraphLists?: ModelListSlot[];
+  body: GoogleDocsTab["body"];
+  /** The list definitions the body's paragraphs reference. */
+  lists: GoogleDocsTab["lists"];
+  namedStyles?: GoogleDocsTab["namedStyles"];
 };
-type BodyElement = GoogleDocsTab["body"]["content"][number];
 
-function withoutDeletedParagraphs<T>(
-  text: string,
-  values: T[],
-  start: number,
-  end: number,
-): T[] {
-  let kept: T[] = [];
-  let paragraph = 0;
-  for (let index = text.indexOf("\n"); index !== -1; index = text.indexOf("\n", index + 1)) {
-    if (index < start || index >= end) kept.push(values[paragraph]);
-    paragraph++;
-  }
-  return kept;
-}
-
-/** Indexes of the plain-text paragraphs `range` touches. */
-function paragraphsIn(text: string, range: { startIndex: number; endIndex: number }): number[] {
-  let startIndex = 1;
-  return text.split("\n").flatMap((paragraph, index) => {
-    let endIndex = startIndex + paragraph.length + 1;
-    let overlaps = range.startIndex < endIndex && range.endIndex > startIndex;
-    startIndex = endIndex;
-    return overlaps ? [index] : [];
-  });
+/** A body of one paragraph per line of `text`. */
+function bodyOfLines(text: string): GoogleDocsTab["body"] {
+  return buildTab(text.split("\n").map(line => ({ runs: [`${line}\n`] }))).body;
 }
 
 /** The tab a single-tab document has, and the one the tab-agnostic tests exercise. */
@@ -136,7 +137,15 @@ class DocsModel {
   /** How many content batches to fail before Google applies them, as a dropped connection can. */
   unsentContentRequests = 0;
   contentBatches = 0;
+  /** The content requests of the last batch applied, without its marker. */
+  lastContentRequests: GoogleDocsRequest[] = [];
   maxMarkerCount = 0;
+  /**
+   * The status of the refusal of a content batch whose `requiredRevisionId` is not the latest
+   * revision; `undefined` for a refusal that carries none, which does not say whether the batch
+   * applied.
+   */
+  stalePinStatus: string | undefined = "INVALID_ARGUMENT";
   /** Google withholds `revisionId` from a caller without edit access. */
   editable = true;
   /** Full `documents.get` calls, excluding the lightweight revision probe. */
@@ -144,6 +153,9 @@ class DocsModel {
   revisionProbes = 0;
   /** Every provider request, of any kind. */
   fetches = 0;
+  /** The UTF-8 length of every request body received, and of every response body sent. */
+  requestBytes = 0;
+  responseBytes = 0;
   /** The body of each `documents.create` call. */
   readonly creates: unknown[] = [];
   /**
@@ -172,7 +184,9 @@ class DocsModel {
   /** Tab each write marker was anchored in, retained after cleanup deletes the marker. */
   readonly markerTabIds: string[] = [];
   /** Every tab in preorder; the first is the one a single-tab document has. */
-  readonly tabs: ModelTab[] = [{ id: MAIN_TAB, title: "Main", text: "", links: [] }];
+  readonly tabs: ModelTab[] = [
+    { id: MAIN_TAB, title: "Main", body: bodyOfLines(""), lists: {} },
+  ];
   /** The Doc's comment threads, in the order Docs lists them. */
   readonly threads: ModelThread[] = [];
   /** Suggestions made in Suggesting mode, with the notes posted on them. */
@@ -188,9 +202,12 @@ class DocsModel {
   lostCommentResponses = 0;
   #nextPostId = 1;
   #nextTabId = 1;
+  /**
+   * Every method that changes what `documents.get` answers moves it, since a document does not
+   * change at one revision.
+   */
   #revision = 1;
   #nextMarkerId = 1;
-  #nextListId = 1;
   readonly #held = new Map<RequestKind, { reach: () => void; released: Promise<void> }>();
 
   install(): void {
@@ -201,10 +218,12 @@ class DocsModel {
   addMarker(name: string, id: string, tabId = MAIN_TAB): void {
     this.markers.set(id, { name, tabId });
     this.#recordMarkerCount();
+    this.#revision++;
   }
 
   addTab(id: string, title: string, parentId: string, text = ""): void {
-    this.tabs.push({ id, title, parentId, text, links: [] });
+    this.tabs.push({ id, title, parentId, body: bodyOfLines(text), lists: {} });
+    this.#revision++;
   }
 
   removeTab(id: string): void {
@@ -212,72 +231,156 @@ class DocsModel {
     this.#revision++;
   }
 
+  /** Give a tab one paragraph per line of `text`. */
   setText(tabId: string, text: string): void {
-    this.#tab(tabId).text = text;
+    this.setBody(tabId, bodyOfLines(text));
   }
 
+  /** Give a tab one paragraph, whose text is one link. */
   setLinkedText(tabId: string, text: string, url: string): void {
-    let tab = this.#tab(tabId);
-    tab.text = text;
-    tab.links = [{ start: 0, end: text.length, url }];
+    this.setBody(tabId, buildTab([{ runs: [{ text, style: { link: { url } } }, "\n"] }]).body);
   }
 
   setParagraphs(
     tabId: string, paragraphs: { text: string; namedStyleType: string }[],
   ): void {
-    let tab = this.#tab(tabId);
-    tab.text = paragraphs.map(paragraph => paragraph.text).join("\n");
-    tab.paragraphStyles = paragraphs.map(paragraph => paragraph.namedStyleType);
+    this.setBody(tabId, buildTab(paragraphs.map(({ text, namedStyleType }) => (
+      { runs: [`${text}\n`], namedStyleType }))).body);
   }
 
   setNumberedList(tabId: string, items: string[]): void {
-    this.#setList(tabId, items, "NUMBERED_DECIMAL_ALPHA_ROMAN");
+    this.#setList(tabId, items, presetLevels(true));
   }
 
   setBulletedList(tabId: string, items: string[]): void {
-    this.#setList(tabId, items, "BULLET_DISC_CIRCLE_SQUARE");
+    this.#setList(tabId, items, presetLevels());
   }
 
-  #setList(tabId: string, items: string[], preset: string): void {
-    let tab = this.#tab(tabId);
-    let list = { id: `list-${this.#nextListId++}`, preset };
-    tab.text = items.join("\n");
-    tab.paragraphLists = items.map(() => list);
+  /** Give a tab one list item per entry, all of one list that has the levels a preset makes. */
+  #setList(tabId: string, items: string[], nestingLevels: NestingLevel[]): void {
+    let listId = "list-1";
+    this.setBody(
+      tabId, buildTab(items.map(item => ({ runs: [`${item}\n`], bullet: { listId } }))).body,
+      { [listId]: { listProperties: { nestingLevels } } });
   }
+
+  /** Take the bullet off one paragraph of a tab, counted from the first. */
   interruptList(tabId: string, index: number): void {
-    this.#tab(tabId).paragraphLists![index] = null;
+    let paragraphs = this.#tab(tabId).body.content.flatMap(element => element.paragraph ?? []);
+    delete paragraphs[index].bullet;
+    this.#revision++;
   }
 
+  /** Give a tab a paragraph, a table of plain cells and a paragraph. */
   setTable(tabId: string, before: string, rows: string[][], after: string): void {
-    this.#tab(tabId).table = { before, rows, after };
+    this.setBody(tabId, buildTab([
+      { runs: [`${before}\n`] },
+      { table: rows.map(row => row.map(cell => `${cell}\n`)) },
+      { runs: [`${after}\n`] },
+    ]).body);
   }
-  setBody(tabId: string, body: GoogleDocsTab["body"]): void {
+
+  /** Give a tab a body, the lists its paragraphs reference and the named styles it has. */
+  setBody(
+    tabId: string, body: GoogleDocsTab["body"], lists: GoogleDocsTab["lists"] = {},
+    namedStyles?: GoogleDocsTab["namedStyles"],
+  ): void {
+    Object.assign(this.#tab(tabId), { body, lists, namedStyles });
+    this.#revision++;
+  }
+
+  /** A collaborator's change this test made through a field of the model: the revision moves. */
+  touch(): void {
+    this.#revision++;
+  }
+
+  /** A collaborator's edit to a tab: the body is replaced, the revision moves. */
+  externalBody(tabId: string, body: GoogleDocsTab["body"]): void {
     this.#tab(tabId).body = body;
+    this.#revision++;
+  }
+
+  /** A collaborator replaces the text of the first paragraph of one cell of a tab's body. */
+  externalCellEdit(
+    table: number, row: number, column: number, text: string, tabId = MAIN_TAB,
+  ): void {
+    let [index] = this.cellParagraphs(table, row, column, tabId);
+    let [first] = this.cellRuns(table, row, column, tabId);
+    let old = first.content.replace(/\n$/, "");
+    this.externalBody(tabId, applyDocsRequests(this.bodyTab(tabId), [
+      { deleteContentRange: { range: { startIndex: index, endIndex: index + old.length, tabId } } },
+      { insertText: { location: { index, tabId }, text } },
+    ]).body);
+  }
+
+  /** A tab as the model takes it. */
+  bodyTab(tabId = MAIN_TAB): GoogleDocsTab {
+    let { id, title, body, lists, namedStyles } = this.#tab(tabId);
+    return {
+      tabId: id, title, index: 0, nestingLevel: 0, body, lists, namedRanges: {},
+      ...namedStyles ? { namedStyles } : {},
+    };
+  }
+
+  /** The tables of a tab's body, in order. */
+  tables(tabId = MAIN_TAB) {
+    return this.bodyTab(tabId).body.content.flatMap(element =>
+      element.table ? [{ start: element.startIndex, rows: element.table.tableRows ?? [] }] : []);
+  }
+
+  /** The start index of each paragraph of one cell of a tab's body. */
+  cellParagraphs(table: number, row: number, column: number, tabId = MAIN_TAB): number[] {
+    let cell = this.tables(tabId)[table]?.rows[row]?.tableCells?.[column];
+    if (!cell) throw new Error(`Table ${table} has no cell at row ${row}, column ${column}`);
+    return (cell.content ?? []).flatMap(element => element.paragraph ? [element.startIndex] : []);
+  }
+
+  /** The text of one cell of a tab's body, its paragraphs joined by line breaks. */
+  cellText(table: number, row: number, column: number, tabId = MAIN_TAB): string {
+    return this.cellRuns(table, row, column, tabId).map(run => run.content).join("")
+      .replace(/\n$/, "");
+  }
+
+  /** The text runs of one cell of a tab's body, in order. */
+  cellRuns(table: number, row: number, column: number, tabId = MAIN_TAB) {
+    let cell = this.tables(tabId)[table]?.rows[row]?.tableCells?.[column];
+    if (!cell) throw new Error(`Table ${table} has no cell at row ${row}, column ${column}`);
+    return (cell.content ?? []).flatMap(element =>
+      element.paragraph?.elements.flatMap(part => part.textRun ?? []) ?? []);
+  }
+
+  /** The text of each paragraph of a tab's body outside its tables. */
+  #lines(tabId: string): { text: string; paragraph: Paragraph }[] {
+    return this.#tab(tabId).body.content.flatMap(({ paragraph }) => paragraph ? [{
+      paragraph,
+      text: paragraph.elements.map(part => part.textRun?.content ?? "").join("")
+        .replace(/\n$/, ""),
+    }] : []);
   }
 
   text(tabId = MAIN_TAB): string {
-    let tab = this.#tab(tabId);
-    if (!tab.body) return tab.text;
-    return tab.body.content.flatMap(element =>
-      element.paragraph?.elements.flatMap(part => part.textRun?.content ?? []) ?? [],
-    ).join("").replace(/\n$/, "");
+    return this.#lines(tabId).map(line => line.text).join("\n");
   }
 
+  /**
+   * A tab's text with a number in front of each list item, counted per list and whatever the
+   * list's glyph, and a tab in front of a paragraph left indented where its bullet stood.
+   */
   renderedText(tabId = MAIN_TAB): string {
-    let tab = this.#tab(tabId);
     let counts = new Map<string, number>();
-    return tab.text.split("\n").map((text, index) => {
-      let list = tab.paragraphLists?.[index];
-      if (list === "indented") return `\t${text}`;
-      if (!list) return text;
-      let number = (counts.get(list.id) ?? 0) + 1;
-      counts.set(list.id, number);
+    return this.#lines(tabId).map(({ text, paragraph }) => {
+      let { bullet } = paragraph;
+      let style: ModelParagraphStyle = paragraph.paragraphStyle;
+      if (!bullet) return style.indentStart?.magnitude ? `\t${text}` : text;
+      let number = (counts.get(bullet.listId) ?? 0) + 1;
+      counts.set(bullet.listId, number);
       return `${number}. ${text}`;
     }).join("\n");
   }
 
   clearMarkers(): void {
     this.markers.clear();
+    this.#revision++;
   }
 
   /**
@@ -296,12 +399,27 @@ class DocsModel {
 
   /** A collaborator edit: the document changes without this gatekeeper writing to it. */
   externalEdit(tabId = MAIN_TAB, text?: string): void {
-    let tab = this.#tab(tabId);
-    tab.text = text ?? tab.text + "collaborator";
-    this.#revision++;
+    if (text !== undefined) {
+      this.setText(tabId, text);
+      return;
+    }
+    let last = this.#tab(tabId).body.content.findLast(element => element.paragraph)!;
+    this.externalBody(tabId, applyDocsRequests(this.bodyTab(tabId), [
+      { insertText: { location: { index: last.endIndex - 1, tabId }, text: "collaborator" } },
+    ]).body);
   }
 
   async fetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+    let body = init?.body;
+    this.requestBytes += typeof body === "string" ? new TextEncoder().encode(body).byteLength
+      : body instanceof Uint8Array ? body.byteLength : 0;
+    let response = await this.#answer(input, init);
+    // Counted from a copy, beside the caller's read: the response is not held for the count.
+    void response.clone().arrayBuffer().then(sent => { this.responseBytes += sent.byteLength; });
+    return response;
+  }
+
+  async #answer(input: string | URL | Request, init?: RequestInit): Promise<Response> {
     let url = new URL(input instanceof Request ? input.url : input.toString());
     this.fetches++;
     if (url.hostname === "www.googleapis.com" && url.pathname.startsWith("/batch/")) {
@@ -362,11 +480,16 @@ class DocsModel {
       requests: BatchRequest[];
       writeControl?: { requiredRevisionId?: string; writeMode?: "SUGGEST" };
     };
-    let first = body.requests[0];
-    if (first?.insertComment || first?.addCommentReply || body.writeControl?.writeMode === "SUGGEST") {
-      return this.#commentWrite(body);
+    let first = body.requests[0] as BatchRequest | CommentRequest | undefined;
+    if (first && ("insertComment" in first || "addCommentReply" in first) ||
+        body.writeControl?.writeMode === "SUGGEST") {
+      return this.#commentWrite(
+        body as { requests: (GoogleDocsRequest | CommentRequest)[]; writeControl?: typeof body.writeControl });
     }
-    let isDelete = body.requests.length === 1 && !!body.requests[0].deleteNamedRange;
+    let [only] = body.requests;
+    let deletion = body.requests.length === 1 && "deleteNamedRange" in only
+      ? only.deleteNamedRange : undefined;
+    let isDelete = deletion !== undefined;
     await this.#hold(isDelete ? "cleanup" : "content");
     if (!isDelete && this.refusesEdits) {
       return Response.json({
@@ -382,7 +505,6 @@ class DocsModel {
       throw new Error("cleanup failed");
     }
     // Once there are several tabs, Google finds a named range only in the tabs a deletion names.
-    let deletion = isDelete ? body.requests[0].deleteNamedRange! : undefined;
     let markerTab = deletion && this.markers.get(deletion.namedRangeId)?.tabId;
     if (deletion && markerTab && this.tabs.length > 1 &&
         !deletion.tabsCriteria?.tabIds.includes(markerTab)) {
@@ -392,82 +514,88 @@ class DocsModel {
     }
     if (body.writeControl?.requiredRevisionId &&
         body.writeControl.requiredRevisionId !== `revision-${this.#revision}`) {
-      return Response.json({ error: { code: 400, message: "revision mismatch" } }, { status: 400 });
+      return Response.json({
+        error: {
+          code: 400,
+          ...this.stalePinStatus ? { status: this.stalePinStatus } : {},
+          message: "The required revision ID does not match the latest revision.",
+        },
+      }, { status: 400 });
     }
     // Google checks a batch whole before it applies any of it.
-    for (let { addDocumentTab } of body.requests) {
-      let refusal = addDocumentTab && this.#addTabRefusal(addDocumentTab.tabProperties);
+    for (let request of body.requests) {
+      let refusal = "addDocumentTab" in request &&
+        this.#addTabRefusal(request.addDocumentTab.tabProperties);
       if (refusal) {
         return Response.json(
           { error: { code: 400, status: "INVALID_ARGUMENT", message: refusal } }, { status: 400 });
       }
     }
 
-    let replies: unknown[] = [];
-    let hasContent = false;
+    // Google resolves an unqualified coordinate against a default tab, so a request that omits
+    // the ID would edit whichever tab that happens to be.
+    let contentRequests: GoogleDocsRequest[] = [];
+    let tabRequests = new Map<ModelTab, GoogleDocsRequest[]>();
     for (const request of body.requests) {
-      if (request.deleteNamedRange) {
+      // The add of a tab changes no tab's content: the model is never given one.
+      if ("deleteNamedRange" in request || "addDocumentTab" in request) continue;
+      let tabId = requestTabId(request);
+      if (!tabId) {
+        throw new Error(`Google Docs request is missing tabId: ${JSON.stringify(request)}`);
+      }
+      if ("createNamedRange" in request) continue;
+      contentRequests.push(request);
+      let tab = this.#tab(tabId);
+      tabRequests.set(tab, [...tabRequests.get(tab) ?? [], request]);
+    }
+    // The gatekeeper sends an add alone, with its marker.
+    if (contentRequests.length > 0 && body.requests.some(request => "addDocumentTab" in request)) {
+      throw new Error("A Google Docs batch that adds a tab changed content too");
+    }
+    // The model applies each tab's requests: all of a batch, or none of it, the marker included.
+    let edited = new Map<ModelTab, GoogleDocsTab>();
+    for (const [tab, requests] of tabRequests) {
+      try {
+        edited.set(tab, applyDocsRequests(this.bodyTab(tab.id), requests));
+      } catch (error) {
+        let message = error instanceof Error ? error.message : String(error);
+        return Response.json(
+          { error: { code: 400, status: "INVALID_ARGUMENT", message } }, { status: 400 });
+      }
+    }
+    for (const [tab, applied] of edited) {
+      Object.assign(tab, { body: applied.body, lists: applied.lists });
+    }
+
+    let replies: unknown[] = [];
+    let hasContent = contentRequests.length > 0;
+    for (const request of body.requests) {
+      if ("deleteNamedRange" in request) {
         this.markers.delete(request.deleteNamedRange.namedRangeId);
         this.deletedMarkerIds.push(request.deleteNamedRange.namedRangeId);
         replies.push({});
         continue;
       }
-      if (request.addDocumentTab) {
+      if ("addDocumentTab" in request) {
         hasContent = true;
         replies.push({ addDocumentTab: { tabProperties: this.#addTab(request.addDocumentTab.tabProperties) } });
         continue;
       }
 
-      // Google resolves an unqualified coordinate against a default tab, so a request that omits
-      // the ID would edit whichever tab that happens to be.
-      let coordinate = request.createNamedRange?.range ?? request.insertText?.location ??
-        request.deleteContentRange?.range ?? request.updateParagraphStyle?.range ??
-        request.createParagraphBullets?.range ?? request.deleteParagraphBullets?.range ??
-        request.updateTextStyle?.range;
-      if (!coordinate?.tabId) {
-        throw new Error(`Google Docs request is missing tabId: ${JSON.stringify(request)}`);
-      }
-      let tab = this.#tab(coordinate.tabId);
-
-      if (request.createNamedRange) {
+      let tab = this.#tab(requestTabId(request) ?? "");
+      if ("createNamedRange" in request) {
         let id = `marker-${this.#nextMarkerId++}`;
-        this.addMarker(request.createNamedRange.name, id, tab.id);
+        // A batch's marker is part of its one revision, which moves below.
+        this.markers.set(id, { name: request.createNamedRange.name, tabId: tab.id });
+        this.#recordMarkerCount();
         this.markerTabIds.push(tab.id);
         replies.push({ createNamedRange: { namedRangeId: id } });
         continue;
       }
 
-      hasContent = true;
-      if (request.insertText) {
-        this.#insertText(
-          tab, request.insertText.location.index, request.insertText.text,
-        );
-      } else if (request.deleteContentRange) {
-        let { startIndex, endIndex } = request.deleteContentRange.range;
-        this.#deleteText(tab, startIndex, endIndex);
-      } else if (request.updateParagraphStyle) {
-        let { range, paragraphStyle, fields } = request.updateParagraphStyle;
-        if (paragraphStyle.namedStyleType) {
-          this.#setParagraphStyle(tab, range, paragraphStyle.namedStyleType);
-        }
-        if (fields.split(",").includes("indentStart")) this.#clearIndent(tab, range);
-      } else if (request.deleteParagraphBullets) {
-        this.#setBullets(tab, request.deleteParagraphBullets.range);
-      } else if (request.createParagraphBullets) {
-        this.#setBullets(
-          tab, request.createParagraphBullets.range, request.createParagraphBullets.bulletPreset,
-        );
-      } else if (request.updateTextStyle && (
-        request.updateTextStyle.textStyle?.link || request.updateTextStyle.fields?.includes("link")
-      )) {
-        let { startIndex, endIndex } = request.updateTextStyle.range;
-        this.#setLink(
-          tab, startIndex - 1, endIndex - 1,
-          request.updateTextStyle.textStyle?.link?.url,
-        );
-      }
       replies.push({});
     }
+    if (hasContent) this.lastContentRequests = contentRequests;
     if (hasContent) this.contentBatches++;
     this.#revision++;
     this.#recordMarkerCount();
@@ -494,13 +622,20 @@ class DocsModel {
     }
   }
 
-  /** Adds an empty tab as `addDocumentTab` does, returning its properties as Google replies. */
+  /**
+   * Adds an empty tab as `addDocumentTab` does, returning its properties as Google replies. The
+   * tab holds what `blankDocsTab` gives one, the named styles of a new document included, so it
+   * reads the same once added as the replay showed it while its add waited.
+   */
   #addTab({ title, parentTabId, index }: { title?: string; parentTabId?: string; index?: number }) {
     let siblings = this.tabs.filter(tab => tab.parentId === parentTabId);
     let at = index ?? siblings.length;
+    let id = `t.added-${this.#nextTabId++}`;
+    let { title: named, body, lists, namedStyles } =
+      blankDocsTab(id, title || `Tab ${this.tabs.length + 1}`);
     let tab: ModelTab = {
-      id: `t.added-${this.#nextTabId++}`, title: title || `Tab ${this.tabs.length + 1}`,
-      ...parentTabId === undefined ? {} : { parentId: parentTabId }, text: "", links: [],
+      id, title: named, ...parentTabId === undefined ? {} : { parentId: parentTabId },
+      body, lists, namedStyles,
     };
     // Siblings keep the order of this list, so the tab goes before the one it displaces.
     if (at < siblings.length) this.tabs.splice(this.tabs.indexOf(siblings[at]), 0, tab);
@@ -585,7 +720,8 @@ class DocsModel {
 
   /** A batch of comment writes, or one suggestion, as Docs applies it. */
   #commentWrite(body: {
-    requests: BatchRequest[]; writeControl?: { requiredRevisionId?: string; writeMode?: "SUGGEST" };
+    requests: (GoogleDocsRequest | CommentRequest)[];
+    writeControl?: { requiredRevisionId?: string; writeMode?: "SUGGEST" };
   }): Response {
     let refuse = (code: number, status: string, message: string) =>
       Response.json({ error: { code, status, message } }, { status: code });
@@ -596,29 +732,31 @@ class DocsModel {
     let replies: unknown[] = [];
     let suggestionResponses: unknown[] = [];
     if (body.writeControl?.writeMode === "SUGGEST") {
-      let [{ deleteContentRange }, insert] = body.requests;
-      let { startIndex, endIndex, tabId } = deleteContentRange!.range;
-      let old = this.#tab(tabId!).text.slice(startIndex - 1, endIndex - 1);
+      let [remove, insert] = body.requests;
+      if (!remove || !("deleteContentRange" in remove)) throw new Error("A suggestion starts with a deletion");
+      let { startIndex, endIndex, tabId } = remove.deleteContentRange.range;
+      let old = this.text(this.#tab(tabId!).id).slice(startIndex - 1, endIndex - 1);
       let id = `suggest.s${this.suggestions.length + 1}`;
       this.suggestions.push({
         suggestionId: id, notes: [],
-        summaryText: insert?.insertText ? `Replace: “${old}” with “${insert.insertText.text}”` : `Delete: “${old}”`,
+        summaryText: insert && "insertText" in insert ? `Replace: “${old}” with “${insert.insertText.text}”` : `Delete: “${old}”`,
       });
       suggestionResponses.push({ createdSuggestionIds: [id] });
     }
     for (let request of body.requests) {
-      if (request.insertComment) {
+      if ("insertComment" in request) {
         let { content, range } = request.insertComment;
-        let quote = this.#tab(range.tabId!).text.slice(range.startIndex - 1, range.endIndex - 1);
+        let quote = this.text(this.#tab(range.tabId!).id)
+          .slice(range.startIndex - 1, range.endIndex - 1);
         let thread = this.addThread(content, { quote, me: true });
         replies.push({ insertComment: { commentThread: { commentId: thread.commentId } } });
-      } else if (request.addCommentReply?.suggestionId) {
-        let suggestion = this.suggestions.find(
-          candidate => candidate.suggestionId === request.addCommentReply!.suggestionId);
+      } else if ("addCommentReply" in request && request.addCommentReply.suggestionId) {
+        let { suggestionId } = request.addCommentReply;
+        let suggestion = this.suggestions.find(candidate => candidate.suggestionId === suggestionId);
         if (!suggestion) return refuse(404, "NOT_FOUND", "No such suggestion.");
         suggestion.notes.push(request.addCommentReply.post.content ?? "");
         replies.push({});
-      } else if (request.addCommentReply) {
+      } else if ("addCommentReply" in request) {
         let { commentId, post } = request.addCommentReply;
         let thread = this.threads.find(candidate => candidate.commentId === commentId);
         if (!thread) return refuse(404, "NOT_FOUND", `Comment with ID ${commentId} does not exist.`);
@@ -643,233 +781,6 @@ class DocsModel {
     });
   }
 
-  #insertText(tab: ModelTab, index: number, text: string): void {
-    if (tab.body) {
-      this.#replaceBodyText(tab, index, index, text);
-      return;
-    }
-    if (tab.table) {
-      this.#replaceTableText(tab, index, index, text);
-      return;
-    }
-    let offset = index - 1;
-    let paragraph = tab.text.slice(0, offset).split("\n").length - 1;
-    let insertedParagraphs = text.split("\n").length - 1;
-    if (tab.paragraphStyles) {
-      let style = tab.paragraphStyles[paragraph];
-      tab.paragraphStyles.splice(paragraph, 0, ...Array(insertedParagraphs).fill(style));
-    }
-    if (tab.paragraphLists) {
-      let list = tab.paragraphLists[paragraph] ?? null;
-      tab.paragraphLists.splice(paragraph, 0, ...Array(insertedParagraphs).fill(list));
-    }
-    for (const link of tab.links) {
-      if (link.start >= offset) {
-        link.start += text.length;
-        link.end += text.length;
-      } else if (link.end > offset) {
-        link.end += text.length;
-      }
-    }
-    tab.text = tab.text.slice(0, offset) + text + tab.text.slice(offset);
-  }
-
-  #deleteText(tab: ModelTab, startIndex: number, endIndex: number): void {
-    if (tab.body) {
-      this.#replaceBodyText(tab, startIndex, endIndex, "");
-      return;
-    }
-    if (tab.table) {
-      this.#replaceTableText(tab, startIndex, endIndex, "");
-      return;
-    }
-    let start = startIndex - 1;
-    let end = endIndex - 1;
-    let removed = end - start;
-    let fullText = `${tab.text}\n`;
-    if (tab.paragraphStyles) {
-      tab.paragraphStyles = withoutDeletedParagraphs(fullText, tab.paragraphStyles, start, end);
-    }
-    if (tab.paragraphLists) {
-      tab.paragraphLists = withoutDeletedParagraphs(fullText, tab.paragraphLists, start, end);
-    }
-    let links: ModelTab["links"] = [];
-    for (const link of tab.links) {
-      if (link.end <= start) links.push(link);
-      else if (link.start >= end) {
-        links.push({ ...link, start: link.start - removed, end: link.end - removed });
-      } else {
-        if (link.start < start) links.push({ ...link, end: start });
-        if (link.end > end) {
-          links.push({ ...link, start, end: link.end - removed });
-        }
-      }
-    }
-    tab.links = this.#normalizeLinks(links);
-    tab.text = tab.text.slice(0, start) + tab.text.slice(end);
-  }
-
-  #replaceBodyText(
-    tab: ModelTab, startIndex: number, endIndex: number, replacement: string,
-  ): void {
-    let content = tab.body!.content;
-    for (let structureIndex = 0; structureIndex < content.length; structureIndex++) {
-      let structure = content[structureIndex];
-      let elements = structure.paragraph?.elements;
-      if (!elements) continue;
-      let elementIndex = elements.findIndex(element => element.textRun &&
-        startIndex >= element.startIndex && endIndex <= element.endIndex);
-      if (elementIndex < 0) continue;
-
-      let element = elements[elementIndex];
-      let text = element.textRun!.content;
-      let start = startIndex - element.startIndex;
-      let end = endIndex - element.startIndex;
-      element.textRun!.content = text.slice(0, start) + replacement + text.slice(end);
-      let delta = replacement.length - (endIndex - startIndex);
-      element.endIndex += delta;
-      for (let index = elementIndex + 1; index < elements.length; index++) {
-        elements[index].startIndex += delta;
-        elements[index].endIndex += delta;
-      }
-      structure.endIndex += delta;
-      for (let index = structureIndex + 1; index < content.length; index++) {
-        this.#shiftBodyElement(content[index], delta);
-      }
-      return;
-    }
-    throw new Error("Fixture cannot edit structured content");
-  }
-
-  #shiftBodyElement(element: BodyElement, delta: number): void {
-    element.startIndex += delta;
-    element.endIndex += delta;
-    for (let part of element.paragraph?.elements ?? []) {
-      part.startIndex += delta;
-      part.endIndex += delta;
-    }
-    for (let row of element.table?.tableRows ?? []) {
-      row.startIndex += delta;
-      row.endIndex += delta;
-      for (let cell of row.tableCells ?? []) {
-        cell.startIndex += delta;
-        cell.endIndex += delta;
-        for (let child of cell.content ?? []) this.#shiftBodyElement(child, delta);
-      }
-    }
-  }
-
-  #setBullets(
-    tab: ModelTab,
-    range: { startIndex: number; endIndex: number },
-    preset?: string,
-  ): void {
-    let indexes = paragraphsIn(tab.text, range);
-    if (!preset) {
-      for (let index of indexes) if (tab.paragraphLists?.[index]) tab.paragraphLists[index] = "indented";
-      return;
-    }
-    let lists = tab.paragraphLists ??= tab.text.split("\n").map(() => null);
-    let first = indexes[0];
-    if (first === undefined) return;
-    let preceding = lists[first - 1];
-    let id = isListItem(preceding) && preceding.preset === preset
-      ? preceding.id : `list-${this.#nextListId++}`;
-    for (let index of indexes) lists[index] = { id, preset };
-  }
-
-  #clearIndent(tab: ModelTab, range: { startIndex: number; endIndex: number }): void {
-    let lists = tab.paragraphLists;
-    for (let index of paragraphsIn(tab.text, range)) {
-      if (lists?.[index] === "indented") lists[index] = null;
-    }
-  }
-
-  #setLink(tab: ModelTab, start: number, end: number, url?: string): void {
-    let links: ModelTab["links"] = [];
-    for (const link of tab.links) {
-      if (link.end <= start || link.start >= end) links.push(link);
-      else {
-        if (link.start < start) links.push({ ...link, end: start });
-        if (link.end > end) links.push({ ...link, start: end });
-      }
-    }
-    if (url) links.push({ start, end, url });
-    tab.links = this.#normalizeLinks(links);
-  }
-
-  #normalizeLinks(links: ModelTab["links"]): ModelTab["links"] {
-    links.sort((a, b) => a.start - b.start || a.end - b.end);
-    let normalized: ModelTab["links"] = [];
-    for (const link of links) {
-      if (link.start === link.end) continue;
-      let previous = normalized.at(-1);
-      if (previous?.url === link.url && previous.end >= link.start) {
-        previous.end = Math.max(previous.end, link.end);
-      } else {
-        normalized.push({ ...link });
-      }
-    }
-    return normalized;
-  }
-
-  #setParagraphStyle(
-    tab: ModelTab,
-    range: { startIndex: number; endIndex: number },
-    namedStyleType: string,
-  ): void {
-    if (tab.body) {
-      for (let element of tab.body.content) {
-        if (element.paragraph && range.startIndex < element.endIndex &&
-            range.endIndex > element.startIndex) {
-          element.paragraph.paragraphStyle.namedStyleType = namedStyleType;
-        }
-      }
-      return;
-    }
-    let styles = tab.paragraphStyles ??=
-      tab.text.split("\n").map(() => "NORMAL_TEXT");
-    for (let index of paragraphsIn(tab.text, range)) styles[index] = namedStyleType;
-  }
-
-  #replaceTableText(
-    tab: ModelTab, startIndex: number, endIndex: number, replacement: string,
-  ): void {
-    let table = tab.table;
-    if (!table) throw new Error("Expected a table-backed tab");
-    let start = this.#tableTextPoint(table, startIndex);
-    let end = this.#tableTextPoint(table, endIndex);
-    if (!start || !end || start.field !== end.field) {
-      throw new Error("Fixture cannot edit table structure");
-    }
-    let text = table[start.field];
-    table[start.field] = text.slice(0, start.offset) + replacement + text.slice(end.offset);
-  }
-
-  #tableTextPoint(table: NonNullable<ModelTab["table"]>, index: number): {
-    field: "before" | "after";
-    offset: number;
-  } | undefined {
-    let content = this.#tableBody(table).content;
-    let paragraphs = [
-      { field: "before" as const, element: content[1] },
-      { field: "after" as const, element: content.at(-1)! },
-    ];
-    for (const { field, element } of paragraphs) {
-      if (index >= element.startIndex && index <= element.endIndex - 1) {
-        return { field, offset: index - element.startIndex };
-      }
-    }
-  }
-
-  #tableBody(table: NonNullable<ModelTab["table"]>): GoogleDocsTab["body"] {
-    return buildTab([
-      { runs: [`${table.before}\n`] },
-      { table: table.rows.map(row => row.map(cell => `${cell}\n`)) },
-      { runs: [`${table.after}\n`] },
-    ]).body;
-  }
-
   /** Blocks a held request until the test releases it. One hold, so a retry is never held twice. */
   async #hold(kind: RequestKind): Promise<void> {
     let held = this.#held.get(kind);
@@ -890,53 +801,16 @@ class DocsModel {
   }
 
   #documentTab(tab: ModelTab): unknown {
-    let text = `${tab.text}\n`;
     let namedRanges: Record<string, { namedRanges: { namedRangeId: string; name: string }[] }> = {};
     for (const [namedRangeId, marker] of this.markers) {
       if (marker.tabId !== tab.id) continue;
       (namedRanges[marker.name] ??= { namedRanges: [] })
         .namedRanges.push({ namedRangeId, name: marker.name });
     }
-    let body = tab.body;
-    if (!body && tab.table) body = this.#tableBody(tab.table);
-    let lists: GoogleDocsTab["lists"] = {};
-    let paragraphLists = tab.paragraphLists;
-    let paragraphStyles = tab.paragraphStyles;
-    // One paragraph per line, carrying whichever of the per-paragraph attributes this tab has.
-    let paragraphBody = () => buildTab(tab.text.split("\n").map((paragraphText, index) => {
-      let list = paragraphLists?.[index];
-      return {
-        runs: [`${paragraphText}\n`],
-        namedStyleType: paragraphStyles?.[index],
-        ...isListItem(list) ? { bullet: { listId: list.id } } : {},
-      };
-    }), lists).body;
-
-    if (!body && paragraphLists) {
-      for (let item of paragraphLists) {
-        if (!isListItem(item)) continue;
-        let level = item.preset.startsWith("BULLET_")
-          ? { glyphSymbol: "●" } : { glyphType: "DECIMAL" };
-        lists[item.id] ??= { listProperties: { nestingLevels: [level] } };
-      }
-      body = paragraphBody();
-    }
-    if (!body && tab.links.length > 0) {
-      let textCursor = 0;
-      let runs: ({ text: string; style: { link: { url: string } } } | string)[] = [];
-      for (const link of tab.links) {
-        if (link.start > textCursor) runs.push(text.slice(textCursor, link.start));
-        runs.push({ text: text.slice(link.start, link.end), style: { link: { url: link.url } } });
-        textCursor = link.end;
-      }
-      if (textCursor < text.length) runs.push(text.slice(textCursor));
-      body = buildTab([{ runs, namedStyleType: paragraphStyles?.[0] }]).body;
-    }
-    if (!body && paragraphStyles) body = paragraphBody();
-    body ??= buildTab([{ runs: [text] }]).body;
+    let { body, lists, namedStyles } = tab;
     return {
       tabProperties: { tabId: tab.id, title: tab.title },
-      documentTab: { body, lists, namedRanges },
+      documentTab: { body, lists, namedRanges, ...namedStyles ? { namedStyles } : {} },
       childTabs: this.tabs.filter(child => child.parentId === tab.id)
         .map(child => this.#documentTab(child)),
     };
@@ -976,6 +850,8 @@ type Run = {
    * store keeps the reason it recorded, and the journal the error the approval failed with.
    */
   unapplied(reason: string): string;
+  /** What `insertTable()` authorizes beyond the read that prepares it, given the position read. */
+  positionReads(read: string): string[];
 };
 
 const STANDALONE: Run = {
@@ -985,6 +861,7 @@ const STANDALONE: Run = {
     `Google Doc edits must be approved in order. Approve earlier edit ${earlier} before edit ${later}.`,
   appliedAgain: answer => expect(answer).toMatch(/Unknown pending/),
   unapplied: reason => `Pending Google Doc edit could not be applied: ${reason}`,
+  positionReads: read => [read],
 };
 
 const THROUGH_DRIVE: Run = {
@@ -994,15 +871,22 @@ const THROUGH_DRIVE: Run = {
     "the earlier change to this file first.",
   appliedAgain: answer => expect(answer).toBeNull(),
   unapplied: reason => reason,
+  // The read that prepares the table is the authorization of the position it returns.
+  positionReads: () => [],
 };
 
 /**
  * The runs of a block that asserts what the engine does. A block runs bound directly alone when it
  * is about what only a Doc's own binding has: metadata dated by the revisions it observed, edits
- * stored in its own store under an earlier rendering or before tabs, creating a Doc, an Office
- * file connected as a Doc, its comments, and its stored layout. Within a block that runs twice, a
- * test that reads or writes the bound Doc's storage, or counts the fetches of its stored snapshot,
- * runs bound directly alone, and says why where that is not the reason.
+ * stored in its own store under an earlier rendering, creating a Doc, an Office file connected as
+ * a Doc, its comments, its stored layout, adding a tab, a write stored while a request of an
+ * approval is held, and the one queue its sessions share. Within a block that runs twice, a test
+ * runs bound directly alone, and says why where that is not the first reason, when it reads or
+ * writes the bound Doc's storage or counts the fetches of its stored copy; when it rejects a
+ * change to a table and asserts what the replay over the stored copy keeps of the table changes
+ * behind it, which a Drive binding, storing no copy, fails ('fails the table changes queued behind
+ * a rejected table change, and none behind a rejected text edit' asserts that); or when it needs
+ * a change or a queue larger than the 100 KiB a Drive binding stores a change in.
  */
 const RUNS = [STANDALONE, THROUGH_DRIVE];
 
@@ -1095,6 +979,66 @@ function markdownField(label: string, value: string) {
   return { label, kind: "text", value, syntax: "markdown" };
 }
 
+/** What a failed edit authorizes: the error says whether a tab, or what is in it, exists. */
+const GENERIC_READ = "Read the content of one tab of the document.";
+
+/** A model whose main tab has `body`, which the shared model of Google Docs edits. */
+function docsWithBody(body: GoogleDocsTab["body"], lists: GoogleDocsTab["lists"] = {}): DocsModel {
+  let docs = new DocsModel();
+  docs.setBody(MAIN_TAB, body, lists);
+  docs.install();
+  return docs;
+}
+
+type WriteMethod = Parameters<ReturnType<typeof hooks>["submitEdit"]>[1];
+
+/** Call one write method of a fresh session: the action it queued, and what it resolved to. */
+function edit(facet: string, method: WriteMethod, ...args: unknown[]) {
+  return Promise.resolve(hooks().submitEdit(facet, method, args));
+}
+
+/** Move the clock past the snapshot's time to live, so the next read asks Google again. */
+function passSnapshotTtl(): void {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(Date.now() + 60_000);
+}
+
+/** A table as `getContent()` writes it, from the inline HTML of each cell's one paragraph. */
+function tableOf(rows: string[][]): string {
+  let lines = rows.map(row =>
+    "  <tr>\n" + row.map(cell => `    <td><p>${cell}</p></td>\n`).join("") + "  </tr>\n");
+  return `<table>\n${lines.join("")}</table>`;
+}
+
+/** `Before`, a table of two rows and two columns, and `After`. */
+function tableBody(): GoogleDocsTab["body"] {
+  return buildTab([
+    { runs: ["Before\n"] },
+    { table: [["Task\n", "Status\n"], ["Fix login\n", "Open\n"]] },
+    { runs: ["After\n"] },
+  ]).body;
+}
+
+/** How the tab of `tableBody()` reads. */
+const TABLE_ROWS = [["Task", "Status"], ["Fix login", "Open"]];
+const TABLE_CONTENT = `Before\n\n${tableOf(TABLE_ROWS)}\n\nAfter\n`;
+/** Marks the paragraph at `position` in a tab's body as the anchor of a positioned image. */
+function anchorImage(tab: GoogleDocsTab, position: number): GoogleDocsTab {
+  let anchor = tab.body.content[position].paragraph;
+  if (!anchor) throw new Error(`Element ${position} is not a paragraph`);
+  anchor.positionedObjectIds = ["image-1"];
+  return tab;
+}
+
+/** A pending record for the main tab, as storage holds one under the current rendering. */
+const storedAction = (id: number, action: Record<string, unknown>) => ({
+  kind: "put" as const,
+  key: `pending:action:${id}`,
+  value: {
+    tabId: MAIN_TAB, submittedAt: 0, markdownVersion: MARKDOWN_RENDERING_VERSION, ...action,
+  },
+});
+
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
@@ -1124,6 +1068,14 @@ describe.each(RUNS)("Google Doc auto-approval, $name", r => {
     expect(await hooks().lastActionVerdict)
       .toEqual({ actionKind: EDIT_DOCUMENT, autoApprovable: true });
     await hooks().submitReplace("verdict-edit", "Draft", "Final");
+    expect(await hooks().lastActionVerdict)
+      .toEqual({ actionKind: EDIT_DOCUMENT, autoApprovable: true });
+  });
+
+  it("lets a cell's text be replaced as a document edit", async () => {
+    docsWithBody(tableBody());
+
+    await edit("verdict-cell", "replaceText", "<td><p>Open</p></td>", "<td><p>Done</p></td>");
     expect(await hooks().lastActionVerdict)
       .toEqual({ actionKind: EDIT_DOCUMENT, autoApprovable: true });
   });
@@ -1228,12 +1180,388 @@ describe.each(RUNS)("Google Doc tables, $name", r => {
 
     await expect(Promise.resolve(
       hooks().submitReplace("table-edit", content.trimEnd(), "Updated"),
-    )).rejects.toThrow("replaceText: structured content cannot be edited");
+    )).rejects.toThrow(
+      "replaceText: this replacement changes a table together with what is around it");
     expect(await hooks().lastActionDescription).toBe("");
     expect(docs.contentBatches).toBe(0);
   });
+
+  it("shows a cell replacement's card as table HTML", async () => {
+    let docs = docsWithBody(tableBody());
+    let facet = "table-cell-card";
+
+    let { actionId } = await edit(
+      facet, "replaceText", "<td><p>Open</p></td>", "<td><p>**Done**</p></td>");
+
+    expect(await hooks().lastActionTitle).toBe("Edit Google Doc");
+    expect(await hooks().lastActionDescription).toBe(
+      'Replace text in a table of tab "Main" (tab-1). The values below are the table\'s HTML: ' +
+      "Markdown syntax in them is written to the cells as typed.");
+    expect(await hooks().lastActionFields).toEqual([
+      cardField("Old", "<td><p>Open</p></td>", "html"),
+      cardField("New", "<td><p>**Done**</p></td>", "html"),
+    ]);
+    expect(await hooks().readContent(facet)).toContain("<td><p>**Done**</p></td>");
+    expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    expect(docs.cellText(0, 1, 1)).toBe("**Done**");
+
+    // The same strings outside a table are Markdown, and the card says so.
+    await edit(facet, "replaceText", "After", "**Later**");
+    expect(await hooks().lastActionDescription).toBe('Replace text in tab "Main" (tab-1).');
+    expect(await hooks().lastActionFields).toEqual([
+      cardField("Old", "After", "markdown"),
+      cardField("New", "**Later**", "markdown"),
+    ]);
+  });
+
+  // A rendering of the document may be left under these two keys. The gatekeeper's constructor
+  // ran before the seed below was stored, so the facet is restarted for it to meet them.
+  it.skipIf(r.drive)("deletes a rendering left in storage without reading it", async () => {
+    let docs = new DocsModel();
+    docs.setText(MAIN_TAB, "fresh");
+    docs.install();
+    let facet = "rendering-left-in-storage";
+    let lengths = async () => [
+      await hooks().storedValueJsonLength(facet, "docSnapshot"),
+      await hooks().storedValueJsonLength(facet, "docSnapshotCheck"),
+    ];
+    await hooks().applyStorage(facet, [
+      { kind: "put", key: "docSnapshot", value: { markdown: "stale\n", fetchedAt: Date.now() } },
+      { kind: "put", key: "docSnapshotCheck", value: { checkedAt: Date.now() } },
+    ]);
+    expect(await lengths()).toEqual([expect.any(Number), expect.any(Number)]);
+
+    await hooks().restartDoc(facet);
+
+    expect(await hooks().readContent(facet)).toBe("fresh\n");
+    expect(docs.documentFetches).toBe(1);
+    expect(await lengths()).toEqual([undefined, undefined]);
+  });
+
+  it.skipIf(r.drive)("checks the revision after a rejection", async () => {
+    let docs = new DocsModel();
+    docs.setText(MAIN_TAB, "base");
+    docs.install();
+    let facet = "reject-revision-check";
+    let actionId = await hooks().submitAppend(facet, "added");
+    expect(await hooks().readContent(facet)).toBe("base\n\nadded\n");
+    expect(docs.documentFetches).toBe(1);
+
+    await hooks().rejectAction(facet, actionId);
+
+    // The copy was kept, and only its revision checked.
+    expect(await hooks().readContent(facet)).toBe("base\n");
+    expect(docs.revisionProbes).toBe(1);
+    expect(docs.documentFetches).toBe(1);
+
+    // With a collaborator's edit since, the same read fetches the document again.
+    let edited = "reject-revision-moved";
+    let editedId = await hooks().submitAppend(edited, "added");
+    await hooks().rejectAction(edited, editedId);
+    docs.externalEdit(MAIN_TAB, "collaborator edit");
+    expect(await hooks().readContent(edited)).toBe("collaborator edit\n");
+    expect(docs.revisionProbes).toBe(2);
+    expect(docs.documentFetches).toBe(3);
+  });
+
+  // The approval read the document to refuse the edit, and that reading is not the copy's to keep.
+  it.skipIf(r.drive)("checks the revision after an approval that could not be applied", async () => {
+    let docs = new DocsModel();
+    docs.setText(MAIN_TAB, "Before");
+    docs.install();
+    let facet = "unapplyable-revision-check";
+    let actionId = await hooks().submitAppend(facet, "added");
+    expect(await hooks().readContent(facet)).toBe("Before\n\nadded\n");
+
+    // A collaborator ends the tab in a table, inside the copy's TTL.
+    docs.setBody(MAIN_TAB, buildTab([{ runs: ["Before\n"] }, { table: [["Cell\n"]] }]).body);
+    docs.externalEdit();
+    expect(await hooks().applyAction(facet, actionId))
+      .toContain("appendText: the selected tab does not end in a paragraph");
+    let fetches = docs.documentFetches;
+    let probes = docs.revisionProbes;
+
+    expect(await hooks().readContent(facet)).toBe(`Beforecollaborator\n\n${tableOf([["Cell"]])}\n`);
+    expect(docs.revisionProbes).toBe(probes + 1);
+    expect(docs.documentFetches).toBe(fetches + 1);
+  });
+
+  it.skipIf(r.drive)("serves the copy it holds once its revision is confirmed", async () => {
+    let docs = docsWithBody(tableBody());
+    let facet = "copy-confirmed";
+    await hooks().readContent(facet);
+    expect(docs.documentFetches).toBe(1);
+
+    passSnapshotTtl();
+    await hooks().readContent(facet);
+
+    expect(docs.revisionProbes).toBe(1);
+    expect(docs.documentFetches).toBe(1);
+
+    // The check is what made the copy current: a read at once asks Google nothing.
+    await hooks().readContent(facet);
+    expect(docs.revisionProbes).toBe(1);
+    expect(docs.documentFetches).toBe(1);
+  });
 });
 
+/** What a read's replay stores with an edit it drops for `reason`. */
+const droppedByRead = (reason: string) =>
+  `Pending Google Doc edit could not be replayed against the current document: ${reason} ` +
+  "This edit was dropped from the document. Reject it and retry if it is still needed.";
+
+describe.each(RUNS)("Google Doc edits replayed on the copy of the document, $name", r => {
+  inRun(r);
+
+  it.skipIf(r.drive)("keeps a tab larger than one stored value", async () => {
+    let lines = Array.from({ length: 4_000 }, (_, line) => `line ${line} ${"x".repeat(700)}`);
+    let docs = docsWithBody(buildTab(lines.map(para)).body);
+    let facet = "copy-larger-than-one-value";
+    let stored = new TextEncoder().encode(JSON.stringify(pruneTab(docs.bodyTab()))).length;
+    expect(stored).toBeGreaterThan(3 * 1024 * 1024);
+
+    let content = await hooks().readContent(facet);
+    expect(content).toBe(lines.map(line => `${line}\n`).join("\n"));
+    let { actionId } = await edit(facet, "replaceText", "line 2000 ", "changed 2000 ");
+    let pending = content.replace("line 2000 ", "changed 2000 ");
+    expect(await hooks().readContent(facet)).toBe(pending);
+
+    // Another activation has only what was stored: the read comes out of the stored copy.
+    await hooks().restartDoc(facet);
+    expect(await hooks().readContent(facet)).toBe(pending);
+    expect(docs.documentFetches).toBe(1);
+    expect(docs.revisionProbes).toBe(0);
+
+    expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    expect(docTabToMarkdown(docs.bodyTab()).markdown).toBe(pending);
+    expect(await hooks().readContent(facet)).toBe(pending);
+  });
+
+  it("drops the edits queued for a tab when a write to it is refused because the model cannot index it", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let docs = docsWithBody(buildTab([para("Zebra"), para("Dingo")]).body);
+    let facet = "tab-unindexed-write";
+    await hooks().readContent(facet, MAIN_TAB);
+    let earlier = await edit(facet, "replaceText", "Zebra", "Okapi", MAIN_TAB);
+
+    let body = structuredClone(docs.bodyTab().body);
+    let first = body.content.find(element => element.paragraph)!;
+    first.paragraph!.elements.unshift({
+      startIndex: first.startIndex, endIndex: first.startIndex,
+      textRun: { content: "", textStyle: {} },
+    });
+    docs.externalBody(MAIN_TAB, body);
+    passSnapshotTtl();
+
+    // No read comes between: the refused write is what replays the tab.
+    await expect(edit(facet, "appendText", "more", MAIN_TAB))
+      .rejects.toThrow(unindexedTabRefusal("appendText").message);
+    expect(await hooks().applyAction(facet, earlier.actionId))
+      .toBe(droppedByRead(unindexedTabRefusal("replaceText").message));
+    expect(docs.contentBatches).toBe(0);
+  });
+
+  it("shows on the card what a read returns", async () => {
+    // Bold written on a heading whose named style gives bold: the markers write nothing.
+    let docs = new DocsModel();
+    docs.setBody(MAIN_TAB, buildTab([
+      para("Before"), { runs: ["Notes here\n"], namedStyleType: "HEADING_2" }, para("After"),
+    ]).body, {}, {
+      styles: [
+        { namedStyleType: "NORMAL_TEXT", textStyle: { bold: false } },
+        { namedStyleType: "HEADING_2", textStyle: { bold: true } },
+      ],
+    });
+    docs.install();
+    let facet = "card-shows-the-read";
+    let content = await hooks().readContent(facet);
+
+    let { actionId } = await edit(facet, "replaceText", "Notes here", "**Notes here**");
+
+    expect(await hooks().lastActionFields).toEqual([
+      cardField("Old", "Notes here", "markdown"),
+      cardField("Requested New", "**Notes here**", "markdown"),
+      cardField("New", "Notes here", "markdown"),
+    ]);
+    expect(await hooks().readContent(facet)).toBe(content);
+    expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    passSnapshotTtl();
+    expect(await hooks().readContent(facet)).toBe(content);
+  });
+
+  it("takes an edit to a subtitle while another edit to its tab waits", async () => {
+    let docs = new DocsModel();
+    docs.setBody(MAIN_TAB, buildTab([
+      para("Other text"), { runs: ["Notes here\n"], namedStyleType: "SUBTITLE" }, para("After"),
+    ]).body, {}, {
+      styles: [
+        { namedStyleType: "NORMAL_TEXT", textStyle: { bold: false } },
+        { namedStyleType: "SUBTITLE", textStyle: { bold: true } },
+      ],
+    });
+    docs.install();
+    let facet = "subtitle-behind-an-edit";
+    let content = await hooks().readContent(facet);
+
+    let waiting = await edit(facet, "replaceText", "Other text", "Elsewhere");
+    let subtitle = await edit(facet, "replaceText", "Notes here", "*Notes* here");
+
+    // Italic is written, since the subtitle's style does not give it.
+    expect(await hooks().lastActionFields).toEqual([
+      cardField("Old", "Notes here", "markdown"),
+      cardField("New", "*Notes* here", "markdown"),
+    ]);
+    let pending = content.replace("Other text", "Elsewhere").replace("Notes here", "*Notes* here");
+    expect(await hooks().readContent(facet)).toBe(pending);
+    expect(await hooks().applyAction(facet, waiting.actionId)).toBeNull();
+    expect(await hooks().applyAction(facet, subtitle.actionId)).toBeNull();
+    expect(docTabToMarkdown(docs.bodyTab()).markdown).toBe(pending);
+    passSnapshotTtl();
+    expect(await hooks().readContent(facet)).toBe(pending);
+  });
+
+  it.skipIf(r.drive)("refuses at the call an append that approval would refuse", async () => {
+    // A top-level item behind a nested one that anchors an image could only be placed by
+    // rewriting that item, which the request builder refuses.
+    let lists = { "list-1": { listProperties: { nestingLevels: presetLevels() } } };
+    let tab = buildTab([
+      { runs: ["a\n"], bullet: { listId: "list-1", nestingLevel: 0 } },
+      { runs: ["b\n"], bullet: { listId: "list-1", nestingLevel: 1 } },
+    ], lists);
+    docsWithBody(anchorImage(tab, tab.body.content.length - 1).body, lists);
+    let facet = "append-refused-at-the-call";
+
+    await expect(edit(facet, "appendText", "- c")).rejects.toThrow(POSITIONED_ITEM_BEFORE);
+    expect(await hooks().storedValueJsonLength(facet, "pending:action:1")).toBeUndefined();
+    // An item at the nested one's level rewrites nothing, and is queued.
+    expect((await edit(facet, "appendText", "    - c")).actionId).toBe(1);
+  });
+
+  it.skipIf(r.drive)("drops an edit a read finds will not apply, and shows the tab without it", async () => {
+    let docs = new DocsModel();
+    docs.setText(MAIN_TAB, "Alpha\nBeta\nGamma");
+    docs.install();
+    let facet = "edit-dropped-by-a-read";
+    let first = await edit(facet, "replaceText", "Alpha", "First");
+    let third = await edit(facet, "replaceText", "Gamma", "Third");
+    expect(await hooks().readContent(facet)).toBe("First\n\nBeta\n\nThird\n");
+    let key = `pending:action:${third.actionId}`;
+    let queued = await hooks().storedValueJsonLength(facet, key);
+
+    // A collaborator's edit removes what the second edit quotes.
+    docs.externalEdit(MAIN_TAB, "Alpha\nBeta\nDelta");
+    passSnapshotTtl();
+    expect(await hooks().readContent(facet)).toBe("First\n\nBeta\n\nDelta\n");
+
+    let dropped = await hooks().storedValueJsonLength(facet, key);
+    expect(dropped).toBeGreaterThan(queued ?? Infinity);
+    expect(await hooks().applyAction(facet, third.actionId)).toBe(droppedByRead(
+      `replaceText: oldMarkdown was not found in the current simulated tab "${MAIN_TAB}". ` +
+      `Make sure the text exactly matches content returned by getContent("${MAIN_TAB}").`));
+    // A further read marks nothing more.
+    expect(await hooks().readContent(facet)).toBe("First\n\nBeta\n\nDelta\n");
+    expect(await hooks().storedValueJsonLength(facet, key)).toBe(dropped);
+    expect(await hooks().applyAction(facet, first.actionId)).toBeNull();
+    expect(docs.contentBatches).toBe(1);
+  });
+
+  it("queues a break that splits off text normal text's style also gives", async () => {
+    // Bold of its own in a heading, where normal text is bold by its style: split off, the
+    // rest of the heading is normal text and reads without the markers.
+    let styles = {
+      styles: [
+        { namedStyleType: "NORMAL_TEXT", textStyle: { bold: true } },
+        { namedStyleType: "HEADING_2", textStyle: { bold: false } },
+        { namedStyleType: "SUBTITLE", textStyle: { italic: true } },
+      ],
+    };
+    let docs = new DocsModel();
+    docs.setBody(MAIN_TAB, buildTab([para("Before"), {
+      runs: ["Notes ", { text: "here", style: { bold: true } }, "\n"], namedStyleType: "HEADING_2",
+    }, { runs: ["Aside here\n"], namedStyleType: "SUBTITLE" }, para("After")]).body, {}, styles);
+    docs.install();
+    let facet = "split-accepted";
+    let content = await hooks().readContent(facet);
+    expect(content).toContain("## Notes **here**\n");
+
+    let { actionId } = await edit(facet, "replaceText", "Notes", "End\n\n");
+
+    let fields = await hooks().lastActionFields;
+    expect(fields).toEqual([
+      cardField("Old", "Notes **here**", "markdown"),
+      cardField("Requested New", "End\n\n **here**", "markdown"),
+      cardField("New", "End\n\n here", "markdown"),
+    ]);
+    let pending = content.replace("Notes **here**", "End\n\n here");
+    expect(await hooks().readContent(facet)).toBe(pending);
+    expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    passSnapshotTtl();
+    expect(await hooks().readContent(facet)).toBe(pending);
+    expect(docTabToMarkdown(docs.bodyTab()).markdown).toBe(pending);
+
+    // A break inside a subtitle would lose the subtitle's look: the request builder refuses it.
+    await expect(edit(facet, "replaceText", "Aside", "End\n\n")).rejects.toThrow(
+      "replaceText: a paragraph break written inside a subtitle would make the rest of it a " +
+      "normal paragraph, without the subtitle's look. Write the break at the subtitle's end, " +
+      "or replace the whole subtitle.");
+  });
+
+  it("shows on an append's card the empty paragraphs it writes", async () => {
+    let docs = new DocsModel();
+    docs.setText(MAIN_TAB, "Intro");
+    docs.install();
+    let facet = "append-card-empty-paragraphs";
+
+    await edit(facet, "appendText", "a\n\nb\n\n");
+    expect(await hooks().lastActionFields)
+      .toEqual([cardField("Content", "a\n\nb\n\n", "markdown")]);
+    expect(await hooks().readContent(facet)).toBe("Intro\n\na\n\nb\n\n\n");
+
+    await edit(facet, "appendText", "\nplain");
+    expect(await hooks().lastActionFields).toEqual([
+      cardField("Requested", "\nplain", "markdown"),
+      cardField("Resulting", "\n\nplain", "markdown"),
+    ]);
+    expect(await hooks().readContent(facet)).toContain("\n\n\nplain\n");
+  });
+
+  it.skipIf(r.drive)("asks Google nothing more after an edit that sent nothing is approved with nothing behind it", async () => {
+    let docs = new DocsModel();
+    docs.setText(MAIN_TAB, "Alpha\nBeta");
+    docs.install();
+    // A single line break is written as the paragraph break the tab already has there.
+    let unchanged = ["replaceText", "Alpha\n\nBeta", "Alpha\nBeta"] as const;
+    let facet = "apply-sends-nothing";
+    expect(await hooks().readContent(facet)).toBe("Alpha\n\nBeta\n");
+    let alone = await edit(facet, ...unchanged);
+    expect(docs.documentFetches).toBe(1);
+
+    expect(await hooks().applyAction(facet, alone.actionId)).toBeNull();
+    expect(docs.contentBatches).toBe(0);
+    // The approval fetched the document for itself, and nothing for a replay nobody needs.
+    expect(docs.documentFetches).toBe(2);
+    expect(docs.revisionProbes).toBe(0);
+    // The copy is kept, and is due a check of its revision.
+    expect(await hooks().readContent(facet)).toBe("Alpha\n\nBeta\n");
+    expect(docs.revisionProbes).toBe(1);
+    expect(docs.documentFetches).toBe(2);
+
+    // With an edit behind it, the approval replays the queue over the copy once it is checked.
+    let behind = "apply-sends-nothing-behind";
+    expect(await hooks().readContent(behind)).toBe("Alpha\n\nBeta\n");
+    let first = await edit(behind, ...unchanged);
+    await edit(behind, "appendText", "more");
+    let fetches = docs.documentFetches;
+    let probes = docs.revisionProbes;
+    expect(await hooks().applyAction(behind, first.actionId)).toBeNull();
+    expect(docs.contentBatches).toBe(0);
+    expect(docs.documentFetches).toBe(fetches + 1);
+    expect(docs.revisionProbes).toBe(probes + 1);
+    expect(await hooks().readContent(behind)).toBe("Alpha\n\nBeta\n\nmore\n");
+    expect(docs.documentFetches).toBe(fetches + 1);
+    expect(docs.revisionProbes).toBe(probes + 1);
+  });
+});
 describe.each(RUNS)("Google Doc structured elements, $name", r => {
   inRun(r);
 
@@ -1281,6 +1609,14 @@ describe.each(RUNS)("Google Doc structured elements, $name", r => {
     );
   });
 });
+
+/** Each paragraph of the main tab: its text, and the list and level it is an item of. */
+function storedParagraphs(docs: DocsModel) {
+  return docs.bodyTab().body.content.flatMap(element => element.paragraph ? [{
+    text: element.paragraph.elements.map(part => part.textRun?.content ?? "").join(""),
+    bullet: element.paragraph.bullet,
+  }] : []);
+}
 
 describe.each(RUNS)("Google Doc list edits, $name", r => {
   inRun(r);
@@ -1483,6 +1819,217 @@ describe.each(RUNS)("Google Doc list edits, $name", r => {
     expect(preview).toBe("1. First\n\n- Second\n");
     expect(await hooks().applyAction("change-list-type", actionId)).toBeNull();
     expect(await hooks().readContent("change-list-type")).toBe(preview);
+  });
+
+  it("reads a list written through approval as Google would store it", async () => {
+    let docs = new DocsModel();
+    docs.install();
+    let facet = "stored-list";
+    let nestedId = await hooks().submitAppend(facet, "- a\n  - b\n    - c");
+    expect(await hooks().applyAction(facet, nestedId)).toBeNull();
+
+    // Google makes one list of the preset's nine levels, takes the tabs that carried each item's
+    // level off its text, and keeps none of the empty paragraph the levels were counted from
+    // (recorded: `nesting-outdent / a nested list`).
+    let listId = storedParagraphs(docs)[0].bullet?.listId;
+    expect(storedParagraphs(docs)).toEqual([
+      { text: "a\n", bullet: { listId } },
+      { text: "b\n", bullet: { listId, nestingLevel: 1 } },
+      { text: "c\n", bullet: { listId, nestingLevel: 2 } },
+    ]);
+    expect(docs.bodyTab().lists).toEqual({
+      [listId!]: { listProperties: { nestingLevels: presetLevels() } },
+    });
+
+    // An item appended after the nested ones joins their list, at the level it is written at
+    // (recorded: `nesting-outdent / a top-level item appended after the nested one`).
+    let joinedId = await hooks().submitAppend(facet, "- d");
+    expect(await hooks().applyAction(facet, joinedId)).toBeNull();
+    expect(storedParagraphs(docs)).toEqual([
+      { text: "a\n", bullet: { listId } },
+      { text: "b\n", bullet: { listId, nestingLevel: 1 } },
+      { text: "c\n", bullet: { listId, nestingLevel: 2 } },
+      { text: "d\n", bullet: { listId } },
+    ]);
+    expect(Object.keys(docs.bodyTab().lists)).toEqual([listId]);
+    expect(await hooks().readContent(facet)).toBe("- a\n  - b\n    - c\n- d\n");
+  });
+
+  it("reads a numbered item added after a numbered list with the list's next number", async () => {
+    let docs = new DocsModel();
+    docs.setNumberedList(MAIN_TAB, ["a", "b", "c"]);
+    docs.install();
+    let actionId = await hooks().submitAppend("next-number", "1. d");
+
+    expect(await hooks().applyAction("next-number", actionId)).toBeNull();
+    // The item counts on from the list's third only because it is an item of that list
+    // (recorded: `bullets-numbering-2 / a fourth item appended`).
+    let lists = storedParagraphs(docs).map(item => item.bullet?.listId);
+    expect(lists).toEqual(Array(4).fill(lists[0]));
+    expect(docs.renderedText()).toBe("1. a\n2. b\n3. c\n4. d");
+  });
+
+  it("shows an item written in front of a list as a list of its own, waiting and applied", async () => {
+    let docs = new DocsModel();
+    docs.setBulletedList(MAIN_TAB, ["Lead", "one", "two"]);
+    docs.interruptList(MAIN_TAB, 0);
+    docs.install();
+    let facet = "item-before-list";
+    let actionId = await hooks().submitReplace(facet, "Lead", "- Lead");
+
+    // Google never joins a new item to the list after it: the item is a list of its own, so a
+    // blank line stays between the two (recorded: `bullets-never-following / the paragraph
+    // becomes an item`).
+    expect(await hooks().readContent(facet)).toBe("- Lead\n\n- one\n- two\n");
+    expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    expect(await hooks().readContent(facet)).toBe("- Lead\n\n- one\n- two\n");
+    expect(docs.renderedText()).toBe("1. Lead\n1. one\n2. two");
+  });
+
+  it("shows two items rewritten together as items of the one list, waiting and applied", async () => {
+    let docs = new DocsModel();
+    docs.setBulletedList(MAIN_TAB, ["Intro", "a", "b", "c", "Outro"]);
+    docs.interruptList(MAIN_TAB, 0);
+    docs.interruptList(MAIN_TAB, 4);
+    docs.install();
+    let facet = "two-items-rewritten";
+    let actionId = await hooks().submitReplace(facet, "- a\n- b", "- x\n- y");
+
+    // A text edit inside a list item leaves its bullet, and this batch edits only text inside
+    // each item, so the three stay one list (recorded: `list-text-edits / bold inside a nested
+    // item`).
+    expect(await hooks().readContent(facet)).toBe("Intro\n\n- x\n- y\n- c\n\nOutro\n");
+    expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    expect(docs.lastContentRequests.filter(request =>
+      "createParagraphBullets" in request || "deleteParagraphBullets" in request)).toEqual([]);
+    expect(await hooks().readContent(facet)).toBe("Intro\n\n- x\n- y\n- c\n\nOutro\n");
+    expect(docs.renderedText()).toBe("Intro\n1. x\n2. y\n3. c\nOutro");
+  });
+
+  it("removes a list item quoted without its line break, and reads the list whole", async () => {
+    let lists = { "list-1": { listProperties: { nestingLevels: presetLevels() } } };
+    let docs = docsWithBody(buildTab([
+      { runs: ["a\n"], bullet: { listId: "list-1", nestingLevel: 0 } },
+      { runs: ["b\n"], bullet: { listId: "list-1", nestingLevel: 1 } },
+      { runs: ["c\n"], bullet: { listId: "list-1", nestingLevel: 0 } },
+      { runs: ["d\n"], bullet: { listId: "list-1", nestingLevel: 0 } },
+      para("End"),
+    ], lists).body, lists);
+    let facet = "item-removed";
+
+    // A nested item quoted from its marker: the card shows the line the change took.
+    let nested = await edit(facet, "replaceText", "- b", "");
+    expect(await hooks().lastActionFields).toEqual([
+      cardField("Old", "  - b\n", "markdown"),
+      cardField("Requested New", "  \n", "markdown"),
+      cardField("New", "", "markdown"),
+    ]);
+    expect(await hooks().readContent(facet)).toBe("- a\n- c\n- d\n\nEnd\n");
+
+    let top = await edit(facet, "replaceText", "- c", "");
+    expect(await hooks().lastActionFields).toEqual([
+      cardField("Old", "- c\n", "markdown"),
+      cardField("Requested New", "\n", "markdown"),
+      cardField("New", "", "markdown"),
+    ]);
+    let pending = await hooks().readContent(facet);
+    expect(pending).toBe("- a\n- d\n\nEnd\n");
+
+    expect(await hooks().applyAction(facet, nested.actionId)).toBeNull();
+    expect(await hooks().applyAction(facet, top.actionId)).toBeNull();
+    expect(docTabToMarkdown(docs.bodyTab()).markdown).toBe(pending);
+  });
+
+  it("writes an item at the blank line behind a nested item at its level", async () => {
+    let lists = { "list-1": { listProperties: { nestingLevels: presetLevels() } } };
+    let docs = docsWithBody(buildTab([
+      { runs: ["p\n"], bullet: { listId: "list-1", nestingLevel: 0 } },
+      { runs: ["a\n"], bullet: { listId: "list-1", nestingLevel: 1 } },
+      para("End"),
+    ], lists).body, lists);
+    let facet = "item-behind-nested";
+
+    // Google nests a bulleted range from the item it joins (recorded: `bullets-nesting`), so the
+    // item is bulleted from the nested item's level.
+    let sibling = await edit(facet, "replaceText", "\n\nEnd", "\n  - x\n\nEnd");
+    expect(await hooks().readContent(facet)).toBe("- p\n  - a\n  - x\n\nEnd\n");
+
+    let top = await edit(facet, "replaceText", "\n\nEnd", "\n- y\n\nEnd");
+    // The card shows the item as it was written: what will read is what was asked for.
+    expect(await hooks().lastActionFields).toEqual([
+      cardField("Old", "\n\nEnd", "markdown"),
+      cardField("New", "\n- y\n\nEnd", "markdown"),
+    ]);
+    let pending = await hooks().readContent(facet);
+    expect(pending).toBe("- p\n  - a\n  - x\n- y\n\nEnd\n");
+
+    expect(await hooks().applyAction(facet, sibling.actionId)).toBeNull();
+    expect(await hooks().applyAction(facet, top.actionId)).toBeNull();
+    expect(docTabToMarkdown(docs.bodyTab()).markdown).toBe(pending);
+  });
+
+  it("refuses at the call a list item written past the ninth level", async () => {
+    let lists = { "list-1": { listProperties: { nestingLevels: presetLevels() } } };
+    docsWithBody(buildTab([
+      para("Intro"),
+      { runs: ["p\n"], bullet: { listId: "list-1", nestingLevel: 0 } },
+      { runs: ["a\n"], bullet: { listId: "list-1", nestingLevel: 8 } },
+      para("End"),
+    ], lists).body, lists);
+    let facet = "item-past-the-ninth-level";
+    let ninthIndent = " ".repeat(16);
+    let tenthIndent = " ".repeat(18);
+    let before = await hooks().readContent(facet);
+    expect(before).toBe(`Intro\n\n- p\n${ninthIndent}- a\n\nEnd\n`);
+
+    // Appended, a paragraph made an item, and an item written behind the ninth-level one.
+    await expect(edit(facet, "appendText", `${tenthIndent}- x`)).rejects.toThrow(LIST_LEVEL_TOO_DEEP);
+    await expect(edit(facet, "replaceText", "Intro", `${tenthIndent}- Intro`))
+      .rejects.toThrow(LIST_LEVEL_TOO_DEEP);
+    await expect(edit(facet, "replaceText", "\n\nEnd", `\n${tenthIndent}- x\n\nEnd`))
+      .rejects.toThrow(LIST_LEVEL_TOO_DEEP);
+    // Nothing was queued.
+    expect(await hooks().readContent(facet)).toBe(before);
+
+    // A sibling of the ninth-level item is queued, and reads at that level.
+    await edit(facet, "replaceText", "\n\nEnd", `\n${ninthIndent}- x\n\nEnd`);
+    expect(await hooks().readContent(facet))
+      .toBe(`Intro\n\n- p\n${ninthIndent}- a\n${ninthIndent}- x\n\nEnd\n`);
+  });
+
+  it("writes list items whose text starts with a tab, and refuses a shallower item behind one before the lines it changes", async () => {
+    let lists = { "list-1": { listProperties: { nestingLevels: presetLevels() } } };
+    let tab = buildTab([
+      { runs: ["a\n"], bullet: { listId: "list-1", nestingLevel: 0 } },
+      { runs: ["\tb\n"], bullet: { listId: "list-1", nestingLevel: 1 } },
+    ], lists);
+    let docs = docsWithBody(tab.body, lists);
+    let facet = "item-text-starts-with-a-tab";
+    let before = await hooks().readContent(facet);
+    expect(before).toBe("- a\n  - \tb\n");
+
+    // Placing a top-level item would bullet the nested one again, and the append holds no text
+    // of that item to write its tab back from. Nothing is queued.
+    await expect(edit(facet, "appendText", "- c")).rejects.toThrow(TABBED_ITEM_BEFORE);
+    expect(await hooks().readContent(facet)).toBe(before);
+
+    // At the nested item's level nothing is bulleted again; the card shows the item as written.
+    let nested = await edit(facet, "appendText", "  - \tc");
+    expect(await hooks().lastActionFields).toEqual([cardField("Content", "  - \tc", "markdown")]);
+    expect(await hooks().readContent(facet)).toBe("- a\n  - \tb\n  - \tc\n");
+
+    // Both nested items are bulleted again with the item behind them, and keep their tabs.
+    let again = await edit(facet, "replaceText", "  - \tb\n  - \tc", "  - \tB\n  - \tc\n- d");
+    expect(await hooks().readContent(facet)).toBe("- a\n  - \tB\n  - \tc\n- d\n");
+
+    let typed = await edit(facet, "replaceText", "- a", "- \ta");
+    let pending = await hooks().readContent(facet);
+    expect(pending).toBe("- \ta\n  - \tB\n  - \tc\n- d\n");
+
+    for (let { actionId } of [nested, again, typed]) {
+      expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    }
+    expect(docTabToMarkdown(docs.bodyTab()).markdown).toBe(pending);
   });
 });
 
@@ -1794,7 +2341,9 @@ describe.each(RUNS)("Google Doc write receipts, $name", r => {
 
     expect(await hooks().applyAction("linked-label-append", firstId)).toBeNull();
     expect(await hooks().applyAction("linked-label-append", secondId)).toBeNull();
-    expect(await hooks().readContent("linked-label-append")).toBe(`base\n${editedLink}\n`);
+    // An append is a paragraph of its own, set off by a blank line
+    // (recorded: `around-tables / text appended`).
+    expect(await hooks().readContent("linked-label-append")).toBe(`base\n\n${editedLink}\n`);
   });
 
   it("simulates an append with canonical formatting nesting", async () => {
@@ -1866,6 +2415,27 @@ describe.each(RUNS)("Google Doc write receipts, $name", r => {
     ))).rejects.toThrow(/1048576-byte safe submission limit/);
     expect(docs.documentFetches).toBe(0);
     expect(await hooks().lastActionDescription).toBe("");
+  });
+
+  // What a card shows beyond the edit's own texts is stored with the edit, so it is held to a
+  // size of its own. Not run through Drive, where the 100 KiB of a record refuses first.
+  it.skipIf(r.drive)("refuses a replacement whose card would show more than 1 MiB of the tab", async () => {
+    // Splitting the second item renumbers the third, so the card shows the third whole, before
+    // and after: twice the padding.
+    let docs = new DocsModel();
+    docs.setNumberedList(MAIN_TAB, ["a", "b", `c ${"x".repeat(600_000)}`]);
+    docs.install();
+    let facet = "oversized-card";
+
+    await expect(Promise.resolve(hooks().submitReplace(facet, "b", "b\n\nplain"))).rejects.toThrow(
+      "replaceText: what this edit's approval card would show exceeds the 1048576-byte safe " +
+      "submission limit. Split the edit into smaller ones.");
+    // Refused by the check against the tab, so the read it took is authorized.
+    expect(await hooks().lastObservations).toEqual([GENERIC_READ]);
+    expect(await hooks().lastActionDescription).toBe("");
+    expect((await hooks().storedKeys(facet, "doc")).filter(key => key.startsWith("pending:action:")))
+      .toEqual([]);
+    expect(docs.contentBatches).toBe(0);
   });
 
   it.skipIf(r.drive)("rejects complex Markdown before reading the document", async () => {
@@ -2123,6 +2693,135 @@ describe.each(RUNS)("Google Doc write receipts, $name", r => {
   });
 });
 
+// The write queue belongs to the document, not to a session: a call takes its turn behind the
+// calls made before it, from whichever session it comes. The test holds a provider request, so it
+// stands after the restart test like the ones above.
+describe("Google Doc writes from several sessions", () => {
+  // Every call below is a session of its own. With a queue for each session the replacement is
+  // checked while the append it quotes still waits for Google, and is refused for text the tab
+  // does not hold; the second append is stored first, and the read shows only that one.
+  it("takes the calls of different sessions in the order they were made", async () => {
+    let docs = new DocsModel();
+    docs.setText(MAIN_TAB, "Start");
+    docs.install();
+    let facet = "write-order-sessions";
+    await hooks().readContent(facet);
+    // Past the snapshot's time to live a write asks Google for the revision: the first one's
+    // request is held, inside its turn.
+    passSnapshotTtl();
+    let probe = docs.hold("read");
+
+    let first = edit(facet, "appendText", "one");
+    await probe.reached;
+    let second = edit(facet, "replaceText", "one", "two");
+    let third = edit(facet, "appendText", "three");
+    let reading = Promise.resolve(hooks().readContent(facet));
+    let settled: string[] = [];
+    for (let [name, call] of Object.entries({ second, third, reading })) {
+      let note = () => { settled.push(name); };
+      call.then(note, note);
+    }
+    // Reading a stored record takes no turn and asks Google nothing, so it answers while the
+    // first write is held. The pause after it gives the three calls sent before it the time to
+    // settle, if nothing held them.
+    expect(await hooks().storedValueJsonLength(facet, "pending:action:1")).toBeUndefined();
+    await scheduler.wait(20);
+    expect(settled).toEqual([]);
+    expect(await hooks().storedValueJsonLength(facet, "pending:action:1")).toBeUndefined();
+    probe.release();
+
+    let queued = await Promise.all([first, second, third]);
+    expect(queued.map(({ actionId }) => actionId)).toEqual([1, 2, 3]);
+    // The replacement found the text of the append before it, and the read waited for all three.
+    let read = await reading;
+    expect(read).toBe("Start\n\ntwo\n\nthree\n");
+
+    for (let { actionId } of queued) {
+      expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    }
+    passSnapshotTtl();
+    expect(await hooks().readContent(facet)).toBe(read);
+    expect(docs.contentBatches).toBe(3);
+  });
+});
+
+// The rendering before the current one differs from it only inside tables, where it could queue
+// nothing, so the text edits it previewed still apply as previewed.
+describe("Google Doc edits stored under an earlier rendering", () => {
+  const PREVIOUS_RENDERING = 6;
+  const STRUCTURED = "replaceText: structured content cannot be edited";
+  const previous = (action: Record<string, unknown>) =>
+    [storedAction(1, { ...action, markdownVersion: PREVIOUS_RENDERING })];
+
+  it("applies a text replacement stored under the previous rendering", async () => {
+    let docs = new DocsModel();
+    docs.setText(MAIN_TAB, "base");
+    docs.install();
+    let facet = "previous-rendering-replace";
+    await hooks().applyStorage(
+      facet, previous({ type: "replaceText", oldMarkdown: "base", newMarkdown: "changed" }));
+
+    expect(await hooks().readContent(facet)).toBe("changed\n");
+    expect(await hooks().applyAction(facet, 1)).toBeNull();
+    expect(docs.text()).toBe("changed");
+  });
+
+  it("applies an append stored under the previous rendering", async () => {
+    let docs = new DocsModel();
+    docs.setText(MAIN_TAB, "base");
+    docs.install();
+    let facet = "previous-rendering-append";
+    await hooks().applyStorage(facet, previous({ type: "appendText", markdown: "added" }));
+
+    expect(await hooks().readContent(facet)).toBe("base\n\nadded\n");
+    expect(await hooks().applyAction(facet, 1)).toBeNull();
+    expect(docs.text()).toBe("base\nadded");
+  });
+
+  it("keeps a previous-rendering replacement out of tables", async () => {
+    let docs = docsWithBody(tableBody());
+    let facet = "previous-rendering-cell";
+    await hooks().applyStorage(
+      facet, previous({ type: "replaceText", oldMarkdown: "Open", newMarkdown: "Done" }));
+
+    expect(await hooks().readContent(facet)).toBe(TABLE_CONTENT);
+    expect(await hooks().applyAction(facet, 1)).toContain(STRUCTURED);
+    expect(docs.contentBatches).toBe(0);
+  });
+
+  // Its card showed Markdown, so it is never applied as the HTML of a cell.
+  it("keeps a replacement queued for a paragraph out of tables", async () => {
+    let docs = docsWithBody(tableBody());
+    let facet = "paragraph-replacement-cell";
+    await hooks().applyStorage(facet, [
+      storedAction(1, { type: "replaceText", oldMarkdown: "Open", newMarkdown: "**Done**" }),
+    ]);
+
+    expect(await hooks().readContent(facet)).toBe(TABLE_CONTENT);
+    expect(await hooks().applyAction(facet, 1)).toContain(STRUCTURED);
+    expect(docs.contentBatches).toBe(0);
+  });
+
+  it("drops a table replacement whose text left the table", async () => {
+    let docs = docsWithBody(tableBody());
+    let facet = "table-replacement-moved";
+    let { actionId } = await edit(facet, "replaceText", "Fix login", "Fix logout");
+    expect(await hooks().readContent(facet)).toContain("<td><p>Fix logout</p></td>");
+
+    docs.externalBody(MAIN_TAB, buildTab([
+      para("Fix login"), grid(["Task", "Status"], ["Other", "Open"]), para("After"),
+    ]).body);
+    passSnapshotTtl();
+
+    expect(await hooks().readContent(facet)).toBe(
+      `Fix login\n\n${tableOf([["Task", "Status"], ["Other", "Open"]])}\n\nAfter\n`);
+    expect(await hooks().applyAction(facet, actionId)).toContain(
+      "replaceText: this change was queued for text in a table, and that text is no longer " +
+      "in one.");
+    expect(docs.contentBatches).toBe(0);
+  });
+});
+
 describe("Google Doc metadata", () => {
   it("holds the modification time steady while the document is unchanged", async () => {
     let docs = new DocsModel();
@@ -2235,8 +2934,43 @@ function nestedDocs(): DocsModel {
   return docs;
 }
 
+/** What approving a replacement of "shared" in the tab `metrics` answers once that text is gone. */
+const NOT_IN_METRICS =
+  'replaceText: oldMarkdown was not found in the current simulated tab "metrics". ' +
+  'Make sure the text exactly matches content returned by getContent("metrics").';
+
 describe.each(RUNS)("Google Doc tab isolation, $name", r => {
   inRun(r);
+
+  it("applies every tab's batch with the model, or none of it", async () => {
+    let docs = nestedDocs();
+    let documentUrl = "https://docs.googleapis.com/v1/documents/doc-1";
+    /** One batch that inserts an `x` at an index of each tab named. */
+    let batch = (...inserts: [tabId: string, index: number][]) => docs.fetch(
+      `${documentUrl}:batchUpdate`, { method: "POST", body: JSON.stringify({
+        requests: inserts.map(([tabId, index]) => (
+          { insertText: { location: { index, tabId }, text: "x" } })),
+      }) });
+    let revision = async () => (await docs.fetch(`${documentUrl}?fields=revisionId`)).json();
+    let before = await revision();
+
+    // The second tab's index lies past its only paragraph, which Google refuses.
+    let refused = await batch([MAIN_TAB, 1], ["details", 99]);
+    expect(refused.status).toBe(400);
+    expect(await refused.json()).toEqual({ error: {
+      code: 400, status: "INVALID_ARGUMENT",
+      message: "The insertion index must be inside the bounds of an existing paragraph. " +
+        "You can still create new paragraphs by inserting newlines.",
+    } });
+    expect(docs.text(MAIN_TAB)).toBe("shared");
+    expect(docs.text("details")).toBe("shared");
+    expect(await revision()).toEqual(before);
+
+    expect((await batch([MAIN_TAB, 1], ["details", 7])).status).toBe(200);
+    expect(docs.text(MAIN_TAB)).toBe("xshared");
+    expect(docs.text("details")).toBe("sharedx");
+    expect(await revision()).not.toEqual(before);
+  });
 
   it("lists the tab tree and appends only to the tab it names", async () => {
     let docs = nestedDocs();
@@ -2302,8 +3036,6 @@ describe.each(RUNS)("Google Doc tab isolation, $name", r => {
 
   // A failed edit still tells the caller whether a tab, or the text in it, exists. Leaving the
   // write paths ungated would let a caller ask through appendText what getContent refuses.
-  const GENERIC_READ = "Read the content of one tab of the document.";
-
   it.each([
     ["an omitted tab", () => hooks().submitAppend("tabs-write-oracle", "added"),
       /tabId is required for documents with multiple tabs/],
@@ -2401,6 +3133,107 @@ describe.each(RUNS)("Google Doc tab isolation, $name", r => {
     expect(docs.text("metrics")).toBe("rewritten");
   });
 
+  // An edit is replayed with its tab. One that a collaborator's change has left unreplayable is
+  // found when its tab is read or changed, at an approval that leaves changes queued, or when
+  // it is approved itself; until then it is the next change to approve.
+  it("holds a later edit behind an unreplayable edit of a tab no read has replayed, until that edit is approved and fails", async () => {
+    let docs = nestedDocs();
+    let facet = "tabs-held-behind";
+    let stale = await hooks().submitReplace(facet, "shared", "changed", "metrics");
+    let later = await hooks().submitAppend(facet, "beta", MAIN_TAB);
+    docs.externalEdit("metrics", "rewritten");
+    passSnapshotTtl();
+    // The main tab alone is read, and shows its own edit.
+    expect(await hooks().readContent(facet, MAIN_TAB)).toContain("beta");
+
+    expect(await hooks().applyAction(facet, later)).toBe(run.outOfOrder(stale, later));
+    expect(docs.contentBatches).toBe(0);
+    expect(await hooks().applyAction(facet, stale)).toBe(NOT_IN_METRICS);
+    expect(await hooks().applyAction(facet, stale)).toBe(run.unapplied(NOT_IN_METRICS));
+    expect(docs.contentBatches).toBe(0);
+
+    expect(await hooks().applyAction(facet, later)).toBeNull();
+    expect(docs.contentBatches).toBe(1);
+    expect(docs.text(MAIN_TAB)).toBe("shared\nbeta");
+    expect(docs.text("metrics")).toBe("rewritten");
+  });
+
+  it("marks an unreplayable edit of another tab at the next approval that leaves changes queued", async () => {
+    let docs = nestedDocs();
+    let facet = "tabs-marked-at-approval";
+    let first = await hooks().submitAppend(facet, "alpha", MAIN_TAB);
+    let stale = await hooks().submitReplace(facet, "shared", "changed", "metrics");
+    let last = await hooks().submitAppend(facet, "beta", MAIN_TAB);
+    docs.externalEdit("metrics", "rewritten");
+    passSnapshotTtl();
+    expect(await hooks().readContent(facet, MAIN_TAB)).toContain("beta");
+
+    // The replay after this approval is of every tab that has changes queued.
+    expect(await hooks().applyAction(facet, first)).toBeNull();
+    // No read of the other tab since: its edit no longer holds the one queued after it.
+    expect(await hooks().applyAction(facet, last)).toBeNull();
+    // The reason that replay stored, which both hosts answer with.
+    expect(await hooks().applyAction(facet, stale)).toBe(
+      `Pending Google Doc edits could not be replayed after edit ${first} was applied: ` +
+      `${NOT_IN_METRICS} This edit was dropped from the document. ` +
+      "Reject it and retry if it is still needed.");
+    expect(docs.contentBatches).toBe(2);
+    expect(docs.text(MAIN_TAB)).toBe("shared\nalpha\nbeta");
+    expect(docs.text("metrics")).toBe("rewritten");
+  });
+
+  it("does not mark another tab's edit at a listing of the tabs", async () => {
+    let docs = nestedDocs();
+    let facet = "tabs-listing-marks-none";
+    let stale = await hooks().submitReplace(facet, "shared", "changed", "metrics");
+    /** The edit as it is stored, or, through Drive, that it still awaits a decision. */
+    let queued = async () => run.drive
+      ? rawHooks().driveQueued(`drive:${facet}`, { scope: { kind: "file", fileId: "doc-1" }, access: "write" })
+      : hooks().storedValue(facet, "doc", `pending:action:${stale}`);
+    let before = await queued();
+    docs.externalEdit("metrics", "rewritten");
+    passSnapshotTtl();
+    let fetches = docs.documentFetches;
+
+    expect(await hooks().listTabs(facet)).toHaveLength(3);
+
+    expect(docs.documentFetches).toBe(fetches + 1);
+    expect(await queued()).toEqual(before);
+    expect(before).toEqual(
+      run.drive ? [stale] : expect.objectContaining({ kv: expect.stringContaining('"changed"') }));
+  });
+
+  // Bound alone: a Doc opened through Drive holds its copy in memory, a new one at each fetch.
+  it.skipIf(r.drive)("keeps a tab's replay across a fetch that brought the tab unchanged", async () => {
+    let docs = nestedDocs();
+    let facet = "tabs-fold-kept";
+    await hooks().submitAppend(facet, "beta", MAIN_TAB);
+    expect(await hooks().readContent(facet, MAIN_TAB)).toBe("shared\n\nbeta\n");
+    docs.externalEdit("metrics", "rewritten");
+    passSnapshotTtl();
+    let before = { folds: replayCost.folds, fetches: docs.documentFetches };
+
+    expect(await hooks().readContent(facet, MAIN_TAB)).toBe("shared\n\nbeta\n");
+
+    // The document was fetched again, and the tab it brought as it was stored is not replayed again.
+    expect(docs.documentFetches).toBe(before.fetches + 1);
+    expect(replayCost.folds).toBe(before.folds);
+    expect(await hooks().readContent(facet, "metrics")).toBe("rewritten\n");
+  });
+
+  it("serializes a tab's queue to queue an edit only where the read that prepares it is authorized", async () => {
+    nestedDocs();
+    let facet = "tabs-queue-serialized";
+    let before = replayCost.fingerprints;
+
+    await hooks().submitReplace(facet, "shared", "changed", MAIN_TAB);
+
+    // Through Drive the queue is serialized at the check and again once the read was authorized,
+    // to refuse an edit whose queue moved between the two. A bound Doc authorizes no such read.
+    expect(replayCost.fingerprints).toBe(before + (r.drive ? 2 : 0));
+    expect(await hooks().readContent(facet, MAIN_TAB)).toBe("changed\n");
+  });
+
   // Titles are user-authored, need not be unique and may be empty, so the approval a user
   // consents to has to carry the ID the write actually targets.
   it("names the target tab by ID when two tabs share a title", async () => {
@@ -2413,57 +3246,6 @@ describe.each(RUNS)("Google Doc tab isolation, $name", r => {
     await hooks().submitAppend("tabs-duplicate-title", "added", "notes-b");
 
     expect(await hooks().lastActionDescription).toContain('tab "Notes" (notes-b)');
-  });
-});
-
-function tabSnapshot(tabId: string, title: string) {
-  return {
-    tabId, title, index: 0, nestingLevel: 0,
-    markdown: "shared\n", sourceMap: { blocks: [], protectedRanges: [] }, bodyEndIndex: 8,
-    committedWriteIds: [],
-  };
-}
-
-// A stored edit with no tab predates tab support. No current write path produces one, so this is
-// the only place the migration refusal can be reached.
-describe("Google Doc edits stored before tab support", () => {
-  const snapshot = {
-    formatVersion: MARKDOWN_RENDERING_VERSION as typeof MARKDOWN_RENDERING_VERSION,
-    title: "Test document",
-    revisionId: "revision-1",
-    tabs: [tabSnapshot(MAIN_TAB, "Main")],
-    fetchedAt: 0,
-  };
-
-  const storedAppend = {
-    type: "appendText" as const,
-    documentId: "doc-1",
-    submittedAt: 0,
-    baseRevisionId: "revision-1",
-    markdown: "added",
-  };
-
-  // The old code refused to read a multi-tab document, so a stored record was approved against
-  // the one tab such a document had.
-  it("retargets a record naming no tab when the document still has exactly one", () => {
-    expect(googleDocActionTab(snapshot, storedAppend).tabId).toBe(MAIN_TAB);
-  });
-
-  it("refuses a record naming no tab once the document has gained tabs", () => {
-    let grown = { ...snapshot, tabs: [...snapshot.tabs, tabSnapshot("second", "Second")] };
-    expect(() => googleDocActionTab(grown, storedAppend)).toThrow(
-      "Pending Google Doc edit predates tab support and the document has gained tabs since, " +
-      "so the tab it was approved against is unknown. Reject it and retry on a selected tab.");
-  });
-
-  it("refuses a vanished tab rather than retargeting to the first", () => {
-    expect(() => googleDocActionTab(snapshot, { ...storedAppend, tabId: "ghost" })).toThrow(
-      'appendText: no tab with ID "ghost" exists in this document. ' +
-      "Call listTabs() to refresh the tab list.");
-  });
-
-  it("resolves a record that names a live tab", () => {
-    expect(googleDocActionTab(snapshot, { ...storedAppend, tabId: MAIN_TAB }).title).toBe("Main");
   });
 });
 
@@ -2509,7 +3291,8 @@ describe("adding a Google Doc tab", () => {
 
     expect(await hooks().applyAction("add-tab", added.actionId)).toBeNull();
     let made = docs.tabs[1];
-    expect(made).toMatchObject({ title: "Notes", text: "" });
+    expect(made).toMatchObject({ title: "Notes" });
+    expect(docs.text(made.id)).toBe("");
     expect(docs.markerTabIds).toEqual([MAIN_TAB]);
     expect(docs.markers.size).toBe(0);
     expect(await hooks().applyAction("add-tab", appendId)).toBeNull();
@@ -2701,6 +3484,7 @@ describe("adding a Google Doc tab", () => {
     expect(await hooks().applyAction("add-tab-renamed", added.actionId))
       .toMatch(/content response lost/);
     docs.tabs[1].title = "Renamed";
+    docs.touch();
     docs.addTab("t.collaborator", "Notes", undefined as unknown as string);
     docs.externalEdit();
 
@@ -2747,6 +3531,7 @@ describe("adding a Google Doc tab", () => {
         .toMatch(/content response lost/);
       // A collaborator moves the new tab under "Second", then deletes the tab holding the marker.
       docs.tabs.find(tab => tab.title === "Notes")!.parentId = "tab-2";
+      docs.touch();
       docs.removeTab(MAIN_TAB);
 
       expect(await hooks().applyAction("add-tab-moved", added.actionId))
@@ -3366,11 +4151,21 @@ describe("Google Doc stored layout", () => {
     docs.cleanupFailures = 1;
     docs.install();
     let facet = "stored-layout-doc";
+    /** The stored keys, apart: the copy of the document under its prefix, and every other. */
+    let storedKeys = async () => {
+      let keys = await hooks().storedKeys(facet, "doc");
+      return {
+        copy: keys.filter(key => key.startsWith("docCopy:")),
+        others: keys.filter(key => !key.startsWith("docCopy:")),
+      };
+    };
 
     let first = await hooks().submitAppend(facet, "first");
     await hooks().readMetadata(facet);
-    expect(await hooks().storedKeys(facet, "doc")).toEqual([
-      "docMetadataRevision", "docSnapshot", "pending:action:1", "pending:nextActionId",
+    // The read that prepared the edit stored the copy of the document, in keys of its own.
+    expect((await storedKeys()).copy).not.toEqual([]);
+    expect((await storedKeys()).others).toEqual([
+      "docMetadataRevision", "pending:action:1", "pending:nextActionId",
     ]);
     expect((await stored(facet, "pending:nextActionId")).kv).toBe(2);
     expect((await stored(facet, "pending:action:1")).kv).toEqual({
@@ -3385,19 +4180,26 @@ describe("Google Doc stored layout", () => {
 
     // The marker's cleanup fails, so the write's receipt stays for the next write to settle.
     expect(await hooks().applyAction(facet, first)).toBeNull();
-    expect(await hooks().storedKeys(facet, "doc")).toEqual([
-      "docMetadataRevision", "docWriteReceipt", "pending:nextActionId",
-    ]);
+    // The copy lacked the write, so it was retired with the write's record: its bytes stay for
+    // the next fetch to be compared with, marked as a copy no read and no rejection is given.
+    expect((await storedKeys()).others)
+      .toEqual(["docMetadataRevision", "docWriteReceipt", "pending:nextActionId"]);
+    expect((await stored(facet, "docCopy:doc:manifest")).kv).toMatchObject({ meta: { stale: true } });
     expect((await stored(facet, "docWriteReceipt")).kv)
       .toEqual({ actionId: first, markerId: expect.any(String) });
 
-    // A rejection drops the snapshot: the next read fetches the document again.
+    // A rejection keeps the copy, for the next read to use once it has checked its revision.
     let second = await hooks().submitAppend(facet, "second");
     let third = await hooks().submitAppend(facet, "third");
+    let fetches = docs.documentFetches;
     expect(await hooks().rejectAction(facet, third)).toBeUndefined();
-    expect(await hooks().storedKeys(facet, "doc")).toEqual([
+    expect((await storedKeys()).copy).not.toEqual([]);
+    expect((await storedKeys()).others).toEqual([
       "docMetadataRevision", "docWriteReceipt", `pending:action:${second}`, "pending:nextActionId",
     ]);
+    let probes = docs.revisionProbes;
+    expect(await hooks().readContent(facet)).toBe("base\n\nfirst\n\nsecond\n");
+    expect([docs.documentFetches, docs.revisionProbes]).toEqual([fetches, probes + 1]);
 
     // A comment write is numbered by the edits' counter, under a prefix of its own.
     let comment = await hooks().callDoc(facet, "comment", ["Why?", { quote: "base" }]);
@@ -3406,6 +4208,70 @@ describe("Google Doc stored layout", () => {
     expect((await stored(facet, "docComments:action:4")).kv).toMatchObject({
       v: 2, state: "pending", action: { kind: "createComment" },
     });
+  });
+
+  it("reads a copy stored under the earlier format as absent", async () => {
+    let docs = new DocsModel();
+    docs.setText(MAIN_TAB, "base");
+    docs.install();
+    let facet = "stored-layout-earlier-format";
+    expect(await hooks().readContent(facet)).toBe("base\n");
+    let index = (await stored(facet, "docCopy:doc:manifest")).kv as { meta: Record<string, unknown> };
+    expect(index.meta).toMatchObject({
+      version: 2, formatVersion: 3,
+      partitions: [{ key: "", digest: expect.any(String) }, { key: MAIN_TAB, digest: expect.any(String) }],
+    });
+
+    // The earlier layout: no outline, and an index that lists its partitions by key alone.
+    await hooks().applyStorage(facet, [{
+      kind: "put", key: "docCopy:doc:manifest",
+      value: { ...index, meta: { ...index.meta, version: 1, formatVersion: 1, partitions: [MAIN_TAB] } },
+    }]);
+    await hooks().restartDoc(facet);
+    let fetches = docs.documentFetches;
+
+    expect(await hooks().readContent(facet)).toBe("base\n");
+    // Fetched, not confirmed by its revision, and stored again in the current layout.
+    expect([docs.documentFetches, docs.revisionProbes]).toEqual([fetches + 1, 0]);
+    expect((await stored(facet, "docCopy:doc:manifest")).kv)
+      .toMatchObject({ meta: { version: 2, formatVersion: 3 } });
+  });
+
+  it("fetches the document again after a stored copy whose outline does not match its tabs", async () => {
+    let docs = nestedDocs();
+    let facet = "stored-layout-outline-mismatch";
+    expect(await hooks().readContent(facet, MAIN_TAB)).toBe("shared\n");
+    // The outline as the copy stores it, one tab short of the tabs stored beside it.
+    let outline = new TextEncoder().encode(JSON.stringify([
+      { tabId: MAIN_TAB, title: "Main", index: 0, nestingLevel: 0 },
+      { tabId: "details", title: "Details", parentTabId: MAIN_TAB, index: 0, nestingLevel: 1 },
+    ]));
+    let digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", outline))]
+      .map(byte => byte.toString(16).padStart(2, "0")).join("");
+    let manifest = (await stored(facet, "docCopy:doc/:manifest")).kv as Record<string, unknown>;
+    let index = (await stored(facet, "docCopy:doc:manifest")).kv as {
+      meta: { partitions: { key: string; digest: string }[] };
+    };
+    // Stored whole, as a keep stores it: the bytes, their size, and their digest in the index.
+    await hooks().applyStorage(facet, [
+      { kind: "put", key: "docCopy:doc/:manifest", value: { ...manifest, size: outline.byteLength } },
+      { kind: "put", key: "docCopy:doc/:chunk:0000", value: outline },
+      { kind: "put", key: "docCopy:doc:manifest", value: { ...index, meta: {
+        ...index.meta,
+        partitions: index.meta.partitions.map(part => part.key === "" ? { ...part, digest } : part),
+      } } },
+    ]);
+    await hooks().restartDoc(facet);
+    let fetches = docs.documentFetches;
+
+    await expect(Promise.resolve(hooks().readContent(facet, MAIN_TAB))).rejects.toThrow(
+      "The stored copy of this Google Doc could not be read back. Read it again.");
+    expect(docs.documentFetches).toBe(fetches);
+
+    // That read dropped the copy, so this one fetches the document.
+    expect(await hooks().readContent(facet, MAIN_TAB)).toBe("shared\n");
+    expect(docs.documentFetches).toBe(fetches + 1);
+    expect(await hooks().readContent(facet, "metrics")).toBe("shared\n");
   });
 
   it("reads and applies every stored edit shape, seeded before the Doc first starts", async () => {
@@ -3528,9 +4394,9 @@ describe("Google Doc edits through a read and write Drive binding", () => {
     return docs;
   }
 
-  /** The stored record of action `id` of the Drive facet `facet`. */
-  async function record(facet: string, id: number) {
-    let stored = await rawHooks().driveStored(`drive:${facet}`, DRIVE_DOC, `drive:action:${id}`);
+  /** The stored record of action `id` of the Drive facet `facet`, as `binding` holds it. */
+  async function record(facet: string, id: number, binding = DRIVE_DOC) {
+    let stored = await rawHooks().driveStored(`drive:${facet}`, binding, `drive:action:${id}`);
     return stored === null ? null : JSON.parse(stored) as {
       state: string; error?: string;
       action: { kind: string; payload: { change: { writeId: string } } };
@@ -3708,6 +4574,67 @@ describe("Google Doc edits through a read and write Drive binding", () => {
     expect(read.indexOf("two")).toBeGreaterThan(read.indexOf("one"));
   });
 
+  it("queues a write of one tab while a read of another drops an edit that tab no longer takes", async () => {
+    let docs = new DocsModel();
+    docs.setText(MAIN_TAB, "shared");
+    docs.addTab("details", "Details", MAIN_TAB, "shared");
+    let drive = new DriveFiles({
+      [ROOT]: { name: "Reports", mimeType: FOLDER_MIME, parents: ["my-root"] },
+      "doc-1": { name: "Test document", mimeType: DRIVE_DOC_MIME, parents: [ROOT] },
+    });
+    serveFakes([drive, docsProvider(docs)]);
+    let facet = "drive-doc-other-tab-dropped";
+    let stale = await rawHooks().callDriveNative(
+      `drive:${facet}`, FOLDER, "openGoogleDoc", "doc-1", "replaceText",
+      ["shared", "changed", "details"]);
+    expect(stale.error).toBeUndefined();
+    // A collaborator leaves that edit nothing to replace, and no read has seen it.
+    docs.externalEdit("details", "other text");
+    passSnapshotTtl();
+
+    // Holds the read at its first proof of the file, and the write at the proof that follows its
+    // check of the queue.
+    let model = globalThis.fetch;
+    let held = { read: Promise.withResolvers<void>(), write: Promise.withResolvers<void>() };
+    let released = { read: Promise.withResolvers<void>(), write: Promise.withResolvers<void>() };
+    let awaited: "read" | "fetch" | "write" | undefined;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      let request = new Request(input, init);
+      let url = new URL(request.url);
+      if (awaited === "fetch") {
+        if (url.hostname === "docs.googleapis.com" && request.method === "GET") awaited = "write";
+      } else if (awaited && url.pathname.startsWith("/batch/")) {
+        let call = awaited;
+        awaited = undefined;
+        held[call].resolve();
+        await released[call].promise;
+      }
+      return model(input, init);
+    });
+    let state = async () => (await record(facet, stale.actionId!, FOLDER))?.state;
+
+    let reading = Promise.resolve(rawHooks().callDriveNativeAfter(
+      `drive:${facet}`, FOLDER, "openGoogleDoc", "doc-1", "getContent", ["details"], [],
+      async () => { awaited = "read"; }));
+    await held.read.promise;
+    awaited = "fetch";
+    let writing = Promise.resolve(rawHooks().callDriveNative(
+      `drive:${facet}`, FOLDER, "openGoogleDoc", "doc-1", "replaceText",
+      ["shared", "mine", MAIN_TAB]));
+    await held.write.promise;
+    // The write's check replayed its own tab alone: the other tab's edit is still queued.
+    expect(await state()).toBe("pending");
+
+    // The read replays the other tab while the write awaits its authorization.
+    released.read.resolve();
+    expect((await reading).value).toBe("other text\n");
+    expect(await state()).toBe("failed");
+    released.write.resolve();
+    let queued = await writing;
+    expect(queued.error).toBeUndefined();
+    expect(queued.actionId).toBe(stale.actionId! + 1);
+  });
+
   it("refuses every write of a Doc that left the folder before any Docs request", async () => {
     let docs = new DocsModel();
     docs.setText(MAIN_TAB, "Draft");
@@ -3766,6 +4693,286 @@ describe("Google Doc edits through a read and write Drive binding", () => {
     await expect(hooks().submitAppend("drive-doc-big", big)).rejects.toThrow(
       /^This change is too large to queue \(\d+ bytes, limit 102400\)\. Split it up\.$/);
     expect(await rawHooks().submitAppend("standalone-doc-big", big)).toBeTypeOf("number");
+  });
+
+  /** A numbered list of three items, the second and third padded to `second` and `third` characters. */
+  function paddedList(second: number, third: number) {
+    let docs = new DocsModel();
+    let item = `b${"y".repeat(second)}`;
+    docs.setNumberedList(MAIN_TAB, ["a", item, `c${"z".repeat(third)}`]);
+    docs.install();
+    return { docs, item };
+  }
+
+  // Replacing a numbered item by an item and a paragraph renumbers the item after it, so the card
+  // shows that item too. Only that is stored beside the edit: its own texts are stored once.
+  it("stores with an edit through Drive what its card shows around it, never the edit's texts again", async () => {
+    let { item } = paddedList(44_000, 0);
+    let facet = "drive-doc-card-context";
+    let content = await hooks().readContent(facet);
+    let third = content.slice(content.indexOf(item) + item.length).trimEnd();
+    expect(third).toMatch(/^\n\d+\. c$/);
+
+    let actionId = await hooks().submitReplace(facet, item, "b\n\nplain");
+    let fields = await hooks().lastActionFields;
+
+    let { change } = (await record(facet, actionId))!.action.payload as unknown as {
+      change: { oldMarkdown: string; newMarkdown: string; display: Record<string, unknown> };
+    };
+    // The edit alone is close to what one record may hold.
+    expect(2 * JSON.stringify({ ...change, display: undefined }).length).toBeGreaterThan(88_000);
+    let rendered = (await hooks().readContent(facet)).slice(content.indexOf(item)).trimEnd();
+    expect(rendered).toMatch(/^b\n\nplain\n\n\d+\. c$/);
+    expect(change.display).toEqual({
+      tab: `"Main" (${MAIN_TAB})`, context: { before: "", after: third }, rendered,
+    });
+    expect(fields).toEqual([
+      cardField("Old", item + third, "markdown"),
+      cardField("Requested New", `b\n\nplain${third}`, "markdown"),
+      cardField("New", rendered, "markdown"),
+    ]);
+  });
+
+  // The third item is shown twice, as it reads before and after, and both are in the record.
+  it("refuses through Drive an edit whose record passes 100 KiB with what its card shows", async () => {
+    let { item } = paddedList(30_000, 12_000);
+    let facet = "drive-doc-card-too-big";
+    let content = await hooks().readContent(facet);
+    expect(2 * JSON.stringify({ oldMarkdown: item, newMarkdown: "b\n\nplain" }).length)
+      .toBeLessThan(70_000);
+
+    await expect(hooks().submitReplace(facet, item, "b\n\nplain")).rejects.toThrow(
+      /^This change is too large to queue \(\d+ bytes, limit 102400\)\. Split it up\.$/);
+
+    expect(await hooks().lastActionDescription).toBe("");
+    expect(await rawHooks().driveStoredKeys(`drive:${facet}`, DRIVE_DOC, "drive:action:")).toEqual([]);
+    expect(await hooks().readContent(facet)).toBe(content);
+    // The Doc's own binding stores the same edit.
+    expect(await rawHooks().submitReplace("standalone-doc-card-big", item, "b\n\nplain"))
+      .toBeTypeOf("number");
+  });
+
+  it("fails at the next read an edit left behind a rejected one that it was built on", async () => {
+    draft();
+    let facet = "drive-doc-behind-rejected";
+    let first = await hooks().submitReplace(facet, "Draft", "Final");
+    let second = await hooks().submitReplace(facet, "Final", "Done");
+    let third = await hooks().submitAppend(facet, "More");
+    expect(await hooks().readContent(facet)).toBe("Done\n\nMore\n");
+
+    expect(await hooks().rejectAction(facet, first)).toEqual({ restart: true });
+    // Nothing is replayed at the rejection: the binding stores no copy of the document.
+    expect((await record(facet, second))!.state).toBe("pending");
+
+    expect(await hooks().readContent(facet)).toBe("Draft\n\nMore\n");
+    expect(await record(facet, second)).toMatchObject({
+      state: "failed",
+      error: droppedByRead(
+        `replaceText: oldMarkdown was not found in the current simulated tab "${MAIN_TAB}". ` +
+        `Make sure the text exactly matches content returned by getContent("${MAIN_TAB}").`),
+    });
+    expect((await record(facet, third))!.state).toBe("pending");
+  });
+
+  // The approval reads the document again once its write has landed and replays what is still
+  // queued over it, so an edit that no longer applies is failed there, before any read.
+  it("fails at an approval an edit queued behind it that the document no longer takes", async () => {
+    let docs = draft();
+    let facet = "drive-doc-behind-approved";
+    let first = await hooks().submitAppend(facet, "More");
+    let second = await hooks().submitReplace(facet, "Draft", "Final");
+    let third = await hooks().submitAppend(facet, "Last");
+
+    // A collaborator's edit removes what the second edit quotes.
+    docs.externalEdit(MAIN_TAB, "Other");
+    expect(await hooks().applyAction(facet, first)).toBeNull();
+
+    expect(await record(facet, second)).toMatchObject({
+      state: "failed",
+      error: `Pending Google Doc edits could not be replayed after edit ${first} was applied: ` +
+        `replaceText: oldMarkdown was not found in the current simulated tab "${MAIN_TAB}". ` +
+        `Make sure the text exactly matches content returned by getContent("${MAIN_TAB}"). ` +
+        "This edit was dropped from the document. Reject it and retry if it is still needed.",
+    });
+    expect((await record(facet, third))!.state).toBe("pending");
+    expect(await hooks().readContent(facet)).toBe("Other\n\nMore\n\nLast\n");
+  });
+
+  it("shows a landed write once in the reads around its approval", async () => {
+    let docs = draft();
+    let facet = "drive-doc-fold-across-write";
+    let first = await hooks().submitAppend(facet, "First");
+    let second = await hooks().submitAppend(facet, "Second");
+    let pending = "Draft\n\nFirst\n\nSecond\n";
+    expect(await hooks().readContent(facet)).toBe(pending);
+
+    expect(await hooks().applyAction(facet, first)).toBeNull();
+    // The write is in the document and no longer in the queue: folded again, not replayed over.
+    expect(docs.text()).toBe("Draft\nFirst");
+    expect(await hooks().readContent(facet)).toBe(pending);
+    expect(await hooks().applyAction(facet, second)).toBeNull();
+    expect(await hooks().readContent(facet)).toBe(pending);
+    expect(docs.contentBatches).toBe(2);
+  });
+
+  // The binding keeps one source for each document: the sessions it opens on the document read
+  // one snapshot, and so share one copy of it and one fold of its queue.
+  it("reads a document once for the sessions that open it within its time to live", async () => {
+    let docs = draft();
+    let facet = "drive-doc-source-reads";
+    for (let session = 0; session < 3; session++) {
+      expect(await hooks().readContent(facet)).toBe("Draft\n");
+    }
+    expect(docs.documentFetches).toBe(1);
+  });
+
+  it("folds a queue once for the sessions that read it", async () => {
+    let docs = draft();
+    let facet = "drive-doc-source-folds";
+    await hooks().submitAppend(facet, "One");
+    await hooks().submitAppend(facet, "Two");
+    let pending = "Draft\n\nOne\n\nTwo\n";
+    expect(await hooks().readContent(facet)).toBe(pending);
+
+    let before = { folds: replayCost.folds, fetches: docs.documentFetches };
+    expect(await hooks().readContent(facet)).toBe(pending);
+    expect(await hooks().readContent(facet)).toBe(pending);
+    expect(replayCost.folds).toBe(before.folds);
+    expect(docs.documentFetches).toBe(before.fetches);
+  });
+
+  it("fetches again for a session opened after a write landed", async () => {
+    let docs = draft();
+    let facet = "drive-doc-source-landed";
+    let first = await hooks().submitAppend(facet, "One");
+    await hooks().submitAppend(facet, "Two");
+    let pending = "Draft\n\nOne\n\nTwo\n";
+    expect(await hooks().readContent(facet)).toBe(pending);
+
+    // The newest edit queued is the same one after the approval: only the write counted tells
+    // that the snapshot is behind the document.
+    expect(await hooks().applyAction(facet, first)).toBeNull();
+    let fetched = docs.documentFetches;
+    expect(await hooks().readContent(facet)).toBe(pending);
+    expect(docs.documentFetches).toBe(fetched + 1);
+  });
+
+  it("fetches again for a session opened after an edit was queued", async () => {
+    let docs = draft();
+    let facet = "drive-doc-source-queued";
+    expect(await hooks().readContent(facet)).toBe("Draft\n");
+    // A collaborator's change, which the snapshot does not show within its time to live.
+    docs.externalEdit(MAIN_TAB, "Other");
+    expect(await hooks().readContent(facet)).toBe("Draft\n");
+
+    await hooks().submitAppend(facet, "More");
+    expect(docs.documentFetches).toBe(1);
+    expect(await hooks().readContent(facet)).toBe("Other\n\nMore\n");
+    expect(docs.documentFetches).toBe(2);
+  });
+
+  it("does not reuse a snapshot no read was authorized for", async () => {
+    let docs = new DocsModel();
+    docs.setText(MAIN_TAB, "Draft");
+    let drive = new DriveFiles({
+      [ROOT]: { name: "Reports", mimeType: FOLDER_MIME, parents: ["my-root"] },
+      "doc-1": { name: "Test document", mimeType: DRIVE_DOC_MIME, parents: [ROOT] },
+    });
+    serveFakes([drive, docsProvider(docs)]);
+    let facet = "drive:drive-doc-source-unauthorized";
+    let read = () => rawHooks().callDriveNative(
+      facet, FOLDER, "openGoogleDoc", "doc-1", "getContent", []);
+
+    // The file leaves the folder while the document is fetched, so the scope check that follows
+    // the fetch refuses the read.
+    let model = globalThis.fetch;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      let response = await model(input, init);
+      if (new URL(new Request(input, init).url).hostname === "docs.googleapis.com") {
+        drive.files.get("doc-1")!.parents = ["elsewhere"];
+      }
+      return response;
+    });
+    let refused = await read();
+    expect(refused.error).toBe("The requested file is outside this Drive binding.");
+    expect(docs.documentFetches).toBe(1);
+
+    // Back in the folder, the next session is given nothing of the document fetched for that read.
+    vi.stubGlobal("fetch", model);
+    drive.files.get("doc-1")!.parents = [ROOT];
+    expect((await read()).value).toBe("Draft\n");
+    expect(docs.documentFetches).toBe(2);
+  });
+
+  /**
+   * One document more than a binding keeps sources of, `doc-1` first, each reading its own
+   * number, and the calls of a fresh session of each through the account's binding `facet`.
+   */
+  function documentsPastSources(facet: string) {
+    let models = Array.from({ length: 5 }, (_, at) => {
+      let docs = new DocsModel();
+      docs.documentId = `doc-${at + 1}`;
+      docs.setText(MAIN_TAB, `Text ${at + 1}`);
+      return docs;
+    });
+    let drive = new DriveFiles(Object.fromEntries(models.map(({ documentId }) =>
+      [documentId, { name: documentId, mimeType: DRIVE_DOC_MIME, parents: ["my-root"] }])));
+    serveFakes([drive, docsProvider(...models)]);
+    let call = (docs: DocsModel, method: string, ...args: unknown[]) => rawHooks().callDriveNative(
+      facet, ACCOUNT, "openGoogleDoc", docs.documentId, method, args);
+    return { models, call };
+  }
+
+  it("keeps the sources of the documents opened most recently", async () => {
+    let { models, call } = documentsPastSources("drive:drive-doc-sources-kept");
+    let fetches = () => models.map(docs => docs.documentFetches);
+    for (let [at, docs] of models.entries()) {
+      expect((await call(docs, "getContent")).value).toBe(`Text ${at + 1}\n`);
+    }
+    expect(fetches()).toEqual([1, 1, 1, 1, 1]);
+
+    // The last is read from the source the binding kept, and the first, whose source went when
+    // the last was opened, is fetched; that lets go of the second's.
+    await call(models[4], "getContent");
+    expect(fetches()).toEqual([1, 1, 1, 1, 1]);
+    await call(models[0], "getContent");
+    expect(fetches()).toEqual([2, 1, 1, 1, 1]);
+    await call(models[1], "getContent");
+    expect(fetches()).toEqual([2, 2, 1, 1, 1]);
+
+    // Opening a document whose source is held makes it the most recent: the fourth is read from
+    // its source, so the third, fetched after it, lets go of the fifth's and not of the fourth's.
+    await call(models[3], "getContent");
+    await call(models[2], "getContent");
+    expect(fetches()).toEqual([2, 2, 2, 1, 1]);
+    await call(models[3], "getContent");
+    expect(fetches()).toEqual([2, 2, 2, 1, 1]);
+  });
+
+  // The binding goes on counting the writes of a document whose source it let go: a session
+  // still open on that source does not reuse a snapshot from before a write that landed since.
+  it("reads again a document a write landed in after the binding let its source go", async () => {
+    let facet = "drive:drive-doc-sources-write";
+    let { models, call } = documentsPastSources(facet);
+    let [first, ...others] = models;
+    let one = (await call(first, "appendText", "One")).actionId!;
+    let two = (await call(first, "appendText", "Two")).actionId!;
+    expect((await call(first, "appendText", "Three")).error).toBeUndefined();
+    let pending = "Text 1\n\nOne\n\nTwo\n\nThree\n";
+
+    // One write is counted and a snapshot fetched after it, within its time to live from here on.
+    expect(await rawHooks().applyDrive(facet, ACCOUNT, one)).toBeNull();
+    expect((await call(first, "getContent")).value).toBe(pending);
+
+    // The newest edit queued stays the same one, so only the second write counted tells the
+    // session that its snapshot is behind the document.
+    let read = await rawHooks().callDriveNativeAfter(
+      facet, ACCOUNT, "openGoogleDoc", first.documentId, "getContent", [], [], async () => {
+        for (let docs of others) await call(docs, "getContent");
+        expect(await rawHooks().applyDrive(facet, ACCOUNT, two)).toBeNull();
+      });
+    expect(first.text()).toBe("Text 1\nOne\nTwo");
+    expect(read.value).toBe(pending);
   });
 
   it("keeps a deployment's read-only setting: no editable Doc, no kind, and a queued edit waits", async () => {
