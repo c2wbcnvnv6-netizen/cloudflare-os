@@ -3,8 +3,15 @@
 // to Google Docs batchUpdate operations.
 
 import type {
-  GoogleDocsTab, Paragraph, ParagraphElement, StructuralElement, Table, TableCell, TextStyle,
+  GoogleDocsRequest, GoogleDocsTab, Paragraph, ParagraphElement, StructuralElement, Table,
+  TableCell, TextStyle,
 } from "./docs-api";
+import {
+  BULLET_PRESETS, CHIP_PLACEHOLDER, isGoogleDocsStrippedCharacter, LIST_LEVELS, loneChipCopy,
+  madeByPreset,
+} from "./docs-content";
+import { lookOfTable, renderLook } from "./docs-table-look";
+import type { TableLook } from "./docs-table-look";
 
 // ---------------------------------------------------------------------------
 // Source map types
@@ -35,24 +42,133 @@ export type DocTabSnapshot = {
   bodyEndIndex: number;
 }
 
+/**
+ * Whether the tab's named styles give a subtitle's text italic, resolved over normal text's.
+ * Without its named styles, a subtitle is taken to be italic, as Google's older default is.
+ */
+function givesSubtitleItalic(namedStyles: GoogleDocsTab["namedStyles"]): boolean {
+  if (!namedStyles?.styles) return true;
+  let normal = namedStyles.styles.find(style => style.namedStyleType === "NORMAL_TEXT")?.textStyle;
+  return namedStyles.styles.some(style => style.namedStyleType === "SUBTITLE" &&
+    (style.textStyle?.italic ?? normal?.italic) === true);
+}
+
 export type SourceMap = {
   /** One entry per editable paragraph/heading/list item, in document order. */
   blocks: BlockMapping[];
   /** Rendered structural content that `replaceText()` must not modify or cross. */
   protectedRanges: MarkdownRange[];
+  /** One entry per top-level table, in document order. */
+  tables: TableMapping[];
 }
 
 /** A half-open range in the rendered Markdown string. */
 export type MarkdownRange = { mdStart: number; mdEnd: number };
 
+/** A table of a tab: where its HTML is in the rendering, where it is in the tab, and its cells. */
+export type TableMapping = MarkdownRange & {
+  /** Where the table starts in the tab's index space. */
+  docStart: number;
+  /** Where the table ends in the tab's index space, exclusive. */
+  docEnd: number;
+  /** The table's look, as its tags write it. */
+  look: TableLook;
+  /** Its rows, in order. */
+  rows: TableRowMapping[];
+  /** How many rows, from the first, the table pins as its header; absent when it pins none. */
+  pinnedRows?: number;
+  /**
+   * Set when the table, a row of it or a cell of it is a suggested insertion or suggested for
+   * deletion, or a table inside one of its cells holds such a suggestion.
+   */
+  suggested?: true;
+};
+
+/** One row of a table: its lines in the rendering, `  <tr…>` through `  </tr>` and its line break. */
+type TableRowMapping = MarkdownRange & {
+  /** Where the row starts in the tab's index space; its first cell starts one index later. */
+  docStart: number;
+  /** Where the row ends in the tab's index space, exclusive: the end of its last cell. */
+  docEnd: number;
+  /** Its cells in order, those a merged cell covers included. */
+  cells: TableCellMapping[];
+};
+
+/** One cell: its lines in the rendering, its last line break included, and what it holds. */
+export type TableCellMapping = MarkdownRange & {
+  /** Where the cell starts in the tab's index space. */
+  docStart: number;
+  /** How many rows the cell spans, as its tag writes it (`rowspan`); 1 where the tag has none. */
+  rowSpan: number;
+  /** How many columns the cell spans, as its tag writes it (`colspan`); 1 where the tag has none. */
+  columnSpan: number;
+  /** Whether the cell holds a table. */
+  nested: boolean;
+  /** The cell's paragraphs as the HTML shows them, one for each line of its content. */
+  lines: number;
+  /** Whether one of those lines is an empty paragraph (`<p></p>`). */
+  emptyParagraph: boolean;
+  /** The cell's editable texts, in order; none for a cell that holds a table. */
+  texts: TableTextMapping[];
+  /** Whether the cell holds an item of a list that numbers any of its levels. */
+  numbered: boolean;
+  /** Whether the cell holds a footnote reference. */
+  footnote: boolean;
+  /**
+   * Whether the cell starts with anything but a paragraph of normal text outside a list: a
+   * heading, a title, a subtitle, a list item, or no paragraph at all. A cell added beside it
+   * is reset to a plain paragraph; beside any other cell it keeps the look Google copies.
+   */
+  styled: boolean;
+  /**
+   * Whether the cell is one paragraph that holds a smart chip, or another element that is
+   * neither text nor an inline image, and no text beside it. Google Docs copies a chip that
+   * stands alone in a cell into a row added beside the cell.
+   */
+  loneChip: boolean;
+  /**
+   * What Google Docs is seen copying into a row added beside a cell of chips and no text: a
+   * dropdown of the same choices for a dropdown, the placeholder character (one index each) for
+   * one person chip, date chip, rich link or placeholder, and nothing for several. Absent for
+   * every other cell, and for chips in a shape nobody has seen copied.
+   */
+  copies?: "dropdown" | "placeholder" | "nothing";
+  /**
+   * Whether the cell holds an element the rendering shows nothing for: a dropdown, or a smart
+   * chip that has no text of its own. A cell that holds nothing else reads as an empty cell.
+   */
+  unshown: boolean;
+};
+
+/** An editable text of a cell: the HTML between the tags of its paragraph. */
+type TableTextMapping = MarkdownRange & {
+  /** The start index of the paragraph that holds it. */
+  docStart: number;
+};
+
 /**
- * Version of this module's rendering. Bump it whenever the Markdown or source map this module
- * produces changes, so callers caching a {@link DocTabSnapshot} discard entries built by older
- * code. It lives here because edits to this file are what invalidate them.
+ * Version of the Markdown a tab reads as: the version an edit records it was previewed under.
+ * Bump it whenever that Markdown changes, so an edit queued against what an earlier version
+ * showed is told apart. A bump also has to decide which earlier versions
+ * {@link REPLAYABLE_TEXT_EDIT_VERSIONS} keeps.
  */
-export const MARKDOWN_RENDERING_VERSION = 6;
+export const MARKDOWN_RENDERING_VERSION = 7;
+
+/**
+ * Earlier rendering versions whose text edits (a replacement outside tables, an append) still
+ * replay under {@link MARKDOWN_RENDERING_VERSION}: they render everything outside tables as it
+ * does, but a subtitle whose named style is not italic, which 6 read as italic (an edit quoting
+ * one no longer finds its text, and says so), and could queue no edit inside one. Decide this
+ * list again with every bump.
+ */
+export const REPLAYABLE_TEXT_EDIT_VERSIONS: readonly number[] = [6];
 
 type ListType = "bullet" | "numbered";
+
+/** The preset `createParagraphBullets` is sent with for a new list item of each kind. */
+const BULLET_PRESET = {
+  bullet: "BULLET_DISC_CIRCLE_SQUARE", numbered: "NUMBERED_DECIMAL_ALPHA_ROMAN",
+} as const;
 
 export type BlockMapping = {
   /** Range in the Markdown string [mdStart, mdEnd). */
@@ -67,6 +183,18 @@ export type BlockMapping = {
   listNestingLevel: number;
   /** Provider list identity, used only when the whole list can be preserved in place. */
   listId?: string;
+  /** Set when a positioned object is anchored to this paragraph. */
+  positioned?: true;
+  /**
+   * Set for an item of a bulleted or numbered list that the preset a new item of its kind is
+   * bulleted with did not make (`madeByPreset`): a new item does not join such a list.
+   */
+  offPreset?: true;
+  /**
+   * Set when the paragraph's text starts with a tab, which `createParagraphBullets` would read
+   * as nesting and remove were the paragraph made a list item again.
+   */
+  tabbed?: true;
   /** Fine-grained segments within this block. */
   segments: Segment[];
 }
@@ -146,21 +274,33 @@ export function docTabToMarkdown(tab: GoogleDocsTab): DocTabSnapshot {
   let writer = new MarkdownWriter();
   let blocks: BlockMapping[] = [];
   let protectedRanges: MarkdownRange[] = [];
+  let tables: TableMapping[] = [];
   let previousListId: string | undefined;
   let listNumbers = new Map<string, number[]>();
   let continuedListLevels: boolean[] = [];
 
   let elements = tab.body.content;
   let bodyEndIndex = elements.length > 0 ? elements[elements.length - 1].endIndex : 0;
+  let subtitleItalic = givesSubtitleItalic(tab.namedStyles);
 
   for (let elem of elements) {
-    let structure = elem.table ? tableToHtml(elem.table, tab.lists, listNumbers)
+    // A table's range is its HTML alone, without the blank line before or the line break after.
+    let tableStart = writer.length + (writer.length > 0 ? 1 : 0);
+    let table = elem.table &&
+      tableToHtml(elem.table, tab.lists, listNumbers, subtitleItalic, tableStart);
+    let structure = table ? table.html
       : elem.tableOfContents ? "[Table of contents]"
       : elem.sectionBreak && elem.startIndex > 0 ? "[Section break]"
       : undefined;
     if (structure !== undefined) {
       let mdStart = writer.length;
       if (writer.length > 0) writer.append("\n");
+      if (elem.table && table) {
+        tables.push({
+          mdStart: tableStart, mdEnd: tableStart + structure.length,
+          ...tableDocMapping(elem, elem.table), look: table.look, rows: table.rows,
+        });
+      }
       writer.append(`${structure}\n`);
       protectedRanges.push({ mdStart, mdEnd: writer.length });
       previousListId = undefined;
@@ -204,7 +344,7 @@ export function docTabToMarkdown(tab: GoogleDocsTab): DocTabSnapshot {
     let prefix = getParagraphPrefix(para, listItem, markdownListNumber);
     if (prefix) writer.syntax(prefix);
 
-    emitParagraphContent(para, writer);
+    emitParagraphContent(para, writer, subtitleItalic);
 
     // Trailing newline. Every Google Docs paragraph ends with \n in the doc
     // character space. In Markdown, we use \n as the line terminator.
@@ -214,16 +354,18 @@ export function docTabToMarkdown(tab: GoogleDocsTab): DocTabSnapshot {
     writer.append("\n");
 
     let mdEnd = writer.length;
-    if (para.positionedObjectIds?.length || para.elements.some(element =>
-      !element.textRun || element.textRun.content.includes("\uE907"))) {
-      protectedRanges.push({ mdStart: protectedStart, mdEnd });
-    }
+    if (!holdsOnlyText(para)) protectedRanges.push({ mdStart: protectedStart, mdEnd });
     blocks.push({
       mdStart, mdEnd, docStart, docEnd, segments,
       namedStyleType: para.paragraphStyle.namedStyleType,
       listType: listItem?.listType ?? null,
       listNestingLevel: listItem?.nestingLevel ?? 0,
       ...(listItem ? { listId: listItem.listId } : {}),
+      ...(para.positionedObjectIds?.length ? { positioned: true as const } : {}),
+      ...(para.elements[0]?.textRun?.content.startsWith("\t") ? { tabbed: true as const } : {}),
+      ...(listItem?.listType && !madeByPreset(
+        tab.lists[listItem.listId], BULLET_PRESETS[BULLET_PRESET[listItem.listType]],
+      ) ? { offPreset: true as const } : {}),
     });
     previousListId = listItem?.listId;
   }
@@ -235,7 +377,7 @@ export function docTabToMarkdown(tab: GoogleDocsTab): DocTabSnapshot {
     index: tab.index,
     nestingLevel: tab.nestingLevel,
     markdown: writer.text,
-    sourceMap: { blocks, protectedRanges },
+    sourceMap: { blocks, protectedRanges, tables },
     bodyEndIndex,
   };
 }
@@ -345,51 +487,279 @@ function positionedImageText(paragraph: Paragraph): string {
   return "[Image] ".repeat(paragraph.positionedObjectIds?.length ?? 0).trimEnd();
 }
 
-/** Render a table as raw HTML, which Markdown preserves without inventing a header row. */
+/** Whether a paragraph holds nothing but text: no positioned object, image or chip. */
+function holdsOnlyText(paragraph: Paragraph): boolean {
+  return !paragraph.positionedObjectIds?.length && paragraph.elements.every(element =>
+    !!element.textRun && !element.textRun.content.includes(CHIP_PLACEHOLDER));
+}
+
+/** An editable text: where it is, and where its paragraph starts. */
+type RenderedText = { start: number; end: number; docStart: number };
+
+/** Rendered HTML with the editable texts in it, as ranges counted from its first character. */
+type RenderedHtml = { html: string; texts: readonly RenderedText[] };
+
+const NO_TEXTS: readonly RenderedText[] = [];
+
+function shiftTexts(texts: readonly RenderedText[], offset: number): readonly RenderedText[] {
+  return offset === 0 ? texts : texts.map(text => ({
+    ...text, start: text.start + offset, end: text.end + offset,
+  }));
+}
+
+/**
+ * A rendered cell: its HTML, and what the HTML shows of the cell. Its texts are counted from the
+ * first character of its first line.
+ */
+type RenderedCell = RenderedHtml &
+  Pick<TableCellMapping, "rowSpan" | "columnSpan" | "nested" | "lines" | "emptyParagraph">;
+
+/** A rendered table: its HTML, its look, and its rows when it is a table of the tab body. */
+type RenderedTable = { html: string } & Pick<TableMapping, "look" | "rows">;
+
+function isSuggested(
+  value: { suggestedInsertionIds?: string[]; suggestedDeletionIds?: string[] },
+): boolean {
+  return !!(value.suggestedInsertionIds?.length || value.suggestedDeletionIds?.length);
+}
+
+/**
+ * Whether the table, a row of it or a cell of it is a suggestion, or a table inside one of its
+ * cells holds one: deleting the cell discards that suggestion too. The table's own fields count
+ * beside those of its rows and cells, since a table that is itself a suggestion may mark only
+ * itself.
+ */
+function holdsSuggestion(table: Table): boolean {
+  return isSuggested(table) || !!table.tableRows?.some(row =>
+    isSuggested(row) || !!row.tableCells?.some(cell =>
+      isSuggested(cell) ||
+      !!cell.content?.some(element => !!element.table && holdsSuggestion(element.table))));
+}
+
+/** What the tab says of a table that its HTML does not show. */
+function tableDocMapping(
+  element: StructuralElement, table: Table,
+): Pick<TableMapping, "docStart" | "docEnd" | "pinnedRows" | "suggested"> {
+  let rows = table.tableRows ?? [];
+  let suggested = holdsSuggestion(table);
+  let pinnedRows = 0;
+  while (rows[pinnedRows]?.tableRowStyle?.tableHeader === true) pinnedRows++;
+  return {
+    docStart: element.startIndex,
+    docEnd: element.endIndex,
+    ...(pinnedRows > 0 ? { pinnedRows } : {}),
+    ...(suggested ? { suggested: true as const } : {}),
+  };
+}
+
+/**
+ * Render a table as raw HTML, which Markdown preserves without inventing a header row. A table of
+ * the tab body is given `mdStart`, where its HTML starts in the tab's Markdown, and its rows are
+ * mapped from there; a table inside a cell is given none, so it has no rows mapped and none of
+ * its text is editable.
+ */
 function tableToHtml(
   table: Table,
   lists: GoogleDocsTab["lists"],
   listNumbers: Map<string, number[]>,
-): string {
-  let lines = ["<table>"];
-  for (let row of table.tableRows ?? []) {
-    lines.push("  <tr>");
-    for (let cell of row.tableCells ?? []) {
-      lines.push(tableCellToHtml(cell, lists, listNumbers));
+  subtitleItalic: boolean,
+  mdStart?: number,
+): RenderedTable {
+  let look = lookOfTable(table);
+  let tags = renderLook(look);
+  let lines: string[] = [];
+  // Where the next line starts.
+  let next = mdStart ?? 0;
+  let add = (line: string) => {
+    lines.push(line);
+    next += line.length + 1;
+  };
+  add(`<table${tags.table}>`);
+  if (tags.colgroup !== undefined) add(`  ${tags.colgroup}`);
+  let rows: TableRowMapping[] = [];
+  for (let [rowIndex, row] of (table.tableRows ?? []).entries()) {
+    let rowStart = next;
+    add(`  <tr${tags.rows[rowIndex]}>`);
+    let cells: TableCellMapping[] = [];
+    for (let [column, cell] of (row.tableCells ?? []).entries()) {
+      // Google puts text sent to a cell that a merged cell covers into the merged cell, whose
+      // own text has ordinary indexes: a covered cell lists no text.
+      let editable = mdStart !== undefined && look.cells[rowIndex][column] !== null;
+      let rendered = tableCellToHtml(
+        cell, lists, listNumbers, subtitleItalic, editable, tags.cells[rowIndex][column]);
+      if (mdStart !== undefined) cells.push(cellMapping(cell, rendered, next, lists));
+      add(rendered.html);
     }
-    lines.push("  </tr>");
+    add("  </tr>");
+    if (mdStart !== undefined) {
+      rows.push({
+        mdStart: rowStart, mdEnd: next, docStart: row.startIndex, docEnd: row.endIndex, cells,
+      });
+    }
   }
   lines.push("</table>");
-  return lines.join("\n");
+  return { html: lines.join("\n"), look, rows };
 }
 
+/**
+ * What the map says of one cell of a top-level table, from the cell and its rendering, whose
+ * first line starts at `mdStart` of the tab's Markdown.
+ */
+function cellMapping(
+  cell: TableCell,
+  rendered: RenderedCell,
+  mdStart: number,
+  lists: GoogleDocsTab["lists"],
+): TableCellMapping {
+  let elements = cell.content ?? [];
+  let first = elements[0]?.paragraph;
+  let copy = loneChipCopy(elements);
+  let { html, texts, ...shown } = rendered;
+  return {
+    mdStart,
+    mdEnd: mdStart + html.length + 1,
+    docStart: cell.startIndex,
+    ...shown,
+    texts: texts.map(({ start, end, docStart }) => ({
+      mdStart: mdStart + start, mdEnd: mdStart + end, docStart,
+    })),
+    numbered: someCellParagraph(elements, lists, isItemOfNumberingList),
+    footnote: someCellParagraph(elements, lists, holdsFootnote),
+    // Google copies the style of a cell's first paragraph into a cell added beside it, and the
+    // HTML does not say what that style is: a subtitle reads as a `<p>` in italics.
+    styled: !first || !!first.bullet || first.paragraphStyle.namedStyleType !== "NORMAL_TEXT",
+    loneChip: copy !== undefined,
+    ...(copy && copy !== "unseen" ? { copies: copy } : {}),
+    unshown: someCellParagraph(elements, lists, holdsUnshownElement),
+  };
+}
+
+/** Whether a paragraph of `elements`, the cells of tables among them included, passes `test`. */
+function someCellParagraph(
+  elements: readonly StructuralElement[],
+  lists: GoogleDocsTab["lists"],
+  test: (paragraph: Paragraph, lists: GoogleDocsTab["lists"]) => boolean,
+): boolean {
+  return elements.some(element => element.paragraph
+    ? test(element.paragraph, lists)
+    : !!element.table?.tableRows?.some(row => !!row.tableCells?.some(cell =>
+      someCellParagraph(cell.content ?? [], lists, test))));
+}
+
+/**
+ * Whether a paragraph is an item of a list that numbers any of its levels, as `paragraphListItem`
+ * reads a level. Only such an item can move a number the rendering shows; a bulleted item of the
+ * list counts, since it restarts the numbered levels below it.
+ */
+function isItemOfNumberingList(paragraph: Paragraph, lists: GoogleDocsTab["lists"]): boolean {
+  let levels = paragraph.bullet && lists[paragraph.bullet.listId]?.listProperties.nestingLevels;
+  return !!levels?.some(({ glyphType }) => glyphType !== undefined && glyphType !== "NONE" &&
+    glyphType !== "GLYPH_TYPE_UNSPECIFIED");
+}
+
+/** Whether a paragraph holds a footnote reference, which renders as the footnote's number. */
+function holdsFootnote(paragraph: Paragraph): boolean {
+  return paragraph.elements.some(element => !!element.footnoteReference);
+}
+
+/**
+ * Whether a paragraph holds an element the rendering shows nothing for: a dropdown, or a smart
+ * chip that has no text of its own.
+ */
+function holdsUnshownElement(paragraph: Paragraph): boolean {
+  return paragraph.elements.some(element =>
+    !element.textRun && !element.horizontalRule && !visibleParagraphElement(element));
+}
+
+/** A paragraph of a cell that holds nothing, as a line of the cell's HTML. */
+const EMPTY_PARAGRAPH = "<p></p>";
+
+/** A cell's span as its tag writes it: 1 unless the cell spans more. */
+function writtenSpan(span: number | undefined): number {
+  return typeof span === "number" && Number.isInteger(span) && span > 1 ? span : 1;
+}
+
+/**
+ * Render one cell, with `lookAttribute` after its spans. Its texts are counted from the first
+ * character of its first line, and it lists none unless `editable`: a cell that a merged cell
+ * covers and a cell of a table inside another cell are not. No other function writes a `<td>`.
+ */
 function tableCellToHtml(
   cell: TableCell,
   lists: GoogleDocsTab["lists"],
   listNumbers: Map<string, number[]>,
-): string {
-  let style = cell.tableCellStyle;
-  let attributes = htmlIntegerAttribute("rowspan", style?.rowSpan) +
-    htmlIntegerAttribute("colspan", style?.columnSpan);
+  subtitleItalic: boolean,
+  editable: boolean,
+  lookAttribute: string,
+): RenderedCell {
+  let rowSpan = writtenSpan(cell.tableCellStyle?.rowSpan);
+  let columnSpan = writtenSpan(cell.tableCellStyle?.columnSpan);
+  let attributes = (rowSpan > 1 ? ` rowspan="${rowSpan}"` : "") +
+    (columnSpan > 1 ? ` colspan="${columnSpan}"` : "") + lookAttribute;
   let elements = cell.content ?? [];
   // Classify every element once: the list walk below revisits them as it groups nested items.
   let items = elements.map(element =>
     element.paragraph && paragraphListItem(element.paragraph, lists));
-  let parts: string[] = [];
+  // A cell that holds anything but paragraphs, such as another table, lists no text either.
+  editable &&= elements.every(element => element.paragraph);
+  let parts: RenderedHtml[] = [];
   for (let index = 0; index < elements.length;) {
     if (items[index]) {
-      let list = tableListToHtml(elements, items, index, listNumbers);
-      parts.push(list.html);
+      let list = tableListToHtml(elements, items, index, listNumbers, subtitleItalic, editable);
+      parts.push(list);
       index = list.nextIndex;
       continue;
     }
-    let part = tableCellElementToHtml(elements[index], lists, listNumbers);
+    let part =
+      tableCellElementToHtml(elements[index], lists, listNumbers, subtitleItalic, editable);
     if (part !== undefined) parts.push(part);
     index++;
   }
-  let content = parts.join("\n");
-  if (!content.includes("\n")) return `    <td${attributes}>${content}</td>`;
-  return `    <td${attributes}>\n${indentHtml(content, 6)}\n    </td>`;
+  let content = parts.map(part => part.html).join("\n");
+  let texts: RenderedText[] = [];
+  let partStart = 0;
+  for (let part of parts) {
+    for (let text of shiftTexts(part.texts, partStart)) texts.push(text);
+    partStart += part.html.length + 1;
+  }
+  let open = `    <td${attributes}>`;
+  let shown = { rowSpan, columnSpan, nested: elements.some(element => !!element.table) };
+  if (!content.includes("\n")) {
+    return {
+      html: `${open}${content}</td>`, texts: shiftTexts(texts, open.length),
+      ...shown, lines: 1, emptyParagraph: content === EMPTY_PARAGRAPH,
+    };
+  }
+  let lines = content.split("\n");
+  return {
+    html: `${open}\n${indentHtml(content, 6)}\n    </td>`,
+    texts: indentedTexts(content, texts, 6, open.length + 1),
+    ...shown, lines: lines.length, emptyParagraph: lines.includes(EMPTY_PARAGRAPH),
+  };
+}
+
+/**
+ * Where the `texts` of `html` are once `indentHtml` has indented it by `spaces` and `lead`
+ * characters stand before it. Every line gains the indentation, so a text moves by it once for
+ * its own line and once for each line before.
+ */
+function indentedTexts(
+  html: string,
+  texts: readonly RenderedText[],
+  spaces: number,
+  lead: number,
+): RenderedText[] {
+  let lines = 1;
+  let nextBreak = html.indexOf("\n");
+  // Texts are in order, so the line breaks before each offset are counted in one pass.
+  let place = (offset: number) => {
+    while (nextBreak >= 0 && nextBreak < offset) {
+      lines++;
+      nextBreak = html.indexOf("\n", nextBreak + 1);
+    }
+    return lead + offset + spaces * lines;
+  };
+  return texts.map(text => ({ ...text, start: place(text.start), end: place(text.end) }));
 }
 
 /**
@@ -401,11 +771,14 @@ function tableListToHtml(
   items: readonly (ParagraphListItem | undefined)[],
   startIndex: number,
   listNumbers: Map<string, number[]>,
+  subtitleItalic: boolean,
+  editable: boolean,
   level = 0,
-): { html: string; nextIndex: number } {
+): RenderedHtml & { nextIndex: number } {
   let first = items[startIndex]!;
   let tag = first.listType === "numbered" ? "ol" : "ul";
   let html = htmlListOpeningTag(first, nextOrderedListNumber(first, listNumbers));
+  let texts: RenderedText[] = [];
   let index = startIndex;
 
   while (index < elements.length) {
@@ -417,16 +790,25 @@ function tableListToHtml(
 
     let glyph = item.listType === "bullet" && item.glyphSymbol
       ? `${escapeHtml(item.glyphSymbol)} ` : "";
-    let content = glyph + tableParagraphContentToHtml(paragraph);
+    let content = tableParagraphContentToHtml(paragraph, subtitleItalic);
     let headingLevel = paragraphHeadingLevel(paragraph);
-    if (headingLevel) content = `<h${headingLevel}>${content}</h${headingLevel}>`;
-    html += `<li>${content}`;
+    // The glyph shows the bullet and is not the item's text, so the text starts after it.
+    html += headingLevel ? `<li><h${headingLevel}>${glyph}` : `<li>${glyph}`;
+    if (editable && isEditableCellParagraph(paragraph)) {
+      texts.push({
+        start: html.length, end: html.length + content.length,
+        docStart: elements[index].startIndex,
+      });
+    }
+    html += headingLevel ? `${content}</h${headingLevel}>` : content;
     index++;
     while (index < elements.length) {
       let nested = items[index];
       if (!nested || nested.listId !== first.listId ||
           nested.nestingLevel <= first.nestingLevel) break;
-      let child = tableListToHtml(elements, items, index, listNumbers, first.nestingLevel + 1);
+      let child = tableListToHtml(
+        elements, items, index, listNumbers, subtitleItalic, editable, first.nestingLevel + 1);
+      for (let text of shiftTexts(child.texts, html.length)) texts.push(text);
       html += child.html;
       index = child.nextIndex;
     }
@@ -434,9 +816,10 @@ function tableListToHtml(
   }
 
   let skipped = first.nestingLevel - level;
+  let lead = `${MARKERLESS_LIST}<li>`.repeat(skipped);
   return {
-    html: `${MARKERLESS_LIST}<li>`.repeat(skipped) + `${html}</${tag}>` +
-      "</li></ul>".repeat(skipped),
+    html: `${lead}${html}</${tag}>` + "</li></ul>".repeat(skipped),
+    texts: shiftTexts(texts, lead.length),
     nextIndex: index,
   };
 }
@@ -445,25 +828,57 @@ function tableCellElementToHtml(
   element: StructuralElement,
   lists: GoogleDocsTab["lists"],
   listNumbers: Map<string, number[]>,
-): string | undefined {
-  if (element.tableOfContents) return "[Table of contents]";
-  if (element.table) return tableToHtml(element.table, lists, listNumbers);
+  subtitleItalic: boolean,
+  editable: boolean,
+): RenderedHtml | undefined {
+  if (element.tableOfContents) return { html: "[Table of contents]", texts: NO_TEXTS };
+  if (element.table) {
+    let { html } = tableToHtml(element.table, lists, listNumbers, subtitleItalic);
+    return { html, texts: NO_TEXTS };
+  }
   if (!element.paragraph) return undefined;
   let paragraph = element.paragraph;
-  let content = tableParagraphContentToHtml(paragraph);
-  if (content === "<hr>") return content;
+  let content = tableParagraphContentToHtml(paragraph, subtitleItalic);
+  if (content === "<hr>") return { html: content, texts: NO_TEXTS };
   let headingLevel = paragraphHeadingLevel(paragraph);
   let tag = headingLevel ? `h${headingLevel}` : "p";
-  return `<${tag}>${content}</${tag}>`;
+  let start = tag.length + 2;
+  return {
+    html: `<${tag}>${content}</${tag}>`,
+    texts: editable && isEditableCellParagraph(paragraph) ? [{
+      start, end: start + content.length, docStart: element.startIndex,
+    }] : NO_TEXTS,
+  };
 }
 
-function tableParagraphContentToHtml(paragraph: Paragraph): string {
-  let inheritedItalic = paragraph.paragraphStyle.namedStyleType === "SUBTITLE";
+/**
+ * Whether the text of a cell paragraph can be edited: it holds nothing but text, so its HTML is
+ * exactly `cellInlineHtml` of its runs, and it is not a subtitle, whose HTML carries the italic
+ * the style gives it.
+ */
+function isEditableCellParagraph(paragraph: Paragraph): boolean {
+  return holdsOnlyText(paragraph) && paragraph.paragraphStyle.namedStyleType !== "SUBTITLE";
+}
+
+/**
+ * The inline HTML of a cell paragraph. Adjacent elements that render with the same formatting
+ * share one element, so the run boundaries Google keeps for styles this rendering does not show
+ * (a colour, a font) leave no trace in it.
+ */
+function tableParagraphContentToHtml(paragraph: Paragraph, subtitleItalic: boolean): string {
+  let inheritedItalic = subtitleItalic && paragraph.paragraphStyle.namedStyleType === "SUBTITLE";
   let lastElement = paragraph.elements.at(-1);
   let content = "";
   let italic = false;
+  // The runs since the last rule or change of inherited italic, which nothing sets apart yet.
+  let runs: CellInlineRun[] = [];
+  let flush = () => {
+    content += cellInlineHtml(runs);
+    runs = [];
+  };
   for (let part of paragraph.elements) {
     if (part.horizontalRule) {
+      flush();
       content += italic ? "</em><hr>" : "<hr>";
       italic = false;
       continue;
@@ -471,31 +886,71 @@ function tableParagraphContentToHtml(paragraph: Paragraph): string {
     let visible = paragraphRun(part, part === lastElement);
     if (!visible) continue;
     let nextItalic = inheritedItalic && (visible.style.italic ?? true);
-    if (nextItalic !== italic) content += nextItalic ? "<em>" : "</em>";
-    content += styledTextToHtml(visible.text, visible.style, visible.link, !inheritedItalic);
-    italic = nextItalic;
+    if (nextItalic !== italic) {
+      flush();
+      content += nextItalic ? "<em>" : "</em>";
+      italic = nextItalic;
+    }
+    let { text, style, link } = visible;
+    runs.push({
+      text,
+      bold: style.bold,
+      // A subtitle's italic is the span around its runs, opened and closed above.
+      italic: !inheritedItalic && style.italic,
+      strikethrough: style.strikethrough,
+      link: link && isSafeTableLink(link) ? link : undefined,
+    });
   }
+  flush();
   if (italic) content += "</em>";
   let images = positionedImageText(paragraph);
   return images && content ? `${images} ${content}` : images || content;
 }
 
 /** Permit inert web links and native Docs destinations in generated table HTML. */
-function isSafeTableLink(link: string): boolean {
+export function isSafeTableLink(link: string): boolean {
   return /^(?:https?:|mailto:)/i.test(link) || parseInternalDocsLink(link) !== undefined;
 }
 
-function styledTextToHtml(
-  text: string,
-  style: TextStyle,
-  link: string | undefined,
-  renderItalic: boolean,
-): string {
+/** One stretch of a cell paragraph's text with the formatting the table HTML shows. */
+export type CellInlineRun = {
+  text: string;
+  bold?: boolean;
+  italic?: boolean;
+  strikethrough?: boolean;
+  /** The destination as the HTML shows it, absent for text that is not linked. */
+  link?: string;
+};
+
+/** The HTML of a cell paragraph's text: adjacent runs formatted alike share one element. */
+function cellInlineHtml(runs: readonly CellInlineRun[]): string {
+  let html = "";
+  let text = "";
+  let format: CellInlineRun | undefined;
+  for (let run of runs) {
+    if (!run.text) continue;
+    if (format && !sameInlineFormat(format, run)) {
+      html += formattedTextToHtml(text, format);
+      text = "";
+    }
+    format = run;
+    text += run.text;
+  }
+  return format ? html + formattedTextToHtml(text, format) : html;
+}
+
+function sameInlineFormat(left: CellInlineRun, right: CellInlineRun): boolean {
+  return !left.bold === !right.bold && !left.italic === !right.italic &&
+    !left.strikethrough === !right.strikethrough &&
+    (left.link || undefined) === (right.link || undefined);
+}
+
+function formattedTextToHtml(text: string, format: CellInlineRun): string {
   let html = escapeHtml(text).replaceAll("\u000b", "<br>");
-  if (style.strikethrough) html = `<s>${html}</s>`;
-  if (renderItalic && style.italic) html = `<em>${html}</em>`;
-  if (style.bold) html = `<strong>${html}</strong>`;
-  if (link && isSafeTableLink(link)) html = `<a href="${escapeHtmlAttribute(link)}">${html}</a>`;
+  if (format.strikethrough) html = `<s>${html}</s>`;
+  if (format.italic) html = `<em>${html}</em>`;
+  if (format.bold) html = `<strong>${html}</strong>`;
+  if (format.link) html = `<a href="${escapeHtmlAttribute(format.link)}">${html}</a>`;
   return html;
 }
 
@@ -528,11 +983,6 @@ function htmlListOpeningTag(item: ParagraphListItem, listNumber: number | undefi
   return `<ol${typeAttribute}${style}${htmlListStartAttribute(startNumber ?? 1)}>`;
 }
 
-function htmlIntegerAttribute(name: string, value: number | undefined): string {
-  return typeof value === "number" && Number.isInteger(value) && value > 1
-    ? ` ${name}="${value}"` : "";
-}
-
 /**
  * Escape only what changes how the table markup parses. Deliberately narrower than the kit's
  * `escapeHtml()`: this output is read by an agent, so quotes and apostrophes in cell prose stay
@@ -542,7 +992,8 @@ function escapeHtml(text: string): string {
   return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
-function escapeHtmlAttribute(text: string): string {
+/** Escape text for a double-quoted attribute value of the table markup. */
+export function escapeHtmlAttribute(text: string): string {
   return escapeHtml(text).replaceAll('"', "&quot;");
 }
 
@@ -661,9 +1112,12 @@ function markdownFormatTransition(
 function sameMarkdownFormat(left: MarkdownFormat, right: MarkdownFormat): boolean {
   return left.open === right.open && left.close === right.close;
 }
-function emitParagraphContent(para: Paragraph, writer: MarkdownWriter): void {
+function emitParagraphContent(
+  para: Paragraph, writer: MarkdownWriter, subtitleItalic: boolean,
+): void {
   let formats: MarkdownFormat[] = [];
-  let isSubtitle = para.paragraphStyle.namedStyleType === "SUBTITLE";
+  // A subtitle's text is italic unless it says otherwise where its style makes it so.
+  let isSubtitle = subtitleItalic && para.paragraphStyle.namedStyleType === "SUBTITLE";
   let lastElement = para.elements.at(-1);
   let images = positionedImageText(para);
   if (images) {
@@ -751,10 +1205,14 @@ type FormattingSpan = {
   link?: string;
 }
 
-const MAX_MARKDOWN_BLOCKS = 2_000;
+/** The most blocks, one for each line, that the Markdown of one write may hold. */
+export const MAX_MARKDOWN_BLOCKS = 2_000;
 const MAX_MARKDOWN_FORMATTING_TOKENS = 5_000;
-// The most requests one replacement can emit within those limits, which `parseMarkdownForWrite`
-// enforces on everything it writes.
+// The requests one replacement emits within those limits, which `parseMarkdownForWrite` enforces
+// on everything it writes. The count leaves out the tabs a list item's own text starts with,
+// which take up to three requests more for that item (their insert, its style reset, and the
+// part of a formatting span that lies over them): `addRequest` refuses a batch that would pass
+// the limit.
 // A bullet removal, a paragraph style, and a subtitle override or bullet run (subtitles are never
 // list items).
 const REQUESTS_PER_BLOCK = 3;
@@ -764,7 +1222,8 @@ const REQUESTS_PER_REWRITTEN_PARAGRAPH = 4;
 // A leading deletion, an insert and style reset before the first paragraph, and a bullet removal and
 // paragraph style repairing a paragraph merged into the tab's last.
 const REQUESTS_PER_REPLACEMENT = 5;
-const MAX_GOOGLE_DOC_REQUESTS = REQUESTS_PER_REPLACEMENT +
+/** The most requests `addRequest` lets one batch hold. */
+export const MAX_GOOGLE_DOC_REQUESTS = REQUESTS_PER_REPLACEMENT +
   (REQUESTS_PER_BLOCK + REQUESTS_PER_REWRITTEN_PARAGRAPH) * MAX_MARKDOWN_BLOCKS +
   MAX_MARKDOWN_FORMATTING_TOKENS;
 
@@ -1000,9 +1459,33 @@ function markdownTokenSplits(markdown: string): Uint8Array {
   return splits;
 }
 
+/** The marker that opens a heading or list item, at the start of its line, with its space. */
+const BLOCK_MARKER = /(?:#{1,6}| *-| *\d+\.) /y;
+
+/**
+ * The block marker of the line of `markdown` that `index` is in, as [start, end), when `index`
+ * lies inside it: from its first character, or with `within` from its second.
+ */
+function blockMarkerAround(
+  markdown: string, index: number, within: boolean,
+): { start: number; end: number } | undefined {
+  let start = markdown.lastIndexOf("\n", index - 1) + 1;
+  BLOCK_MARKER.lastIndex = start;
+  let marker = BLOCK_MARKER.exec(markdown);
+  if (!marker) return undefined;
+  let end = start + marker[0].length;
+  return (within ? start < index : start <= index) && index < end ? { start, end } : undefined;
+}
+
 /**
  * Shared replacement bounds that never split Markdown syntax tokens, or a surrogate pair: two
  * emoji can share their high surrogate, and Google refuses to delete half of a pair.
+ *
+ * Nor do they leave part of a block marker the new Markdown writes in the text the two share,
+ * where the old Markdown has those characters as a line's text and not as a marker: `one two`
+ * replaced by `one\n- two` shares ` two`, and the marker's space with it. The whole marker
+ * then counts as changed, so that the line is written as the heading or list item it reads as
+ * and not as text that happens to hold a marker's characters.
  */
 function markdownReplacementBounds(oldMarkdown: string, newMarkdown: string): {
   prefixLen: number;
@@ -1015,16 +1498,25 @@ function markdownReplacementBounds(oldMarkdown: string, newMarkdown: string): {
       oldMarkdown[prefixLen] === newMarkdown[prefixLen]) prefixLen++;
   while (prefixLen > 0 && (oldTokenSplits[prefixLen] || newTokenSplits[prefixLen] ||
       isHighSurrogate(oldMarkdown.charCodeAt(prefixLen - 1)))) prefixLen--;
+  let written = blockMarkerAround(newMarkdown, prefixLen, true);
+  if (written && !blockMarkerAround(oldMarkdown, prefixLen, true)) prefixLen = written.start;
 
   let suffixLen = 0;
   while (suffixLen < oldMarkdown.length - prefixLen &&
       suffixLen < newMarkdown.length - prefixLen &&
       oldMarkdown[oldMarkdown.length - suffixLen - 1] ===
         newMarkdown[newMarkdown.length - suffixLen - 1]) suffixLen++;
-  while (suffixLen > 0 &&
-      (oldTokenSplits[oldMarkdown.length - suffixLen] ||
-        newTokenSplits[newMarkdown.length - suffixLen] ||
-        isLowSurrogate(oldMarkdown.charCodeAt(oldMarkdown.length - suffixLen)))) suffixLen--;
+  let splitsToken = () => suffixLen > 0 &&
+    (oldTokenSplits[oldMarkdown.length - suffixLen] ||
+      newTokenSplits[newMarkdown.length - suffixLen] ||
+      isLowSurrogate(oldMarkdown.charCodeAt(oldMarkdown.length - suffixLen)));
+  while (splitsToken()) suffixLen--;
+  written = blockMarkerAround(newMarkdown, newMarkdown.length - suffixLen, false);
+  if (suffixLen > 0 && written &&
+      !blockMarkerAround(oldMarkdown, oldMarkdown.length - suffixLen, false)) {
+    suffixLen = newMarkdown.length - written.end;
+    while (splitsToken()) suffixLen--;
+  }
 
   return { prefixLen, suffixLen };
 }
@@ -1207,10 +1699,16 @@ function inlineSpanStyle(
   }
 }
 
-/** Whether Google Docs strips UTF-16 code unit `code` from text it inserts. */
-export function isGoogleDocsStrippedCharacter(code: number): boolean {
-  return code <= 0x08 || code >= 0x0c && code <= 0x1f ||
-    code >= 0xe000 && code <= 0xf8ff;
+/** `text` without the characters Google removes from inserted text. */
+export function stripUnwritableCharacters(text: string): string {
+  let kept = "";
+  let start = 0;
+  for (let index = 0; index < text.length; index++) {
+    if (!isGoogleDocsStrippedCharacter(text.charCodeAt(index))) continue;
+    kept += text.slice(start, index);
+    start = index + 1;
+  }
+  return start === 0 ? text : kept + text.slice(start);
 }
 
 function coalesceFormattingSpans(spans: FormattingSpan[]): FormattingSpan[] {
@@ -1433,14 +1931,33 @@ type MarkdownWriteOptions = {
   };
   /** Whether blocks with no source counterpart must be reset to a plain paragraph first. */
   resetParagraphs?: boolean;
+  /** Whether paragraphs reset to plain also lose their indent, which removing a bullet leaves. */
+  resetIndent?: boolean;
   /** Style to apply across the insertion, for an edit that stays inside one text run. */
   sourceTextStyle?: TextStyle;
   /** Leave the paragraph before an inserted separator unchanged. */
   preserveLeadingParagraph?: boolean;
   /** Keep a fragment's final paragraph break. */
   preserveTrailingNewline?: boolean;
+  /**
+   * Make the paragraph that a kept final break splits off a plain one: it takes the list and
+   * style of the paragraph written into, which the Markdown does not show on it. `list` says
+   * whether that paragraph is a list item, whose bullet and indent then go. `restyle` says
+   * whether its named style is not normal text; naming a style resets the look its text has on
+   * every run, so `runs`, its kept text's bold, italic, strikethrough and links counted from its
+   * start, are then written again.
+   */
+  resetTrailingParagraph?: {
+    list: boolean; restyle: boolean; runs: { start: number; end: number; textStyle: TextStyle }[];
+  };
   /** Receives the index of each block needing bullets, for a caller that creates them itself. */
   bulleted?: (index: number) => void;
+  /**
+   * The tab's blocks, for a write that creates its own bullets: they say what the paragraph
+   * written into is, and which list items lie before it, which decides the nesting a new list
+   * item gets (`addBulletRequests`).
+   */
+  tabBlocks?: readonly BlockMapping[];
 };
 
 function parseInternalDocsLink(destination: string): DocsLink | undefined {
@@ -1461,8 +1978,26 @@ function parseInternalDocsLink(destination: string): DocsLink | undefined {
   }
 }
 
-function canonicalLinkDestination(destination: string): string {
+/** A link destination spelled as a rendering spells it, however it was written. */
+export function canonicalLinkDestination(destination: string): string {
   return docsLinkDestination(parseInternalDocsLink(destination)) ?? destination;
+}
+
+/** The link a destination written in table HTML or Markdown stands for. */
+export function docsLinkForDestination(destination: string): DocsLink {
+  return parseInternalDocsLink(destination) ?? { url: destination };
+}
+
+/**
+ * A link destination as a table cell of tab `tabId` reads once it is written: a heading or
+ * bookmark named without a tab is one of that tab, as a read returns it.
+ */
+export function cellLinkDestination(destination: string, tabId: string): string {
+  let link = parseInternalDocsLink(destination);
+  if (!link) return destination;
+  if ("headingId" in link) link = { heading: { id: link.headingId, tabId } };
+  else if ("bookmarkId" in link) link = { bookmark: { id: link.bookmarkId, tabId } };
+  return docsLinkDestination(link) ?? destination;
 }
 
 function sourceLinks(blocks: BlockMapping[]): Map<string, DocsLink> {
@@ -1480,8 +2015,7 @@ function sourceLinks(blocks: BlockMapping[]): Map<string, DocsLink> {
 }
 
 function linkForWrite(source: MarkdownWriteOptions["source"], destination: string): DocsLink {
-  return source?.links.get(destination) ?? parseInternalDocsLink(destination) ??
-    { url: destination };
+  return source?.links.get(destination) ?? docsLinkForDestination(destination);
 }
 
 function targetNamedStyle(block: ParsedBlock, source?: BlockMapping): string {
@@ -1674,7 +2208,8 @@ function pairGap(
   ];
 }
 
-function addRequest(requests: any[], request: any): void {
+/** Append `request` to a batch, refusing a batch larger than `MAX_GOOGLE_DOC_REQUESTS`. */
+export function addRequest(requests: GoogleDocsRequest[], request: GoogleDocsRequest): void {
   if (requests.length >= MAX_GOOGLE_DOC_REQUESTS) {
     throw new Error(`Google Doc action exceeds the ${MAX_GOOGLE_DOC_REQUESTS}-request batch limit.`);
   }
@@ -1743,14 +2278,35 @@ export function markdownToDocRequests(
   return blocksToDocRequests(parseMarkdownForWrite(markdown), insertAt, tabId, options, []);
 }
 
+/**
+ * Append to `requests` those that fill the empty paragraph at `insertAt` with `text` as plain
+ * paragraphs, one per line, none of the text bold, italic, struck through or linked. The
+ * paragraphs are reset as well: none is a list item, a heading or indented, whatever the
+ * paragraph was, and empty text only resets it. With `keepParagraphStyle` they are left as
+ * the paragraph is, and empty text sends nothing.
+ */
+export function plainTextToDocRequests(
+  text: string,
+  insertAt: number,
+  tabId: string,
+  requests: GoogleDocsRequest[],
+  keepParagraphStyle = false,
+): void {
+  let blocks = text.split("\n").map((plainText): ParsedBlock => ({
+    plainText, headingLevel: null, listType: null, listNumber: null, nestingLevel: 0, spans: [],
+  }));
+  blocksToDocRequests(blocks, insertAt, tabId,
+    keepParagraphStyle ? {} : { resetParagraphs: true, resetIndent: true }, requests);
+}
+
 /** Append to `requests` the requests that insert `blocks` at `insertAt`. */
 function blocksToDocRequests(
   blocks: ParsedBlock[],
   insertAt: number,
   tabId: string,
   options: MarkdownWriteOptions,
-  requests: any[],
-): any[] {
+  requests: GoogleDocsRequest[],
+): GoogleDocsRequest[] {
   if (blocks.length === 0) return requests;
   let { source, resetParagraphs = false } = options;
   let preserveLists = blocks.map((block, index) => source !== undefined &&
@@ -1766,14 +2322,21 @@ function blocksToDocRequests(
   }
   // Positions are known from the text lengths alone, so lay every block out in one pass.
   let offset = insertAt;
-  let positioned = blocks.map((block, index) => {
+  let positioned = blocks.map((written, index) => {
     let paired = index === source?.pairedIndex ? source.container : undefined;
     let preserveList = preserveLists[index];
-    let prefix = block.listType && !preserveList ? "\t".repeat(block.nestingLevel) : "";
+    let fresh = written.listType !== null && !preserveList;
+    // `createParagraphBullets` reads every tab a paragraph starts with as nesting and removes
+    // it, so a new item is laid out behind the tabs of its level alone, and the tabs its own
+    // text starts with are written once its bullet is made (`addBulletRequests`).
+    let textTabs = fresh ? leadingTabs(written) : undefined;
+    let block = textTabs ? blockTextSlice(written, textTabs.plainText.length) : written;
+    let prefix = fresh ? levelTabs(block.nestingLevel) : "";
     let paragraphStart = offset;
     offset += prefix.length + block.plainText.length + 1;
     return {
       block,
+      textTabs,
       paired,
       preserveList,
       targetStyle: targetNamedStyle(block, paired),
@@ -1805,13 +2368,20 @@ function blocksToDocRequests(
     let resetList = !preserveList &&
       (source ? source.container.listId !== undefined : resetParagraphs);
     change.deleteBullets = resetList;
-    change.clearIndent = resetList && source !== undefined;
+    change.clearIndent = resetList && (source !== undefined || options.resetIndent === true);
     if (paired ? paired.namedStyleType !== targetStyle
       : resetParagraphs || targetStyle !== "NORMAL_TEXT") {
       change.namedStyleType = targetStyle;
     }
     return change;
   });
+  let trailing = options.preserveTrailingNewline ? options.resetTrailingParagraph : undefined;
+  if (trailing) {
+    paragraphChanges.push({
+      startIndex: offset, endIndex: offset + 1, deleteBullets: trailing.list,
+      namedStyleType: trailing.restyle ? "NORMAL_TEXT" : undefined, clearIndent: trailing.list,
+    });
+  }
   // Bullets go first: removing them indents each paragraph to keep its nesting visible, and the
   // indent reset below undoes that.
   for (let { startIndex, endIndex } of coalesceRanges(
@@ -1824,6 +2394,16 @@ function blocksToDocRequests(
       previous.clearIndent === next.clearIndent)) {
     addRequest(requests, updateParagraphStyleRequest(
       { startIndex, endIndex, tabId }, namedStyleType, clearIndent));
+  }
+  for (let run of trailing?.restyle ? trailing.runs : []) {
+    let fields = (["bold", "italic", "strikethrough", "link"] as const)
+      .filter(field => run.textStyle[field]);
+    addRequest(requests, {
+      updateTextStyle: {
+        range: { startIndex: offset + run.start, endIndex: offset + run.end, tabId },
+        textStyle: run.textStyle, fields: fields.join(","),
+      },
+    });
   }
 
   // Reset inherited inline styling across all inserted text in one request. Starting at the first
@@ -1880,37 +2460,293 @@ function blocksToDocRequests(
     }
   }
 
-  let bullets = positioned.flatMap(({ block, preserveList, paragraphStart, paragraphEnd }, index) =>
-    block.listType && !preserveList
-      ? [{ index, listType: block.listType, startIndex: paragraphStart, endIndex: paragraphEnd }]
-      : []);
-  if (options.bulleted) bullets.forEach(({ index }) => options.bulleted!(index));
-  else addBulletRequests(requests, bullets, tabId);
+  let isNewItem = ({ block, preserveList }: (typeof positioned)[number]) =>
+    block.listType !== null && !preserveList;
+  if (options.bulleted) {
+    positioned.forEach((paragraph, index) => {
+      if (isNewItem(paragraph)) options.bulleted!(index);
+    });
+    return requests;
+  }
+  // The first block is written into a paragraph of the tab: it begins where that paragraph
+  // does and, where the write leaves that paragraph as it is, is the list item it is.
+  let tabBlocks = options.tabBlocks ?? [];
+  let written = tabBlocks.findIndex(block => block.docStart <= insertAt && insertAt < block.docEnd);
+  let container = written < 0 ? undefined : tabBlocks[written];
+  let keptItem = options.preserveLeadingParagraph || !resetParagraphs ? container : undefined;
+  addBulletRequests(requests, positioned.map((paragraph, index): LaidParagraph => {
+    let { block, textTabs, paragraphStart, paragraphEnd } = paragraph;
+    if (isNewItem(paragraph)) {
+      return {
+        startIndex: paragraphStart, endIndex: paragraphEnd,
+        listType: block.listType, nestingLevel: block.nestingLevel, fresh: true,
+        ...(textTabs ? { textTabs } : {}),
+      };
+    }
+    let kept = index === 0 ? keptItem : undefined;
+    return {
+      startIndex: index === 0 && container ? container.docStart : paragraphStart,
+      endIndex: paragraphEnd,
+      listType: kept?.listType ?? null,
+      nestingLevel: kept?.listNestingLevel ?? 0,
+      ...(kept?.positioned ? { positioned: true as const } : {}),
+      ...(kept?.offPreset ? { offPreset: true as const } : {}),
+      ...(kept?.tabbed ? { tabbed: true as const } : {}),
+    };
+  }), tabId, tabBlocks.slice(0, Math.max(written, 0)));
   return requests;
 }
 
+/** A paragraph of a write once its text is laid out, as the bullets are created over it. */
+type LaidParagraph = {
+  startIndex: number;
+  endIndex: number;
+  /** The kind of list it is, or is to be, an item of; null for a paragraph outside any list. */
+  listType: ListType | null;
+  nestingLevel: number;
+  /** Set for a paragraph still to be bulleted, which starts with its nesting level in tabs. */
+  fresh?: true;
+  /** Set for a paragraph of the tab that a positioned object is anchored to. */
+  positioned?: true;
+  /** Set for an item of a list no new item joins, as `BlockMapping.offPreset` says. */
+  offPreset?: true;
+  /**
+   * The tabs the paragraph's own text starts with, where the write holds that text.
+   * `createParagraphBullets` reads them as nesting and removes them, so a fresh paragraph is
+   * laid out without them, a paragraph taken in has them counted toward its level, and either
+   * way they are written at the start of its text once the bullets are made.
+   */
+  textTabs?: ParsedBlock;
+  /**
+   * Set for a paragraph of the tab the write leaves as it is whose text starts with a tab, as
+   * `BlockMapping.tabbed` says. It comes as a block mapping, without its text, so it has no
+   * `textTabs`.
+   */
+  tabbed?: true;
+};
+
+/** `block` with only its text from `start` to `end`, and the formatting that text has. */
+function blockTextSlice(
+  block: ParsedBlock, start: number, end = block.plainText.length,
+): ParsedBlock {
+  return {
+    ...block,
+    plainText: block.plainText.slice(start, end),
+    spans: block.spans.flatMap(span => {
+      let from = Math.max(span.start, start);
+      let to = Math.min(span.end, end);
+      return from < to ? [{ ...span, start: from - start, end: to - start }] : [];
+    }),
+  };
+}
+
+/**
+ * The tabs `block`'s text starts with, as the text of a plain paragraph with the formatting
+ * they have; undefined when it starts with none.
+ */
+function leadingTabs(block: ParsedBlock): ParsedBlock | undefined {
+  let count = block.plainText.length - block.plainText.replace(/^\t+/, "").length;
+  return count === 0 ? undefined
+    : { ...blockTextSlice(block, 0, count), headingLevel: null, listType: null };
+}
+
+/**
+ * The refusal of a new list item that only bulleting again an item before the lines the write
+ * changes, whose text starts with a tab, would place.
+ */
+export const TABBED_ITEM_BEFORE =
+  "a list item cannot be written shallower than the list item before it while that item, or " +
+  "one between it and an item as shallow, has text that starts with a tab: placing the new " +
+  "item would make a list item of that item again, and Google Docs would read its tab as a " +
+  "nesting level and remove it. Remove the tab from that item's text first, or write the new " +
+  "item at that item's level.";
+
+/** The refusal of a new list item that only rewriting an item with a positioned image would place. */
+export const POSITIONED_ITEM_BEFORE =
+  "a list item cannot be written shallower than the list item before it while that item, or " +
+  "one between it and an item as shallow, holds a positioned image: placing the new item " +
+  "would rewrite that item, and whether the image stays with it is not known. Write the item " +
+  "at that item's level, or move the image in Google Docs first.";
+
+/** The refusal of a list item written deeper than the last level a list has. */
+export const LIST_LEVEL_TOO_DEEP =
+  "a list item cannot be written deeper than the ninth nesting level: a list in Google Docs " +
+  "has nine levels. Write the item at most that deep, with at most sixteen spaces before its " +
+  "marker.";
+
+/**
+ * The tabs that write nesting level `level` at the start of a paragraph still to be bulleted,
+ * which `createParagraphBullets` counts and removes. Throws `LIST_LEVEL_TOO_DEEP` for a level
+ * a list does not have.
+ */
+function levelTabs(level: number): string {
+  // What Google Docs does with a tenth level is not on record, so none is sent. This stands
+  // until a recording shows it.
+  if (level >= LIST_LEVELS) throw new Error(LIST_LEVEL_TOO_DEEP);
+  return "\t".repeat(level);
+}
+
+/**
+ * Append the requests that make list items of the `fresh` paragraphs of `paragraphs`, which
+ * abut in document order; `lead` holds the tab's blocks before the first of them.
+ *
+ * `createParagraphBullets` does not nest a paragraph by its leading tabs alone. A range joins
+ * the list of the item directly before it, and each of its paragraphs lands at that item's
+ * level plus its own tabs, less the fewest tabs any paragraph of the range has; a range with
+ * no such item before it starts a list and counts from 0. So a run of new items is bulleted
+ * as it is only when its shallowest item is at the level of the item before it. Otherwise:
+ * - a run with an item shallower than the item before it takes in the items before it, up to
+ *   one no deeper than its shallowest: their bullets are removed and their levels written as
+ *   tabs, and they are bulleted again with the run, which puts them back in the list they
+ *   were in, at their levels; an item a positioned object is anchored to is never taken in,
+ *   since what its anchor does then is not on record: the write is refused;
+ * - a run whose shallowest item is deeper than the item before it is bulleted behind an
+ *   empty paragraph carrying that item's level in tabs, which is deleted afterwards.
+ *
+ * The tabs an item's own text starts with (`LaidParagraph.textTabs`) would be read as nesting
+ * too. A new item is laid out without them; an item taken in has them counted toward its
+ * level's tabs; and they are written at the start of the item's text once the bullets are
+ * made. An item of `lead` whose text starts with a tab (`tabbed`) comes as a block mapping,
+ * without its text, so its tab is not written back: like one a positioned object is anchored
+ * to, it is never taken in, and the write is refused.
+ *
+ * Which list Google joins is on record for lists made by these presets. An item of any other
+ * list (`BlockMapping.offPreset`) is taken for one the range does not join, so a run behind it
+ * is laid out as a run that starts a list, and the item is never taken in. That is inferred,
+ * in `madeByPreset`.
+ */
 function addBulletRequests(
   requests: any[],
-  paragraphs: { listType: ListType; startIndex: number; endIndex: number }[],
+  paragraphs: readonly LaidParagraph[],
   tabId: string,
+  lead: readonly BlockMapping[] = [],
 ): void {
-  let groups = coalesceRanges(paragraphs, (previous, next) => previous.listType === next.listType);
-  // Reversed: creating bullets strips each paragraph's leading tabs, shifting later indices.
-  for (let { listType, startIndex, endIndex } of groups.toReversed()) {
+  // The paragraph at `index`; a negative index counts back into `lead`, for as long as its
+  // blocks abut: a table or another element between ends the paragraphs a range can join.
+  let earlier: LaidParagraph[] = [];
+  let at = (index: number): LaidParagraph | undefined => {
+    if (index >= 0) return paragraphs[index];
+    while (earlier.length < -index) {
+      let block = lead[lead.length - 1 - earlier.length];
+      if (block?.docEnd !== (earlier.at(-1) ?? paragraphs[0]).startIndex) return undefined;
+      earlier.push({
+        startIndex: block.docStart, endIndex: block.docEnd,
+        listType: block.listType, nestingLevel: block.listNestingLevel,
+        ...(block.positioned ? { positioned: true as const } : {}),
+        ...(block.offPreset ? { offPreset: true as const } : {}),
+        ...(block.tabbed ? { tabbed: true as const } : {}),
+      });
+    }
+    return earlier[-index - 1];
+  };
+  let insert = (index: number, text: string) =>
+    addRequest(requests, { insertText: { location: { index, tabId }, text } });
+
+  // The paragraphs taken in whose own tabs their bullets removed with their level's.
+  let rebulleted = new Set<LaidParagraph>();
+  // Last to first: creating bullets strips each paragraph's leading tabs, shifting later indices.
+  for (let last = paragraphs.length - 1; last >= 0; last--) {
+    let { listType } = paragraphs[last];
+    if (!paragraphs[last].fresh || listType === null) continue;
+    let first = last;
+    let shallowest = paragraphs[last].nestingLevel;
+    // The level of the item the range joins behind, which its paragraphs' levels count from.
+    let level = 0;
+    for (;;) {
+      let before = at(first - 1);
+      if (before?.listType !== listType || before.offPreset) break;
+      if (!before.fresh && before.nestingLevel <= shallowest) {
+        level = before.nestingLevel;
+        break;
+      }
+      // Another new item of the run, an item deeper than the run's shallowest, or a new item
+      // beyond such an item: each is bulleted with the run.
+      shallowest = Math.min(shallowest, before.nestingLevel);
+      first--;
+    }
+    let members: LaidParagraph[] = [];
+    for (let index = first; index <= last; index++) members.push(at(index)!);
+    let { startIndex } = members[0];
+
+    // The items taken in become plain paragraphs that start with their levels in tabs, as the
+    // new ones do. Tabs go in last to first, so that no insertion moves one still to be made.
+    let taken = members.filter(member => !member.fresh);
+    if (taken.some(member => member.positioned)) throw new Error(POSITIONED_ITEM_BEFORE);
+    // An item of `lead` whose text starts with a tab is never taken in either: its tab would
+    // be read as nesting and removed, and `lead` holds block mappings, not the items' text, so
+    // nothing here writes the tab back.
+    if (taken.some(member => member.tabbed)) throw new Error(TABBED_ITEM_BEFORE);
+    for (let range of coalesceRanges(taken, () => true)) {
+      let unlisted = { startIndex: range.startIndex, endIndex: range.endIndex, tabId };
+      addRequest(requests, { deleteParagraphBullets: { range: unlisted } });
+      // A removed bullet leaves its indent behind.
+      addRequest(requests, updateParagraphStyleRequest(unlisted, undefined, true));
+    }
+    let inserted = 0;
+    for (let member of taken.toReversed()) {
+      // The tabs its own text starts with count as nesting too. Its level is made up with the
+      // tabs it lacks, or the tabs it has over its level are deleted, and its own are written
+      // back once the bullets are made.
+      let own = member.textTabs?.plainText.length ?? 0;
+      let lacking = member.nestingLevel - own;
+      if (lacking > 0) insert(member.startIndex, levelTabs(member.nestingLevel).slice(own));
+      if (lacking < 0) {
+        addRequest(requests, { deleteContentRange: {
+          range: { startIndex: member.startIndex, endIndex: member.startIndex - lacking, tabId },
+        } });
+      }
+      inserted += lacking;
+      if (own > 0) rebulleted.add(member);
+    }
+    let scaffold = shallowest > level;
+    if (scaffold) {
+      insert(startIndex, levelTabs(level) + "\n");
+      inserted += level + 1;
+    }
     addRequest(requests, {
       createParagraphBullets: {
-        range: { startIndex, endIndex, tabId },
-        bulletPreset: listType === "numbered"
-          ? "NUMBERED_DECIMAL_ALPHA_ROMAN"
-          : "BULLET_DISC_CIRCLE_SQUARE",
+        range: { startIndex, endIndex: members.at(-1)!.endIndex + inserted, tabId },
+        bulletPreset: BULLET_PRESET[listType],
       },
     });
+    // Its tabs are stripped with the others', which leaves the empty paragraph's break.
+    if (scaffold) {
+      addRequest(requests, {
+        deleteContentRange: { range: { startIndex, endIndex: startIndex + 1, tabId } },
+      });
+    }
+    last = first;
+  }
+  // The tabs an item's own text starts with go in at the start of its text once every bullet
+  // is made. Each paragraph then starts earlier than it was laid out by what the bullets took
+  // off the paragraphs before it: a new item's level in tabs, a taken-in item's own tabs. Last
+  // to first, so that no insertion moves one still to be made. That Google Docs keeps a tab
+  // written there as text, at the item's level, is not on record: the recorder's scenarios
+  // `tab-typed-into-list-item`, `tab-starts-new-list-item` and `tab-item-bulleted-again` are
+  // there to record it.
+  let removedBefore = 0;
+  let writes: { index: number; tabs: ParsedBlock }[] = [];
+  for (let paragraph of paragraphs) {
+    let { startIndex, nestingLevel, fresh, textTabs } = paragraph;
+    let removed = fresh || rebulleted.has(paragraph) ? textTabs : undefined;
+    if (removed) writes.push({ index: startIndex - removedBefore, tabs: removed });
+    removedBefore += fresh ? nestingLevel : removed?.plainText.length ?? 0;
+  }
+  for (let { index, tabs } of writes.toReversed()) {
+    blocksToDocRequests([tabs], index, tabId, {}, requests);
   }
 }
 
 // ---------------------------------------------------------------------------
 // Replace operations: map a Markdown edit back to doc operations
 // ---------------------------------------------------------------------------
+
+/** The refusal of an edit that touches rendered content `replaceText()` must leave alone. */
+export class StructuredContentError extends Error {
+  constructor() {
+    super("replaceText: structured content cannot be edited. Narrow the match to plain text.");
+  }
+}
 
 /** Refuse edits that would modify or bridge structural content without a safe source mapping. */
 export function assertMarkdownRangeEditable(
@@ -1919,22 +2755,16 @@ export function assertMarkdownRangeEditable(
   mdEnd: number,
 ): void {
   if (protectedRanges.some(range => markdownRangeTouches(mdStart, mdEnd, range))) {
-    throw new Error(
-      "replaceText: structured content cannot be edited. Narrow the match to plain text.",
-    );
+    throw new StructuredContentError();
   }
 }
 
-/** A Markdown rendering together with the ranges in it that edits must leave alone. */
-export type EditableMarkdown = {
-  markdown: string;
-  protectedRanges: MarkdownRange[];
-};
-
-function lineStart(markdown: string, index: number): number {
+/** Where the line that holds `index` starts in `markdown`. */
+export function lineStart(markdown: string, index: number): number {
   return index <= 0 ? 0 : markdown.lastIndexOf("\n", index - 1) + 1;
 }
 
+/** The kind of list item the line starting at `start` reads as, or `null` for any other line. */
 function listLineType(markdown: string, start: number): ListType | null {
   while (markdown[start] === " ") start++;
   if (markdown.startsWith("- ", start)) return "bullet";
@@ -1997,127 +2827,6 @@ function normalizeChangedBlockBoundaries(
     if (edit) markdown = markdown.slice(0, edit.start) + edit.text + markdown.slice(edit.end);
   }
   return markdown;
-}
-
-function normalizeChangedListBoundaries(
-  markdown: string,
-  updated: string,
-  oldStart: number,
-  oldEnd: number,
-  newEnd: number,
-): string {
-  let oldFirst = lineStart(markdown, oldStart);
-  let oldLast = lineStart(markdown, oldEnd > oldStart ? oldEnd - 1 : oldStart);
-  let newFirst = lineStart(updated, oldStart);
-  let newLast = lineStart(updated, newEnd > oldStart ? newEnd - 1 : oldStart);
-  let edits: TextEdit[] = [];
-
-  if (listLineType(markdown, oldFirst) !== listLineType(updated, newFirst)) {
-    let edit = separatorBefore(updated, newFirst);
-    if (edit) edits.push(edit);
-  }
-  if (listLineType(markdown, oldLast) !== listLineType(updated, newLast)) {
-    let next = nextLineStart(updated, newLast);
-    let edit = next === undefined ? undefined : separatorBefore(updated, next);
-    if (edit) edits.push(edit);
-  }
-
-  for (let edit of edits.toSorted((left, right) => right.start - left.start)) {
-    updated = updated.slice(0, edit.start) + edit.text + updated.slice(edit.end);
-  }
-  return updated;
-}
-
-/**
- * Splice `newMarkdown` over [mdStart, mdEnd), keeping the protected ranges on the text they
- * guard. Refusing an edit that overlaps one is what makes shifting the rest by a constant sound.
- */
-export function applyMarkdownEdit(
-  content: EditableMarkdown,
-  mdStart: number,
-  mdEnd: number,
-  newMarkdown: string,
-): EditableMarkdown {
-  assertMarkdownEscapeBoundaries(content.markdown, mdStart, mdEnd);
-  let oldMarkdown = content.markdown.slice(mdStart, mdEnd);
-  let updated = content.markdown.slice(0, mdStart) + newMarkdown +
-    content.markdown.slice(mdEnd);
-  let normalized = normalizeChangedListBoundaries(
-    content.markdown, updated, mdStart, mdEnd, mdStart + newMarkdown.length);
-  if (normalized !== updated) {
-    let bounds = markdownReplacementBounds(content.markdown, normalized);
-    mdStart = bounds.prefixLen;
-    mdEnd = content.markdown.length - bounds.suffixLen;
-    newMarkdown = normalized.slice(bounds.prefixLen, normalized.length - bounds.suffixLen);
-  } else {
-    let bounds = markdownReplacementBounds(oldMarkdown, newMarkdown);
-    mdStart += bounds.prefixLen;
-    mdEnd -= bounds.suffixLen;
-    newMarkdown = newMarkdown.slice(bounds.prefixLen, newMarkdown.length - bounds.suffixLen);
-  }
-  assertMarkdownRangeEditable(content.protectedRanges, mdStart, mdEnd);
-  newMarkdown = closeFormattingAtBreaks(content.markdown, mdStart, mdEnd, newMarkdown);
-  let offset = newMarkdown.length - (mdEnd - mdStart);
-  return {
-    markdown: content.markdown.slice(0, mdStart) + newMarkdown + content.markdown.slice(mdEnd),
-    protectedRanges: offset === 0 ? content.protectedRanges
-      : content.protectedRanges.map(range => range.mdEnd <= mdStart ? range : {
-        mdStart: range.mdStart + offset,
-        mdEnd: range.mdEnd + offset,
-      }),
-  };
-}
-
-/** Formats open at `offset` in one rendered line, outermost first. */
-function openFormatsAt(line: string, offset: number): MarkdownFormat[] {
-  let links = indexMarkdownLinks(line);
-  for (let index = 0; index < offset;) {
-    if (line[index] === "\\" && isMarkdownPunctuation(line[index + 1] ?? "")) {
-      index += 2;
-      continue;
-    }
-    let link = matchMarkdownLink(line, index, links);
-    if (!link) {
-      index++;
-      continue;
-    }
-    let labelEnd = index + 1 + link.label.length;
-    if (offset <= labelEnd) {
-      return [
-        { open: "[", close: line.slice(labelEnd, link.end + 1) },
-        ...openFormatsAt(link.label, offset - index - 1),
-      ];
-    }
-    index = link.end + 1;
-  }
-  let state = 0;
-  for (let range of inlineMarkdownRanges(line, links)) {
-    if (range.mdStart < offset && offset < range.mdEnd) state |= range.style;
-  }
-  return markdownFormats({
-    bold: !!(state & BOLD_STATE),
-    italic: !!(state & ITALIC_STATE),
-    strikethrough: !!(state & STRIKETHROUGH_STATE),
-  }, undefined, false);
-}
-
-/** Close and reopen the formatting around an edit at each paragraph break it inserts. */
-function closeFormattingAtBreaks(
-  markdown: string,
-  start: number,
-  end: number,
-  text: string,
-): string {
-  if (!text.includes("\n") || BLOCK_SYNTAX_LINE.test(text) ||
-    markdown.slice(start, end).includes("\n")) return text;
-  let lineFrom = lineStart(markdown, start);
-  let lineTo = markdown.indexOf("\n", end);
-  let line = markdown.slice(lineFrom, lineTo < 0 ? undefined : lineTo);
-  let formats = openFormatsAt(line, start - lineFrom);
-  if (markdownFormatTransition(formats, openFormatsAt(line, end - lineFrom))) return text;
-  let close = markdownFormatTransition(formats, []);
-  let open = markdownFormatTransition([], formats);
-  return text.replace(/\n+/g, breaks => close + breaks + open);
 }
 
 /**
@@ -2243,6 +2952,23 @@ function mappedTextStyle(
 }
 
 /**
+ * Where the lines start that the trimmed range `[mdStart, mdEnd)` takes whole, when it ends in
+ * front of a list item's line break: at `mdStart` where a block starts there, and at the start
+ * of a list item's line where only the item's indentation lies before `mdStart` (the item
+ * quoted from its marker). Undefined for every other range.
+ */
+function itemLinesStart(
+  sourceMap: SourceMap, markdown: string, mdStart: number, mdEnd: number,
+): number | undefined {
+  let { blocks } = sourceMap;
+  if (!blocks.some(block => block.listType !== null && block.mdEnd - 1 === mdEnd)) return undefined;
+  let first = blocks.find(block => block.mdStart <= mdStart && mdStart < block.mdEnd);
+  if (!first) return undefined;
+  let indented = first.listType !== null && /^ +$/.test(markdown.slice(first.mdStart, mdStart));
+  return first.mdStart === mdStart || indented ? first.mdStart : undefined;
+}
+
+/**
  * Compute the batch-update operations that replace one range in a tab's Markdown rendering.
  *
  * Unchanged leading and trailing text is trimmed before document indices are calculated;
@@ -2269,47 +2995,36 @@ export function computeReplaceOperations(
   let trimmedOld = oldText.slice(prefixLen, oldText.length - suffixLen);
   assertMarkdownRangeEditable(sourceMap.protectedRanges, trimmedMatchStart, trimmedMatchEnd);
 
-  let blockRange = blockReplacementRange(
-    sourceMap,
-    trimmedMatchStart,
-    trimmedMatchEnd,
-    BLOCK_SYNTAX_LINE.test(trimmedNew),
-    trimmedOld.includes("\n"),
-  );
-  if (blockRange) {
-    assertMarkdownRangeEditable(
-      sourceMap.protectedRanges, blockRange.mdStart, blockRange.mdEnd - 1,
-    );
-    let rewritten = (
-      literalMarkdownSlice(sourceMap, markdown, blockRange.mdStart, trimmedMatchStart) +
-      trimmedNew +
-      literalMarkdownSlice(sourceMap, markdown, trimmedMatchEnd, blockRange.mdEnd)
-    ).replace(/\n$/, "");
-    // Leading newlines extend the separator before the range, which already holds its breaks.
-    let lead = newlineRun(rewritten, 0, 1);
-    let before = newlineRun(markdown, blockRange.mdStart - 1, -1);
-    let blockMarkdown = "\n".repeat(Math.ceil((before + lead) / 2) - Math.ceil(before / 2)) +
-      rewritten.slice(lead);
-    let targets = parseMarkdownForWrite(blockMarkdown);
-    if (/[^\n]\n+$/.test(blockMarkdown)) targets.push(parseLine(""));
-    let requests = rewriteBlocks(sourceMap, markdown, blockRange.blocks, targets, tabId);
-    return { requests, trimmedOld, trimmedNew };
-  }
-
-  let docRange = mdRangeToDocRange(sourceMap, trimmedMatchStart, trimmedMatchEnd);
-  if (!docRange) {
-    throw new Error(
-      "replaceText: could not map the Markdown range to document indices. " +
-      "The match may span unsupported content.");
-  }
-  let insertMarkdown = fragmentInsertMarkdown(
-    markdown, trimmedMatchStart, trimmedMatchEnd, trimmedNew, docRange.startsAfterParagraph);
-  // Paragraphs split off the one written into would inherit its list and style.
-  let writeOptions: MarkdownWriteOptions = {
-    resetParagraphs: true,
-    preserveLeadingParagraph: true,
-    preserveTrailingNewline: /[^\n]\n+$/.test(insertMarkdown),
+  let rewriteRange = (start: number, end: number, crossesBreak: boolean): any[] | undefined => {
+    let rewrite = blockRewrite(sourceMap, markdown, start, end, trimmedNew, crossesBreak);
+    return rewrite &&
+      rewriteBlocks(sourceMap, markdown, rewrite.blockRange.blocks, rewrite.targets, tabId);
   };
+  let rewritten: any[] | undefined;
+  // Lines replaced by nothing up to the end of a list item's text go whole, with that item's
+  // line break, as they do when the break is quoted too: without it the first line's paragraph
+  // would stay, empty, and where it is a list item's, out of its list, which splits the list.
+  let linesStart = trimmedNew === ""
+    ? itemLinesStart(sourceMap, markdown, trimmedMatchStart, trimmedMatchEnd) : undefined;
+  if (linesStart !== undefined) {
+    try {
+      assertMarkdownRangeEditable(sourceMap.protectedRanges, linesStart, trimmedMatchEnd + 1);
+      rewritten = rewriteRange(linesStart, trimmedMatchEnd + 1, true);
+    } catch (error) {
+      // Where the builders refuse the lines with the break (they end their section behind an
+      // item of another level or list, or a line beside them cannot be edited), the lines are
+      // replaced without it, below. Anything else thrown is not a refusal.
+      let refused = error instanceof StructuredContentError ||
+        error instanceof Error && Object.getPrototypeOf(error) === Error.prototype;
+      if (!refused) throw error;
+    }
+  }
+  rewritten ??= rewriteRange(
+    linesStart ?? trimmedMatchStart, trimmedMatchEnd, trimmedOld.includes("\n"));
+  if (rewritten) return { requests: rewritten, trimmedOld, trimmedNew };
+
+  let { docRange, insertMarkdown, writeOptions } =
+    inlineWrite(sourceMap, markdown, trimmedMatchStart, trimmedMatchEnd, trimmedNew);
   if (!docRange.startsAfterParagraph) {
     writeOptions.sourceTextStyle = mappedTextStyle(sourceMap, trimmedMatchStart, trimmedMatchEnd);
   }
@@ -2327,6 +3042,77 @@ export function computeReplaceOperations(
       parseMarkdownForWrite(insertMarkdown), docRange.start, tabId, writeOptions, requests);
   }
   return { requests, trimmedOld, trimmedNew };
+}
+
+/**
+ * Where a trimmed replacement that edits inside a paragraph writes, what it writes there, and how:
+ * whether its first paragraph keeps the style of the one written into.
+ */
+function inlineWrite(
+  sourceMap: SourceMap, markdown: string, trimmedMatchStart: number, trimmedMatchEnd: number,
+  trimmedNew: string,
+): { docRange: DocRange; insertMarkdown: string; writeOptions: MarkdownWriteOptions } {
+  let docRange = mdRangeToDocRange(sourceMap, trimmedMatchStart, trimmedMatchEnd);
+  if (!docRange) {
+    throw new Error(
+      "replaceText: could not map the Markdown range to document indices. " +
+      "The match may span unsupported content.");
+  }
+  let insertMarkdown = fragmentInsertMarkdown(
+    markdown, trimmedMatchStart, trimmedMatchEnd, trimmedNew, docRange.startsAfterParagraph);
+  let preserveTrailingNewline = /[^\n]\n+$/.test(insertMarkdown);
+  // Paragraphs split off the one written into would inherit its list and style. Text that ends in
+  // a break, written at the start of a paragraph's line, before any marker, holds only paragraphs
+  // split off ahead of it. Written after a marker it is inside the item or heading, which its
+  // first paragraph then is.
+  let start = docRange.start;
+  let atLineStart = trimmedMatchStart === 0 || markdown[trimmedMatchStart - 1] === "\n";
+  let ahead = !docRange.startsAfterParagraph && preserveTrailingNewline && atLineStart
+    ? sourceMap.blocks.find(block => block.docStart === start) : undefined;
+  // Written inside a paragraph, such text splits off the rest of it, which the Markdown shows as
+  // a plain paragraph.
+  let { end } = docRange;
+  let split = !ahead && preserveTrailingNewline && !docRange.startsAfterParagraph
+    ? sourceMap.blocks.find(block => block.docStart <= end && end < block.docEnd) : undefined;
+  let restyle = split !== undefined && split.namedStyleType !== "NORMAL_TEXT";
+  // A subtitle's text reads italic by its style where the style makes it so, and normal text
+  // would not, which the write cannot tell.
+  if (split?.namedStyleType === "SUBTITLE" && end < split.docEnd - 1) {
+    throw new Error(
+      "replaceText: a paragraph break written inside a subtitle would make the rest of it a " +
+      "normal paragraph, without the subtitle's look. Write the break at the subtitle's end, " +
+      "or replace the whole subtitle.");
+  }
+  let runs: { start: number; end: number; textStyle: TextStyle }[] = [];
+  for (let segment of restyle ? split!.segments : []) {
+    if ("syntaxOnly" in segment) continue;
+    let from = Math.max(segment.docStart, end);
+    let to = Math.min(segment.docEnd, split!.docEnd - 1);
+    let { bold, italic, strikethrough, link } = segment.textStyle;
+    let textStyle: TextStyle = {
+      ...bold ? { bold } : {}, ...italic ? { italic } : {},
+      ...strikethrough ? { strikethrough } : {}, ...link ? { link } : {},
+    };
+    if (from < to && Object.keys(textStyle).length > 0) {
+      runs.push({ start: from - end, end: to - end, textStyle });
+    }
+  }
+  return {
+    docRange, insertMarkdown,
+    writeOptions: {
+      resetParagraphs: true,
+      // A removed bullet leaves its indent behind.
+      resetIndent: ahead?.listId !== undefined,
+      preserveLeadingParagraph: !ahead ||
+        ahead.listId === undefined && ahead.namedStyleType === "NORMAL_TEXT",
+      preserveTrailingNewline,
+      // The tab's blocks, as an append has them: the list item the write starts behind, and
+      // the items before it, decide the level a new list item is bulleted at.
+      tabBlocks: sourceMap.blocks,
+      ...(split && (restyle || split.listId !== undefined)
+        ? { resetTrailingParagraph: { list: split.listId !== undefined, restyle, runs } } : {}),
+    },
+  };
 }
 
 function newlineRun(text: string, index: number, step: 1 | -1): number {
@@ -2363,6 +3149,38 @@ function fragmentInsertMarkdown(
 }
 
 /**
+ * The whole blocks a trimmed replacement rewrites, and the blocks it writes in their place, when it
+ * takes that path: when it writes block syntax or crosses a paragraph break.
+ */
+function blockRewrite(
+  sourceMap: SourceMap, markdown: string, trimmedMatchStart: number, trimmedMatchEnd: number,
+  trimmedNew: string, crossesBreak: boolean,
+): { blockRange: NonNullable<ReturnType<typeof blockReplacementRange>>; targets: ParsedBlock[] } | undefined {
+  let blockRange = blockReplacementRange(
+    sourceMap, trimmedMatchStart, trimmedMatchEnd, BLOCK_SYNTAX_LINE.test(trimmedNew), crossesBreak,
+  );
+  if (!blockRange) return undefined;
+  assertMarkdownRangeEditable(sourceMap.protectedRanges, blockRange.mdStart, blockRange.mdEnd - 1);
+  let rewritten = (
+    literalMarkdownSlice(sourceMap, markdown, blockRange.mdStart, trimmedMatchStart) +
+    trimmedNew +
+    literalMarkdownSlice(sourceMap, markdown, trimmedMatchEnd, blockRange.mdEnd)
+  ).replace(/\n$/, "");
+  // Leading newlines extend the separator before the range, which already holds its breaks.
+  let lead = newlineRun(rewritten, 0, 1);
+  let before = newlineRun(markdown, blockRange.mdStart - 1, -1);
+  let blockMarkdown = "\n".repeat(Math.ceil((before + lead) / 2) - Math.ceil(before / 2)) +
+    rewritten.slice(lead);
+  // The range's last block ends at its final break, so each break a trailing run renders after
+  // the text adds an empty paragraph.
+  let trail = /[^\n]\n+$/.test(blockMarkdown)
+    ? newlineRun(blockMarkdown, blockMarkdown.length - 1, -1) : 0;
+  let targets = parseMarkdownForWrite(blockMarkdown.slice(0, blockMarkdown.length - trail));
+  for (let empty = 0; empty < Math.ceil(trail / 2); empty++) targets.push(parseLine(""));
+  return { blockRange, targets };
+}
+
+/**
  * Rewrite whole source blocks paragraph by paragraph, so each kept paragraph keeps its own list and
  * style. Requests run from the end of the range backwards, so earlier indices stay valid.
  */
@@ -2379,6 +3197,8 @@ function rewriteBlocks(
   // before it, and pairs are written last to first.
   let bulleted = new Set<number>();
   let keptLengths = new Map<number, number>();
+  // The source paragraph each target is left as or written into.
+  let containers: BlockMapping[] = [];
   let write = (blocks: ParsedBlock[], first: number, at: number, container: BlockMapping,
     options: MarkdownWriteOptions = {}, pairedIndex?: number) => blocksToDocRequests(blocks, at,
     tabId, {
@@ -2425,6 +3245,7 @@ function rewriteBlocks(
 
     let before = index === 0 ? targets.slice(0, t) : [];
     let after = targets.slice(t + 1, nextTarget);
+    for (let target = t - before.length; target < nextTarget; target++) containers[target] = source;
     if (isUnchangedBlock(source, targets[t], markdown)) {
       keptLengths.set(t, source.docEnd - source.docStart);
       if (after.length > 0) {
@@ -2442,13 +3263,22 @@ function rewriteBlocks(
   }
   if (pairs[0][0] > 0) remove(sources[0].docStart, sources[pairs[0][0]].docStart);
   let offset = sources[0].docStart;
-  addBulletRequests(requests, targets.flatMap((target, index) => {
+  // A target that is not bulleted here is the list item it reads as: it is left as it was, or
+  // it keeps the list of the paragraph it was written into.
+  addBulletRequests(requests, targets.map((target, index): LaidParagraph => {
     let startIndex = offset;
     let isNew = bulleted.has(index);
-    offset += keptLengths.get(index) ??
-      (isNew ? target.nestingLevel : 0) + target.plainText.length + 1;
-    return isNew ? [{ listType: target.listType!, startIndex, endIndex: offset }] : [];
-  }), tabId);
+    let textTabs = leadingTabs(target);
+    // A new item is laid out behind its level's tabs and without the tabs of its own text.
+    offset += keptLengths.get(index) ?? (isNew
+      ? target.nestingLevel - (textTabs?.plainText.length ?? 0) : 0) + target.plainText.length + 1;
+    return {
+      startIndex, endIndex: offset, listType: target.listType,
+      nestingLevel: target.nestingLevel, ...(isNew ? { fresh: true as const } : {}),
+      ...(textTabs ? { textTabs } : {}),
+      ...(!isNew && containers[index].offPreset ? { offPreset: true as const } : {}),
+    };
+  }), tabId, sourceMap.blocks.slice(0, sourceMap.blocks.indexOf(sources[0])));
   return requests;
 }
 

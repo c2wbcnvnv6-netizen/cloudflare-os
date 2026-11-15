@@ -24,7 +24,7 @@ import {
 import {
   applyMarkdownEdit, canonicalizeMarkdownReplacement, computeReplaceOperations,
   MARKDOWN_RENDERING_VERSION,
-} from "./markdown-converter";
+} from "./markdown-replay";
 import { DriveApi, DriveApiRequestError } from "./drive-api";
 import { type DriveCommentAction } from "./drive-comments";
 import { writeAttempts } from "./drive-writes";

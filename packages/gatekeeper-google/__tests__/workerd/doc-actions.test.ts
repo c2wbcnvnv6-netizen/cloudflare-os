@@ -8,7 +8,7 @@ import {
 import { driveDocSource, GoogleDocSessionImpl, type DocChangeQueue } from "../../src/docs";
 import type { GoogleDocsApi, GoogleDocsDocument } from "../../src/docs-api";
 import type { DriveApi } from "../../src/drive-api";
-import { MARKDOWN_RENDERING_VERSION } from "../../src/markdown-converter";
+import { MARKDOWN_RENDERING_VERSION } from "../../src/markdown-replay";
 import { buildTab } from "../doc-fixture";
 
 type Append = Parameters<typeof DOC_DEFINITIONS.appendText.describe>[0];

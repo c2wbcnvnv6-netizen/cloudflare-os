@@ -2,7 +2,7 @@ import { abortAllDurableObjects, env } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ActionField } from "@gadgets/workshop-shared/gatekeeper";
 import { googleDocActionTab } from "../../src/doc-actions";
-import { MARKDOWN_RENDERING_VERSION } from "../../src/markdown-converter";
+import { MARKDOWN_RENDERING_VERSION } from "../../src/markdown-replay";
 import { officeFileError } from "../../src/office-conversion";
 import { DRIVE_WRITES_GRANT, GOOGLE_DRIVE_RESOURCE } from "../../src/resources";
 import type { GoogleDocsTab } from "../../src/docs-api";

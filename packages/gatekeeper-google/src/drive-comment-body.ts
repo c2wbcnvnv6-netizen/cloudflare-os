@@ -11,7 +11,8 @@ import type { DocsRange, GoogleDocsDocument, GoogleDocsTab, ParagraphElement } f
 import {
   MAX_DOCS_COMMENT_BYTES, MAX_QUOTE_CHARS, MAX_REPLACEMENT_CHARS, checkCommentContent,
 } from "./drive-api";
-import { isGoogleDocsStrippedCharacter, paragraphElementText } from "./markdown-converter";
+import { isGoogleDocsStrippedCharacter } from "./docs-content";
+import { paragraphElementText } from "./markdown-converter";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

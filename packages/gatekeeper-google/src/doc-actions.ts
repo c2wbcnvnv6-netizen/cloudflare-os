@@ -18,7 +18,7 @@ import {
   canonicalizeMarkdownReplacement,
   computeReplaceOperations, docTabToMarkdown, markdownToDocRequests, MARKDOWN_RENDERING_VERSION,
   type DocTabSnapshot, type EditableMarkdown,
-} from "./markdown-converter";
+} from "./markdown-replay";
 import { obsContext } from "./observability.js";
 import { explainUnopenedFile } from "./office-conversion";
 import { PendingActionStore } from "./pending-actions";
