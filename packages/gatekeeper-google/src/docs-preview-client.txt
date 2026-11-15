@@ -675,7 +675,7 @@ async function showImages(slots, current) {
 // ---------------------------------------------------------------------------------------------
 // Loading and refreshing
 
-let tabs = null;
+let tabs = [];
 let tabId = null;
 let loaded = false;
 let generation = 0;
@@ -719,13 +719,17 @@ function renderTabs() {
     button.style.marginLeft = `${tab.nestingLevel * 12}px`;
     button.setAttribute('aria-pressed', String(tab.id === tabId));
     button.addEventListener('click', () => {
-      tabId = tab.id;
-      loaded = false;
-      shown = new Set();
+      selectTab(tab.id);
       renderTabs();
       void load();
     });
   }
+}
+
+function selectTab(id) {
+  tabId = id;
+  loaded = false;
+  shown = new Set();
 }
 
 function showLoading() {
@@ -743,11 +747,16 @@ async function load() {
   if (loaded) statusLine.textContent = 'Updating…';
   else showLoading();
   try {
-    if (!tabs) {
-      tabs = await gadget.listTabs();
-      tabId ??= tabs[0]?.id;
-      renderTabs();
+    // Listed each time: a tab can be added, discarded or renamed between two drawings. An added
+    // tab is listed under another ID once Google has it, so the one shown is found by its title.
+    const title = tabs.find(tab => tab.id === tabId)?.title;
+    tabs = await gadget.listTabs();
+    if (current !== generation) return;
+    if (!tabs.some(tab => tab.id === tabId)) {
+      selectTab((tabs.find(tab => tab.title === title) ?? tabs[0])?.id);
+      showLoading();
     }
+    renderTabs();
     // One read: the tab as saved, the tab with its pending changes, and those changes.
     const { savedMarkdown, markdown, changes } = await gadget.getPendingChanges(tabId);
     if (current !== generation) return;
@@ -809,8 +818,6 @@ async function load() {
   } catch (error) {
     if (current !== generation) return;
     statusLine.textContent = '';
-    // A tab that has gone needs the list again.
-    tabs = null;
     showError(error, load);
   }
 }

@@ -4,7 +4,7 @@
 import { afterEach, expect, it } from 'vitest'
 import DOCS_PREVIEW_CLIENT from '../../../../gatekeeper-google/src/docs-preview-client.txt?raw'
 
-type Doc = { savedMarkdown: string, markdown?: string, styles?: object }
+type Doc = { savedMarkdown: string, markdown?: string, styles?: object, tabs?: string[] }
 
 let frame: HTMLIFrameElement | undefined
 
@@ -13,8 +13,14 @@ afterEach(() => frame?.remove())
 /** Draws `doc` and resolves to the frame's document once the page has its blocks. */
 async function draw(doc: Doc) {
   const gadget = {
-    listTabs: async () => [{ id: 't.0', title: 'Tab 1', index: 0, nestingLevel: 0 }],
-    getPendingChanges: async () => ({ changes: [], markdown: doc.savedMarkdown, ...doc }),
+    listTabs: async () => (doc.tabs ?? ['t.0']).map((id, index) =>
+      ({ id, title: `Tab ${index + 1}`, index, nestingLevel: 0 })),
+    getPendingChanges: async (tabId: string) => {
+      if (!(doc.tabs ?? ['t.0']).includes(tabId)) throw new Error(`no tab with ID "${tabId}"`)
+      // With several tabs, each reads as its own ID.
+      const savedMarkdown = doc.tabs ? `${tabId}\n` : doc.savedMarkdown
+      return { changes: [], markdown: savedMarkdown, ...doc, savedMarkdown }
+    },
     getStyles: async () => doc.styles ?? Promise.reject(new Error('no styles')),
     listImages: async () => [],
   }
@@ -132,4 +138,18 @@ it('draws a page break as the gap between two sheets', async () => {
 
   expect(page.querySelectorAll('.break')).toHaveLength(1)
   expect(page.textContent).toBe('BeforeAfter')
+})
+
+it('lists the tabs again on a refresh, and leaves a tab that has gone for the first', async () => {
+  const { page, refresh } = await draw({ savedMarkdown: '', tabs: ['t.0', 'pending-tab-1'] })
+  const buttons = () => [...frame!.contentDocument!.querySelectorAll<HTMLElement>('#tabs button')]
+  buttons()[1].click()
+  await expect.poll(() => page.textContent).toBe('pending-tab-1')
+
+  // The tab's add was discarded.
+  await refresh({ tabs: ['t.0'] })
+
+  await expect.poll(() => page.textContent).toBe('t.0')
+  expect(buttons()).toHaveLength(0)
+  expect(frame!.contentDocument!.getElementById('error')).toBeNull()
 })

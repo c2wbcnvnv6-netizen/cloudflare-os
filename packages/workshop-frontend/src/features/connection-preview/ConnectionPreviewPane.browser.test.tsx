@@ -173,13 +173,13 @@ it('reads the document through the connection session and redraws when an action
   doc.markdown = `${doc.markdown}\n${DRAFTED}`
   doc.changes = [...doc.changes, { id: 12, type: 'appendText', markdown: DRAFTED }]
   emit(action(2))
-  await expect.poll(() => doc.calls).toEqual([...opened, 'getPendingChanges'])
+  await expect.poll(() => doc.calls).toEqual([...opened, 'listTabs', 'getPendingChanges'])
   await expect.element(page.getByText('2 changes waiting')).toBeVisible()
 
   // The preview's own reads come back as observations on this connection, and must not redraw it.
   emit(action(3, { type: 'observation' } as Partial<ActionLogEntry>))
   await new Promise(done => setTimeout(done, 600))
-  expect(doc.calls).toEqual([...opened, 'getPendingChanges'])
+  expect(doc.calls).toEqual([...opened, 'listTabs', 'getPendingChanges'])
 
   // Apply is the Workshop's, outside the frame, and takes the oldest change first.
   await page.getByRole('button', { name: 'Apply' }).click()
