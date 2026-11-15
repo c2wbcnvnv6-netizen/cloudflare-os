@@ -1559,11 +1559,19 @@ checks this one reads the stored binding rather than the shape of the IDs, so it
 consumer that supplies no classifier.
 
 `createSimulationView` sorts once by action ID, indexes each action under every target it affects
-(deduplicated per record), and returns frozen snapshots. `replaySimulation` folds records in
-order; `known-no-effect` continues, and the first `unsupported` stops replay, because projecting
-later actions onto a state already known to be wrong produces confident nonsense. Provider
+(deduplicated per record), and returns frozen snapshots. It is the index the simulation store
+(§4.26) reads: a store folds `forTarget(id)`, the records of one entity, and holds no index of its
+own. Its `targets` function is where an id is resolved through `ProvisionalIds` when a pending
+create will make the entity, so that the records queued under the provisional id and those queued
+under the provider's id fold as one entity. `replaySimulation` folds records in order;
+`known-no-effect` continues, and the first `unsupported` stops replay, because projecting later
+actions onto a state already known to be wrong produces confident nonsense. Provider
 reducers stay in each gatekeeper as pure functions; the kit deliberately ships no generic
-collection overlay and no recursive ID substitution.
+collection overlay and no recursive ID substitution. What it does share around those reducers
+(`./simulation-store`, §4.26) is the fold of one entity, its memory, the report of what was
+refused, a stored base read one partition at a time, and the stand-in, hide and resolve mechanics
+a listing needs. What it does not share is any filter, order or page: those stay each
+gatekeeper's.
 
 `targets` returns an array, not an `Iterable<Target>`. Every simulating gatekeeper's target is a
 scalar string — notion's `actionPageId(action): string | null`, linear's `issueRef: string`,
@@ -2517,6 +2525,395 @@ Until then the escape hatch is the storage itself: the records live nowhere else
 read them directly, and may delete all of its storage at once, disposing each `caps:` record's
 stubs as it does. It must not delete one hook's records alone: only `remove()` also ends the hook's
 queued deliveries, which would otherwise reach it when it is enabled again.
+
+### 4.25 `./chunked-value`
+
+```ts
+export const CHUNKED_VALUE_CHUNK_BYTES = 1024 * 1024;
+export type ChunkedValueStorage = { readonly kv: KvScannable;
+  transactionSync<T>(callback: () => T): T };
+export type ChunkedValuesOptions = { readonly prefix: string; readonly chunkBytes?: number };
+export type ChunkedValue = { readonly bytes: Uint8Array; readonly meta: unknown };
+export class ChunkedValues {
+  constructor(storage: ChunkedValueStorage, options: ChunkedValuesOptions);
+  put(name: string, bytes: Uint8Array, meta?: unknown): void;   // `${prefix}${name}:chunk:0000`
+  get(name: string): ChunkedValue | undefined;                  // and `${prefix}${name}:manifest`
+  meta(name: string): unknown;                                  // reads the manifest alone
+  delete(name: string): void;
+  transaction<T>(run: () => T): T;
+}
+```
+
+`ChunkedValues` holds named byte values in a Durable Object's synchronous KV for state that can
+pass the size of one KV value and is read inside `transactionSync`, such as a stored copy of a
+provider document that a rejected change's transaction replays the rest of the queue over.
+
+**`ActionFileStore` is not reused.** Its read awaits a SHA-256 digest, it mints its own handles, a
+file is written once, and a damaged file throws (§4.17). This store's reads are synchronous, names
+are the caller's, a value is replaced in place, and an incomplete value is a miss, which is what a
+cache wants. The two share the key layout (a manifest and four-digit chunk keys under one prefix)
+and the one-MiB chunk. Like the Workshop's git object store
+(`packages/workshop-backend/src/git-chunked-blob.ts`), it writes chunks before the index and checks
+each chunk's size against the index on read. Unlike it, which checks a chunk as that chunk is
+read, this store checks every chunk before it returns any byte.
+
+**One transaction per put.** The chunks are written first, each copied as it is written; then the
+earlier value's chunks beyond them are removed, found by a scan that starts after the last chunk
+written and so reads only keys that are going away, whatever the earlier manifest says; the
+manifest goes last. A reader finds the earlier value or the later one whole, a put that fails
+leaves the earlier value as it was, and a smaller value put over a larger one leaves no chunk
+behind. `delete` is one transaction too.
+
+**Bytes, not objects.** A stored object read back and put again is stored larger than it was;
+bytes are stored as they are. Each chunk goes into a buffer of its own, because storage keeps a
+view's whole underlying buffer and every chunk would otherwise store the whole value.
+
+**Names are well-formed Unicode and carry no `:`.** With no `:` in a name, the first `:` after the
+prefix ends it, so no two names share a key and one name's chunk scan never covers another's.
+Well-formed, because a scan returns a key holding a lone surrogate changed, so the chunks under it
+could never be found to remove. Every method throws for any other name. A name's length is left to
+storage's own bound on a key together with its value, which only a name of a chunk's order of size
+could reach and which fails the put whole.
+
+**A read never throws for what is stored.** Every chunk is validated against the manifest before
+the value is allocated, and a manifest's chunk size is bounded by the largest any store writes, so
+a foreign record under a value's keys reads as missing instead of failing an allocation.
+
+**No digest.** A digest needs `crypto.subtle`, which is asynchronous. Storage is transactional;
+sizes catch a partial or foreign record.
+
+**A value has at most 10,000 chunks**, the indexes four digits can number: about 9.8 GiB at the
+default chunk size, which is also the largest. A put that needs more throws before writing.
+
+`transaction()` is for a caller that writes several values as one, as `StoredBase` (§4.26) does for
+a copy's partitions and index. The local runtime accepts a single value larger than the deployed
+limit, so the workerd test cannot show chunking by a refusal and asserts the size of every stored
+chunk instead.
+
+### 4.26 `./simulation-store`
+
+```ts
+export type EntityStep<Entity, Refusal = never> =
+  | SimulationStep<Entity>                              // applied, known-no-effect, unsupported
+  | { kind: "deleted" }
+  | { kind: "refused"; refusal: Refusal };
+export type EntityContext<Id extends string, Base extends object, Refusal> = {
+  readonly id: Id;
+  readonly base: Base | undefined;
+  readonly refusals: readonly Refusal[];                // of this call, oldest first
+};
+export type SimulationStoreOptions<Id extends string, Base extends object, Entity,
+  R extends SimulationRecord<unknown>, Refusal = never> = {
+  readonly initial: (base: Base) => Entity;
+  readonly reduce: (entity: Entity | undefined, record: R,
+    context: EntityContext<Id, Base, Refusal>) => EntityStep<Entity, Refusal>;   // pure
+};
+export type EntityFold<Entity, R, Refusal> = {
+  readonly entity: Entity | undefined;
+  readonly refused: readonly { readonly record: R; readonly refusal: Refusal }[];
+  readonly stopped?: { readonly record: R; readonly reason: string };
+};
+export type SimulationStore<Id extends string, Base extends object, Entity,
+  R extends SimulationRecord<unknown>, Refusal = never> = {
+  readonly fold: (id: Id, base: Base | undefined, records: readonly R[])
+    => EntityFold<Entity, R, Refusal>;
+  readonly forget: (id?: Id) => void;
+};
+export function createSimulationStore<Id extends string, Base extends object, Entity,
+  R extends SimulationRecord<unknown>, Refusal = never>(
+  options: SimulationStoreOptions<Id, Base, Entity, R, Refusal>,
+): SimulationStore<Id, Base, Entity, R, Refusal>;
+
+export type HeldBase<Part> = {
+  readonly keys: readonly string[];                     // in `encode`'s order; decodes nothing
+  part(key: string): Part | undefined;                  // decoded on first use
+  readonly fetchedAt: number;
+  readonly revision?: string;
+};
+export type StoredBaseOptions<Base, Part> = {
+  readonly values: ChunkedValues;
+  readonly name: string;                                // letters, digits, `_` and `-`
+  readonly formatVersion: number;
+  readonly encode: (base: Base) => ReadonlyMap<string, Uint8Array>;   // one entry per partition
+  readonly decode: (key: string, bytes: Uint8Array) => Part;          // one partition
+  readonly fetch: () => Promise<{ base: Base; revision?: string }>;
+  readonly ttlMs: number;
+  readonly unchanged?: (revision: string) => Promise<boolean>;
+  readonly now?: () => number;
+};
+export class StoredBase<Base, Part> {
+  constructor(options: StoredBaseOptions<Base, Part>);
+  current(): Promise<HeldBase<Part>>;
+  held(): HeldBase<Part> | undefined;                   // synchronous, for transactions
+  noteWrite(): void;
+  recheck(): void;
+  drop(): void;
+}
+
+export type SimulatedListOptions<Id extends string, Row extends object,
+  R extends SimulationRecord<unknown>> = {
+  readonly store: SimulationStore<Id, Row, Row, R, unknown>;
+  readonly view: () => SimulationView<R, Id>;           // §4.9's view; read at every fold
+  readonly id: (row: Row) => Id;
+  readonly compare: (a: Row, b: Row) => number;
+  readonly keeps?: (row: Row) => boolean;               // the gatekeeper's filter
+  readonly created?: () => readonly Id[];               // provisional ids of pending creates
+};
+export type SimulatedList<Row> = {
+  readonly overlay: (row: Row) => readonly Row[];
+  readonly inject: {
+    readonly items: readonly Row[];
+    readonly compare: (a: Row, b: Row) => number;
+    readonly revalidate: (row: Row) => Row | null;
+  };
+  readonly refresh: () => void;
+};
+export function simulatedList<Id extends string, Row extends object,
+  R extends SimulationRecord<unknown>>(
+  options: SimulatedListOptions<Id, Row, R>,
+): SimulatedList<Row>;
+```
+
+Three things a gatekeeper that replays pending actions needs around its own reducer, and nothing of
+the reducer itself: a fold of the pending records over one entity at a time that remembers each
+entity's fold (`createSimulationStore`); a stored, revision-checked base read one partition at a
+time (`StoredBase`), for a gatekeeper whose base is bounded; and the values a kit cursor takes for a
+listing whose rows are such entities (`simulatedList`). The fold and the stored base are
+independent: neither uses the other. The list hooks sit on the fold.
+
+The fold:
+
+**One fold, per entity.** State is keyed by the provider's own id of an entity: a document's tab, a
+grid, a deck, an incident, a message. It is never a connection's or a session's id, so an entity is
+the same entity whichever connection or session reads it. A record declares the entities it targets
+through the view (§4.9), a read folds only the records that target what it reads, and a record that
+targets several entities is folded for each, by the call that folds that entity. Each of those folds
+stands alone: refused on one entity, the record still applies to the others until the caller leaves
+it out or removes it, so a caller whose record must take effect on all of its entities or none folds
+the entity that can refuse it first and leaves what that fold refused out of the lists it folds
+next. The store holds no index and no resolver: the view is the one index and `ProvisionalIds` the
+one resolver. An editor whose state is one thing folds it as its one entity.
+
+**One queue.** Action ids are private to the queue that issued them. The fold takes records in the
+order that one queue gives and compares no id across queues, so the store has no way to fold the
+records of two queues together, by design: ids say nothing about the order between two queues'
+records.
+
+**Five steps.** `reduce` is given one entity, or `undefined` for one the provider does not hold and
+no earlier record made, and one record:
+
+| Step | The entity | The fold |
+|---|---|---|
+| `applied` | becomes the step's value | goes on |
+| `deleted` | becomes `undefined`, as for an entity the provider does not hold | goes on; a later record may create it again |
+| `refused` | stays as it was | goes on; the result's `refused` lists the record with its refusal |
+| `known-no-effect` | stays as it was | goes on |
+| `unsupported` | stays as it was | stops; the result's `stopped` names the record and the reason |
+
+A pending create is the record that returns the entity as `applied` when given `undefined`, under
+the provisional id the create was given.
+
+**A refusal carries no entity.** A refused record leaves the entity exactly as it was, so a fold
+remembered with a refused record in it equals a fresh fold of a list the record was left out of.
+That equality is what lets the caller mark the record and leave it out, or remove it, and pay
+nothing at the next fold. A step that refused a record and changed the entity as well (the refusal
+recorded in the state) would make the memory wrong as soon as the record left the list.
+
+**`context.refusals` may only make a reducer refuse.** A gatekeeper whose failures close a gate (a
+later record depends on an earlier one having applied) reads the refusals the call has recorded on
+the entity so far, and refuses. They are the call's alone and are not remembered: a later call
+starts with none, because the refused records have by then left the list. So a step that applies,
+deletes or has no effect must be the same whatever they hold, or a remembered fold would differ from
+a fresh one.
+
+**Memory is per entity**: the latest fold over each base object, and the latest fold of each entity
+folded with no base, held by its id. A fold is extended by a suffix when the same base object is
+folded for the same entity with a list that begins with the remembered records, by id and in order,
+once the remembered records the store refused that the list does not carry are set aside. Anything
+else folds that entity from the beginning, and nothing one entity's records do reaches another
+entity's memory. Each rule of the memory is either one the caller keeps or a check the store makes:
+
+| Rule | Kept by | Why |
+|---|---|---|
+| A record is its id | the caller | The store compares ids and nothing else, so it cannot see a record's content change. A marked record is one the caller leaves out of the list, which the id match sees |
+| The latest fold of each base object is remembered, not of one base alone | a check | Every remembered fold is matched record by record against the list it is given. A record one base's fold refused, once marked and left out, breaks the match of a fold over another base that applied it |
+| A refused record that is left out or removed keeps the memory | a check | The match sets aside the refused records the list does not carry. Any other record left out breaks the match of its own entity, which is folded afresh, and a refused record presented again is folded, and refused, again |
+| No `forget()` after a submit, a mark, an apply or a reject | a check | A record added at the end extends the fold, and a record removed breaks the id match of its own entity only |
+| `forget()` after any other rewrite of a record, and when an id may be given to another record | the caller | Neither shows in the ids the store compares |
+| A reducer returns `known-no-effect` or another value, never its input as `applied` | a check | `fold` throws on it (below) |
+
+**The store reads no mark, and has no option for one.** A record the gatekeeper has marked as not to
+be replayed is one it leaves out of the list, and the store reduces every record it is given. That
+serves a gatekeeper that marks a record in place and one whose journal removes a failed record
+alike. An option naming the mark would have had the first as its one caller, and it would have
+bought nothing: the id match already sees a record that is left out.
+
+**`forget` is owed in three cases.** When a record is rewritten under its id in a way `reduce`
+reads. When a folded record's id may be given to another record: a candidate folded and then not
+stored, or a submit whose transaction rolled back, since a journal that counts ids in storage gives
+such an id to the next record. And, as `forget(id)`, for an entity folded with no base once its id
+will not be folded again (its create was rejected, or was applied and the provider's id took its
+place), since such a fold has no base object to be released with. `forget(id)` drops that fold and
+only that: a fold over a base object goes with the object.
+
+**A base is its object, remembered weakly.** The memory of a fold over a base is keyed by the base
+object, so a fold is never served for another base, however equal the two look, and the lookup costs
+nothing. A fold is held only while its base is otherwise alive, although an entity usually reaches
+its base, so the fold of a base fetched for one read dies with it.
+
+**The store takes no callback.** A hook asked what to do with a record that cannot be replayed would
+either run again on a remembered fold (so it must be idempotent, and its durable effect can be
+undone by a rollback the store never sees) or not run (so a remembered fold differs from a fresh
+one). A `refused` step needs none of that: the fold stays pure, the memory equals a fresh fold
+because nothing but the reducer made it, an earlier refusal reaches the records judged after it
+through `context.refusals`, and the gatekeeper marks the records after the fold, from the result's
+`refused`.
+
+**`unsupported` stops the fold**, as `replaySimulation` does, and the stop is remembered: a later
+fold of the same entity over the same base whose records begin with those up to the stop returns it
+without reducing anything.
+
+**A reducer that hands its entity back as applied is refused.** An `applied` step whose value is the
+object `reduce` was given makes `fold` throw. A reducer that changed that object in place would
+otherwise look right on every remembered fold and wrong on every fresh one, and the memory would
+hide it. The guard goes no further: a reducer that changes its entity in place and returns another
+object around it is not caught, so `reduce` being pure stays the caller's to keep.
+
+**A throw leaves the memory as it was**, and a `forget()` with no id during a fold wins: that fold
+is not remembered.
+
+The stored base:
+
+**Storage is the truth, one partition at a time.** The index is the meta of the value named `name`,
+whose bytes are empty: `{ version: 2, formatVersion, stamp, fetchedAt, revision?, partitions: { key,
+digest }[], checkedAt?, stale? }`. `stamp` is random per stored fetch, `partitions` lists every
+partition in `encode`'s order with the lowercase hex SHA-256 of its bytes, and a partition is the
+value `${name}/${encodeURIComponent(key)}`. A partition is loaded when it is read: `decode` runs for
+one key, on first use, from the stored bytes. The decoded object is remembered and served only for
+the digest of the bytes it was decoded from, so everything works after an eviction, and a `drop()`
+that a caller's transaction undoes gives the same objects again. A record under the index name that
+is not an index of this version reads as no copy.
+
+**A digest per partition.** A fetch that brings a partition the bytes the stored index already lists
+for its key does not put it again, and that partition keeps its decoded object: across reads, across
+the fetch, and across a `noteWrite()` or a `drop()` and the fetch after it. So a fold a simulation
+store remembers over one partition survives a fetch that changed another, and the fetch after a
+noted write puts only what the write changed. It rests on `encode` giving a partition the
+same bytes whenever its content is the same. The digests are computed with the fetch, since
+`crypto.subtle` is asynchronous; storing, `held()` and `part()` hash nothing, and no read compares
+stored bytes with a digest (§4.25).
+
+**A `HeldBase` is a view of what is stored.** It holds the keys and digests of the index it was made
+from and no bytes, so a large base is not held twice. A partition is served only while storage still
+holds this copy's bytes for it (the stored index lists the key with this copy's digest, and carries
+no stale mark) or its decoded object is remembered. A copy held across a later fetch, a
+`noteWrite()` or a `drop()` therefore never serves the later copy's bytes and may serve none, which is why a caller reads the partitions it wants
+before it awaits. The decoded objects kept are those of the stored copy's keys: storing a fetch
+forgets the object of every key the stored copy does not list, so a base whose partitions come and
+go does not leave one decoded object per key ever seen.
+
+**`held()` reads the index only**, so it does not prove every partition readable: a partition is
+read when `part` asks. Nothing the class does changes a partition without replacing the index, so a
+listed partition is missing only if storage was damaged.
+
+**A copy that cannot be read is absent.** A copy of another format version reads as none. A
+partition of the stored copy that is missing, incomplete or that `decode` throws for shows when it
+is asked for, as `part()` answering `undefined`; from then `held()` answers `undefined` and the next
+`current()` fetches and puts every partition, whatever its digest. Neither throws inside a
+transaction.
+
+**Age moves by the index alone.** A confirmed revision, a forced recheck and a stale mark each put
+the index again; a partition's bytes are put only by a fetch that brought other bytes for its key.
+
+**What is served is what was stored**: `decode` of a partition's stored bytes, never the fetched
+object, so a read before an eviction and one after it agree. A fetched base is not decoded before it
+is stored.
+
+**One transaction per fetch.** Partitions the earlier copy listed and the fetched one lacks are
+removed, each partition whose bytes are not the stored ones is put and the index goes last, so a
+reader finds the earlier copy or the later one whole.
+
+**Fetching and keeping are two steps.** Inside the class a fetch is encoded and digested in one step
+and stored in a second, so that a caller that must check what was fetched before it is kept can
+later be given the two; nothing public sits on them, because no caller needs them and the kit takes
+a public symbol only for behaviour that has one.
+
+**An epoch** that `noteWrite()`, `recheck()` and `drop()` advance: an answer that began earlier is
+neither stored nor served. With it the three forget the flight in progress, because a flight that
+has answered stays joinable for a moment, and a read made after a write must never join one from
+before it. Callers of superseded work share the one fetch that follows.
+
+**`held()` does not judge age, and returns no copy a write was noted after.** Such a copy lacks
+what the provider holds, and a rejection that replayed over it would refuse records that quote the
+write. `noteWrite()` therefore retires the copy for every reader (`held()`, and the partitions of a
+copy handed out earlier that were not yet decoded) and keeps its bytes and digests stored, because
+the fetch after a write is the commonest one and usually brings most partitions as they were: it
+stores again only those the write changed. `drop()` removes the bytes too, for a copy that is wrong
+rather than outdated, and the fetch after it stores every partition.
+
+**Cleanup reads only the stored record's `partitions`**, whatever else the record holds and whether
+an entry is a key or an object holding one, so a later index version must keep that field in one of
+those shapes. The limit: a record under the index name that lists no partitions leaves any
+partitions beside it in storage, which neither a fetch nor `drop()` removes.
+
+The list hooks:
+
+**This is not the generic collection overlay §4.9 declines.** `simulatedList` is the mechanics a
+listing needs when its rows are entities of a simulation store, as the values a kit cursor's
+`inject`, `overlay` and `refresh` take (§4.11): the stand-in of a pending create, folded from
+nothing with the records that target its provisional id; the per-row fold of a provider row; hiding,
+since a row a pending record deleted is served as no row; and revalidation, which answers a stand-in
+as the last refresh left it and drops one whose create is not pending. It is not an overlay of a
+collection. It holds no filter, sort or page. It does not decide which provider rows to read again
+or where they are placed. And it neither touches nor imports `./cursors`: it produces values for
+three of a cursor's options and leaves `authorize` and `identity` for the gatekeeper to add.
+
+**Listing policy stays in the gatekeeper**, because the policies of the two listings these mechanics
+were read from share nothing, while the mechanics around them are the same. One lists
+incidents: it filters by status, urgency and service, reads again the incidents its pending actions
+touch, since the provider filters before those actions apply and can leave one out, and injects
+those that still match at their sort position. The other lists messages: it filters by folder,
+reads the rows pending moves bring into the folder with its first page, and lists them first. So
+`keeps` and `compare` are the gatekeeper's functions, which the adapter calls and does not
+implement, and a row the gatekeeper reads itself goes through `overlay` like any provider row.
+There is no option for such rows: which they are and where they go is the policy.
+
+**A list gatekeeper builds its store with its listing**, because its reducer reads the caller: who
+is asking, the folder listed, names read ahead of the walk (the reducer is synchronous). The memory
+then lives for the walk, which is where it pays: a row is folded again at every retry of a refused
+page, and the stand-ins at every `next()`.
+
+**The adapter keeps no view.** `view` is read at every fold, so when pending records are read again,
+and when their provisional ids resolve, stays the gatekeeper's choice. `inject.items` is fixed when
+the hooks are made, since a cursor reads it once, and `refresh()` forgets the fold of a stand-in
+whose id left `created`, which is the `forget(id)` the memory asks for.
+
+Who uses what:
+
+| | Entities | Stored base | List hooks | Status |
+|---|---|---|---|---|
+| Docs | a tab; and the tab tree as one outline entity, which a pending tab create targets beside its provisional tab id | the bound document's copy: a partition per tab and one for the outline | none | planned |
+| Sheets | one: the grid | none: cells are unbounded and fetched by range | none | planned |
+| Slides | one: the deck | later, once it loads per slide | none | planned |
+| PagerDuty | incidents | none | the incident listing | planned |
+| Outlook | messages | none | the message listing | planned |
+
+A list gatekeeper that moves onto the store serves what its own overlay serves only under these
+conditions, which are rules of the store and its adapter:
+
+- A pending create targets its provisional ref only while the ref is unresolved. Once the provider
+  has named the entity, the records behind the ref target that id, and the create targets nothing,
+  so it is never reduced onto the provider's row.
+- A gatekeeper whose overlay resolves provisional ids when a row is served builds its view on each
+  call (the adapter reads `view` at every fold and keeps none), so that a row is folded with the ids
+  as they are then.
+- A gatekeeper whose overlay is not an in-order fold of a row's records (one that compares a pending
+  move with the folder the provider reports, or ranks its pending rows) writes its reducer to that
+  result. The overlay's body does not become the reducer as it is, and a sequence whose answer
+  depends on more than the row and its records in order is outside what the fold computes.
+
+**Left out**: the queueing around a file's changes (gating reads against resolution, preparing one
+change at a time, applying in order, restarting on a reject), which is not part of this leaf.
 
 ## 5. Layer 2: the assembly
 
