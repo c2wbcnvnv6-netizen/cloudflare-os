@@ -81,7 +81,7 @@ Across all resource types, the gatekeeper can request:
 
 - `openid`, `userinfo.profile`, and `userinfo.email` to identify the connected account.
 - `gmail.modify` for Gmail thread reads, organization, replies, forwards, and sending. This single scope already includes label access and sending.
-- `documents` for direct Google Docs reads, edits, comments, and creation; `documents.readonly` for native Docs opened from account-wide, folder, or exact-file Drive bindings. Appending and replacing text in a bound Doc can be auto-approved ("Document edits"), and so can adding a tab ("New document tabs") and its comment writes ("Google Doc comments"), which go through the Docs API under this scope (see [Google Doc comments](#google-doc-comments)).
+- `documents` for direct Google Docs reads, edits, comments, and creation; `documents.readonly` for native Docs opened from account-wide, folder, or exact-file Drive bindings. Appending and replacing text in a bound Doc, in table cells too, can be auto-approved ("Document edits"), and so can every table change ("Table changes"): adding and deleting tables, rows and columns, restyling cells, sizing columns and rows, and merging and splitting cells, which the Doc's version history undoes. So can adding a tab ("New document tabs") and its comment writes ("Google Doc comments"), which go through the Docs API under this scope (see [Google Doc comments](#google-doc-comments)).
 - `drive.metadata.readonly` so the Drive picker can browse to a Doc, spreadsheet or presentation connected on its own, and so a bound Doc can read whether the connected account may comment on it. Google classifies this as a restricted scope. Docs, Sheets and Slides share the Google Drive connect card with the Drive resources, and the Workshop asks for every type on a card together, so connecting any of them also asks for the other types' scopes, `drive.readonly` among them.
 - `drive.readonly` for account-wide, folder, and exact-file Drive bindings: the Drive picker, discovery, file metadata, folder descendant proofs, native-file scope checks, downloading a PDF to read its text with `readPdf()`, and downloading any other file's bytes with `readFile()`. Google classifies this as a restricted scope too, so every Drive resource here needs restricted-scope verification.
 - `drive.readonly` and `drive.file` for the Office import grant (`https://docs.google.com/import`), which converts an Office file into a Google Docs, Sheets or Slides copy (see [Office files](#office-files)). Only the connect dialog's **Convert** button asks for it, by incremental consent, the first time an account converts a file; using a copy made before reads only metadata and asks for nothing. Once held, it is part of the account's recorded grants, so a reconnect asks for it again. `drive.readonly` lets the gatekeeper see a source file this OAuth client did not create, which `drive.file` alone cannot, and `drive.file` lets it create the copy. The grant is private to the gatekeeper: it is not a resource, so it is never offered on connect, listed, bound, or shown among an account's granted resources, and admins cannot turn it off separately from Docs, Sheets and Slides. Once held, `drive.readonly` lets the account's token read any Drive file, so bindings stay limited by the gatekeeper's code rather than by the token. A verified OAuth app must add both scopes to its consent screen, and `drive.readonly` is a restricted scope.
@@ -374,6 +374,373 @@ where it can be converted. An Office file bound any other way is refused with a 
 the dialog: by Sheets and Slides when they cannot open it, and by Docs on connecting, since Docs
 reads it. An Office file already bound as a Doc answers each approved edit with the same message.
 
+## Google Docs edits
+
+A `.docx` or other Office document cannot be bound; connecting one makes a native copy (see
+[Office files](#office-files)). A directly bound Doc accepts fourteen changes, each call queued for
+approval as one change: `replaceText()` and `appendText()` edit one tab's Markdown,
+`insertTable()`, `insertTableRows()`, `insertTableColumns()`, `deleteTableRows()`,
+`deleteTableColumns()`, `deleteTable()`, `mergeTableCells()` and `unmergeTableCells()` change a
+tab's tables, `setTableCellStyle()`, `setTableColumnWidths()` and `setTableRowHeights()` change
+a table's look, and `addTab()` adds a tab, which reads as an empty tab and takes every other
+change while its add waits. Changes apply in the order they
+were queued. Calls on one document take effect in the order they are made, whether or not the
+caller awaits each before the next: a write waits for the writes before it, and so does a read that
+shows queued changes (`getContent()`, `listTabs()`, `getMetadata()`). A Doc opened from a read-only
+Drive binding has none of the write methods; one opened from a read and write Drive binding has
+all of them but `addTab()` (see
+[Editing Docs, Sheets and Slides](#editing-docs-sheets-and-slides)).
+
+`getContent()` shows a table as HTML. A replacement that lies inside one table changes the text of
+its cells' paragraphs, headings and list items, in one cell or several, written in that HTML:
+`&amp;`, `&lt;` and `&gt;` for `&`, `<` and `>`, `<br>` for a line break within a paragraph, and
+`<strong>`, `<em>`, `<s>` and `<a href>` for bold, italic, strikethrough and links. Everything else
+in the table has to stay as it is, so a replacement cannot add or remove paragraphs, list items,
+cells, rows or columns, change the table's look, or change a table together with the text around
+it. The characters
+a replacement keeps are not rewritten, and the only formatting sent for them is the bold, italic,
+strikethrough or link the replacement changes. A link that stays is never cleared, so a word
+corrected inside a link stays part of it, and a link pointed to another URL as a whole is only
+pointed there. New text takes the bold, italic, strikethrough and link the replacement gives it,
+and loses the characters Google removes from inserted text. Text a replacement leaves with no link,
+where it had one or was typed next to one, also loses the colour and underline Google gives a link,
+and nothing else of its look. A link to a heading that does not exist fails when the change is
+approved, and writes nothing.
+
+Google stores bold, italic or strikethrough written into a paragraph whose named style already
+gives it as inherited, and a read shows only the formatting text sets itself, so such formatting
+reads without its tag once the change is applied: italic written into a Heading 6, bold into a
+heading the document's owner made bold, in a cell or outside tables. The read of a waiting change
+shows it so too, so that the changes queued behind it find their tables as they will be. Text a
+replacement does not rewrite keeps such formatting where it has it, as text given it before its
+paragraph took that style does. The copy of the document that changes are made in (see below) holds each
+paragraph's named style, a title's and a subtitle's included, with the queued changes made in it,
+so a replacement is checked the same with changes waiting as with none. A subtitle reads as italic only where its named style makes it so.
+
+A paragraph break written inside a paragraph outside tables is accepted: the text after the break
+becomes a normal paragraph and reads as normal text reads it, also where the normal style gives
+the bold, italic or strikethrough that text had, which then reads without its markers. Inside a
+subtitle, a replacement that rewrites none of its formatting markers is refused where the text it
+writes, apart from what it does not rewrite, starts after the start of the subtitle's line and ends
+in new text followed by a break before the subtitle's end, and the refusal says to write the break
+at the subtitle's end or to replace the whole subtitle. Where such text starts the line, it is
+written ahead of the subtitle as paragraphs of its own, and the text after the break stays the
+subtitle. A break written there any other way is taken as in any paragraph.
+
+The HTML also shows a table's look, the parts of it a request can set: each cell's shading,
+vertical alignment, padding and borders as `style` on `<td>`, each fixed column width in a
+`<colgroup>` line after `<table>`, and each row's least height as `style` on `<tr>`. A field Google
+leaves out reads as the default a table added through the API has (no shading, top alignment, 5pt
+padding, a 1pt solid black border), and a table that sets only these defaults, explicitly or not,
+reads as plain `<table>`, as one added with Insert › Table in Google Docs does. What most cells share is written once on `<table>`, each
+longhand separately, a tie going to the default, and a cell writes only what differs from it,
+`transparent` for an unshaded cell under a shaded table. Google stores an edge on both cells that
+share it, and both show it. A merged cell shows its block: its shading, alignment and padding are
+the top-left cell's, and its right and bottom borders those Google keeps on the block's last column
+and row. A cell that a merged cell covers shows no look.
+
+`setTableCellStyle()` sets the shading, vertical alignment, padding and borders of a block of
+cells. Values are checked when the call is made: a colour as `#rrggbb`, padding from 0 to 100pt and
+a border from 0 to 24pt wide, at most three decimals kept, though Google takes any padding,
+negative ones included. It is sent as one request for what is not a border, one for `border`, and
+one for each edge `borders` names, in that order, since Google applies a border to every cell a
+request reaches: the block's top edge is the top of its first row, and the edges between its rows
+the bottoms of all rows but its last. Google keeps an edge on both cells that share it, so an edge
+set on the block's outside changes the cell beside it too, and a later write wins. A request
+reaches the whole of every merged cell it reaches any part of and draws a border along the merged
+cell's outside, so the block has to hold every merged cell it takes in whole, and one that holds a
+merged cell cannot set the edges between its rows or columns. `setTableColumnWidths()` makes
+columns a fixed width, from Google's least of 5pt to 1,000pt, or has them share what the fixed ones
+leave of the page; the other columns keep theirs. `setTableRowHeights()` sets rows' least heights,
+from 0 to 1,000pt, sending only the height so a pinned header row stays pinned. A change to a
+table's look leaves the table's identity as it was, so a change queued behind it does not fail
+when it does.
+
+`mergeTableCells()` merges a block of at least two cells into its top-left one. Google joins the
+paragraphs of every cell into it, row by row, keeping their headings and list items, and a cell
+that is one empty paragraph adds none, the top-left one included; the others are left one empty
+paragraph. It also sets each merged row's least height to the height it renders at, which only
+Google knows, so the change sends the rows' heights again after it. The merged cell keeps the
+top-left cell's shading, alignment and padding. A block may hold a merged cell whole, but a block
+that takes in part of one is refused, as Google refuses it. Google also refuses a block that takes
+in a pinned header row together with a row below the header. No read shows which rows are pinned,
+but the copy of the document says which are, so the merge of such a block is refused when
+it is called, with or without earlier edits waiting. So that reads can show the
+merged cell exactly, the first version refuses a block where a cell other than the top-left one
+starts with a heading, a list item or a subtitle or holds a numbered list, where any cell holds a
+table, a footnote, a smart chip or an element the view does not show, or an empty paragraph beside
+others, or an empty top-left cell that is a heading or list item, and a table that holds
+suggestions.
+`unmergeTableCells()` splits a merged cell named by its top-left cell: its text stays there, and the
+cells it covered come back empty and editable. Google gives those cells the looks they kept while
+covered, which no read shows, so the change then sets each of them to the merged cell's look, the
+edges between them taking its top edge. Rows and columns that cross no merged cell can be added and
+deleted in a table that has some, and its merged cells move with their lines. One that crosses a
+merged cell is refused, naming it: Google grows a merged cell that lines are added through, gives
+lines copied from one its spans, and moves or shrinks one whose lines are deleted.
+
+A replacement outside a table is applied to the tab's paragraphs as Markdown. One that changes a
+table together with text outside it, or the blank line between a table and the paragraph beside it,
+is refused, and the refusal says to write text that goes above or below a table as a change to the
+paragraph on that side, and to use `insertTable()` and `deleteTable()` for a table as a whole. It
+names two spellings, as the `replaceText()` documentation does. A paragraph with text is quoted by
+its own characters, with the blank line and the table left out. An empty one (the paragraph Google
+Docs keeps before a table that opens a tab, between two tables, and after a table added with
+nothing after it) has no characters, so it is quoted as its empty line together with the blank line
+and the table's first or last characters, all unchanged, with the text put on the empty line
+(`\n\n<table` replaced by `## Results\n\n<table`).
+
+The blank line beside a table stays. The paragraph next to a table is removed by taking the blank
+line on the paragraph's other side with it.
+
+A list item replaced by nothing is removed with its paragraph, whether or not the replaced text
+holds the line break after it, so the items around it stay one list. A nested item's line starts
+with the indentation before its marker, which the replaced text may leave out only together with
+the line break (`- b` for the line `  - b`). Quoted from its marker with the line break (`- b\n`),
+the item is cut out of the Markdown as it reads, and the indentation left behind goes to the next
+line: an item there is nested that much deeper, or the change is refused where that passes the
+ninth level, and a blank line or the end of the tab there keeps a paragraph of those spaces.
+
+Two cases leave an empty paragraph in the removed item's place, which the read of the waiting
+change shows. The only item of its list, with a blank line on both sides, leaves one with or
+without the line break: to remove it, replace the item together with the blank line after it
+(`- a\n\n`), or, where the item is the last paragraph of the tab, together with the two line breaks
+before it (`\n\n- a`). And where the line break cannot go with the item (the item is the last
+paragraph of the tab, or stands before a table, behind an item of another level or list; or a line
+beside it holds an image, a smart chip or a footnote), the item's text and bullet go and its
+paragraph stays: quoted with its line break, the same removal is refused or leaves that paragraph
+too.
+
+A table is named by its position among the tab's tables, counting from 0, and its rows and columns
+from 0 too; `insertTable()` returns the position of the table it adds. A queued change to an
+existing table (rows or columns added or deleted, cells restyled, merged or split, widths or
+heights set, the table deleted) remembers how its table read
+when it was requested, and is kept to that table by one rule: it applies only while exactly one
+table of the tab reads so, wherever in the tab that table then is. So such a change is refused
+while another table of the tab reads the same (two empty tables, two that hold only the same header
+row): the refusal names the other table and says to make the two differ first, for example by
+changing the text of a cell with `replaceText()`. Such a replacement quotes the text above the
+table together with the cell, so that it matches once. Adding a table that reads like another is
+not refused, and neither is replacing the text of its cells. "The same" leaves out where a
+numbered list in a cell starts and the number of a footnote: both are counted through the whole
+tab, so an edit elsewhere moves them, and two tables that differ in nothing else would trade
+readings. Any number in square brackets counts as a footnote's, since the Markdown does not tell
+the two apart. It leaves out the table's look too, and so does what a change remembers: a
+collaborator restyling a table, resizing its columns or rows, does not fail the changes queued for
+it. A replacement written against a cell's `style` attribute is the exception, since it is found
+by its text: it no longer matches once the cell is restyled, so quote the text of cells, not their
+tags.
+
+A queued change whose table was edited meanwhile, that was built on a change since rejected, or
+whose table another table has come to read the same as, fails without writing and says so. When a
+queued change that adds or deletes rows, columns or a table, merges or splits cells, or replaces
+the text of cells fails, every change to an existing table queued after it on that tab fails with
+it, a change to its look included, since their tables were recorded with it applied. A new table
+and a text replacement queued after it do not fail with it, and a failed change to a table's look
+takes nothing with it. On a Doc's own connection a rejection is settled at
+once, by replaying what is still queued over the stored copy, so that it is never weighed together
+with another rejection or with a collaborator's edit; where none is stored, as after an approval
+whose reread of the document failed, the changes to existing tables of the rejected change's tab
+queued behind it fail instead. A Doc opened through Drive has no stored copy to replay over, and
+settles a rejection by a rule of its own (see
+[Editing Docs, Sheets and Slides](#editing-docs-sheets-and-slides)). That leaves two ways in which
+a collaborator can still
+send a change to another table between two reads: by moving the text that an earlier queued
+replacement was found by to the other of two tables that read the same (the replacement, and a
+change to its table queued behind it, then go to that table), or by changing one table and making
+another read exactly as it did.
+
+The cells of a table, row or column that is added take plain text, in which `\n` starts a paragraph
+and U+000B breaks a line. `insertTable()` puts the table after the paragraph, heading, list item or
+table that its `after` text ends in, or at the end of the tab. Google Docs keeps a paragraph on
+each side of a table, so one empty paragraph is added with it: after the new table, or between the
+two tables when it follows one. Every cell of a new table, and that paragraph, is reset to a normal
+paragraph with no list and no indent, in default text. A row or column added to a table takes the
+look of the cells beside it, as Google copies it: cell shading, alignment, padding, borders, font,
+size and colour, and the row's least height or the column's width.
+It never takes their bold, italic, strikethrough, links, list items or headings, so new cells read
+as plain paragraphs; a cell added beside one that starts with a heading or a list item is reset to
+default text, since the request that takes the heading off takes the rest with it. "Beside" is the
+row or column the new ones go before, or the last one when they go at the end. The header rows a
+table pins keep their count when a row is added beside one: Google would pin the new row as well,
+so the change pins the count again. A row added above a header row therefore becomes a header row,
+and the last of the rows that were pinned stops being one; the approval card does not say so, since
+pinning is not something the Markdown shows. Google copies a cell's borders as the cell stores them,
+so an edge it shares with the line beside the new one can read differently on its two sides. A
+column added beside one that shares the page's width can make Google narrow the table's fixed
+columns, and only sometimes, so such a change sets every fixed width back to what it was. Reads
+show all of this as it will be. Where a cell
+beside the new rows holds one dropdown, person chip, date chip, rich link or placeholder and no
+text, Google Docs copies it into each new row, as the status tables it offers as building blocks
+need: a dropdown of the same choices set to its first, and the placeholder character for the
+others, also where spaces follow the chip, which are not copied. The new cells in that column take
+no text, and reads and the approval card show the copies. Of two or more person chips, date chips
+or rich links, Google copies nothing, and the new cells take text as any other.
+
+What cannot be applied exactly is refused. Each of the following is refused when the call is made,
+before anything is queued:
+
+- adding rows or columns beside, or deleting, lines that cross a merged cell, since Google grows,
+  copies, moves or shrinks the merged cell then, or the text of a cell a merged cell covers, which
+  Google writes into the merged cell. The merged cell's own text can be replaced;
+- changing anything in a table inside a cell, or the text of the cell holding it;
+- changing the text of a cell paragraph that holds an image, smart chip, footnote or rule, or that
+  is a subtitle;
+- adding a table between two items of one list, or deleting one that sits between two items of one
+  list;
+- deleting rows, columns or a table that hold a footnote (the footnotes after it would be
+  renumbered), or that hold items of a numbered list while a numbered list follows them in the tab
+  (the deletion would renumber it, and the Markdown does not say how);
+- adding a table beside a paragraph that holds a positioned image, where the image would end on the
+  other side of the table from its text: after a table that such a paragraph follows, or after an
+  empty paragraph that holds one. After a paragraph with text the table is added, and the image
+  stays with the text;
+- deleting every row or column of a table, which is done by deleting the table;
+- changing an existing table (its rows or columns, its look, its merged cells), or deleting it,
+  while another table of the tab reads the same, as above;
+- adding a row beside a row in which a cell holds chips and no text in a shape not listed above
+  (a chip after a space, a dropdown beside another chip), since what Google Docs copies of them
+  into the new row has not been seen, or giving text for a cell that takes a copied chip;
+- changing the rows or columns of a table that holds suggested changes to its rows, columns or
+  cells, or to those of a table inside one of its cells, since deleting a suggested row or column
+  would discard the suggestion, or merging or splitting its cells. The text of such a table's
+  cells can still be replaced, and the
+  table deleted, with a note on its approval card. A table that comes to hold suggested changes
+  after its deletion was requested is not deleted: the deletion fails without writing, and is
+  requested again.
+
+A table holding merged cells or another table can still be deleted whole. The checks that ask
+whether paragraphs are list items are made on the copy of the document with the queued
+changes applied, in which a paragraph that merely starts `1. ` is a paragraph and a list whose
+items show no marker is a list: they are exact when the call is made, with changes waiting as with
+none. Approval checks again, on the document as it is then.
+
+Text edits, in cells too, are "Document edits", and every table change is "Table changes": adding
+or deleting tables, rows and columns, restyling cells, sizing columns and rows, and merging and
+splitting cells. A user may let both kinds apply without asking, and the kind of a new tab, "New
+document tabs". A deletion may apply that way
+too, since the document's version history undoes it. The card of a deletion shows what is deleted
+as `getContent()` reads it. A dropdown reads as nothing there, and so does a smart chip that has no
+text of its own, so a cell that holds nothing else reads as an empty cell; the card says when what
+is deleted holds one. Where one is put into those cells after the deletion was requested, the table
+still reads as it did and the card says nothing of it, so the deletion fails without writing and is
+requested again. The card of a replacement in table cells says that its values are the table's
+HTML, where Markdown syntax is written to the cells as typed.
+
+A replacement's card shows `Old` and `New`, the text the change replaces and the text that stands
+there once it is made, as a read returns them. Where that differs from what was typed (formatting
+the paragraph's named style already gives, a break that makes a normal paragraph), `Requested New`
+shows the text as typed and `New`, after it, the text as it will read. An append's card shows
+`Content`, or `Requested` and `Resulting` where what the append adds will read otherwise than it
+was typed. A table change's card ends in `Resulting`, the lines of the tab that will read
+otherwise, as HTML where they are all of one table. Past 8 KiB the field is
+`Resulting (first lines)` and holds the first of them, and it is left out where another field of
+the card shows those lines or the change adds no line, as a deletion does.
+
+Reads show queued changes. The gatekeeper keeps a copy of the document as Google returned it,
+each tab pruned to what the Markdown rendering and a model of `documents.batchUpdate` read. A
+queued change is made in that copy by the same requests approval sends, which the model applies as
+Google Docs applies them, and `getContent()` renders the copy: the tab as it will read once the
+queued changes apply, table changes and the look of new rows and columns included. A tab whose
+`addTab()` is queued is replayed as an empty tab, under its provisional ID, so the changes queued
+for it are made there too. A Doc's own connection stores the copy, so it outlives an eviction; a
+Doc opened through Drive holds it in its connection's memory, one copy of a document for the
+sessions the connection opens on it. `insertTable()`
+reports its table's position as a read of the document, since the number says how many tables the
+tab holds before it, and it does so before it queues anything; so where the workspace refuses reads
+of the document (a collaborator has no access to it), `insertTable()` fails while `appendText()`
+and the other table methods still queue; through Drive, where the read that prepares any change
+is authorized, they fail too. The other table methods report nothing when they succeed.
+
+A queued change is replayed with its tab, so one that the copy does not take is found at a read of
+that tab's content or at a write to that tab; after any approval that leaves changes queued, which
+replays every tab that has some; on a Doc's own connection, at a rejection that leaves a change to
+an existing table of the rejected change's tab queued behind it, which also replays every tab that
+has some; and when it is approved itself, which answers with the reason. A change queued for a tab
+the document does not hold is found at the next read of any tab or of the tab list. Until it is
+found, it is still the next change to approve, and the changes queued after it wait behind it.
+A change the copy does not take is one whose text is gone from the copy, whose table changed there
+or came to read like another, that the request builder refuses on the tab as the copy has it, or
+whose batch is one the model knows Google Docs refuses. The change is marked dropped with the
+reason, reads show the tab without it, approving it answers with that reason, and rejecting it
+clears it. That is what the copy shows and no more: what the model does not check, such as a link
+to a heading that does not exist, fails when the change is approved, and a collaborator's edit
+made after the copy was read is met then too: Google refuses the batch pinned to the copy's
+revision, and approval builds the requests again on the document as it is then.
+
+A write is made in the copy when it is called, and what the copy does not take is refused then,
+with nothing queued. `appendText()` is made in the copy when it is called as the other writes are,
+so an append the request builder would refuse at approval is refused at the call. Each new list
+item is written at the nesting level it reads at, two spaces before its marker for each level. A
+list has nine levels, so an item written deeper, with eighteen or more spaces before its marker, is
+refused, and the refusal says to write it at most nine levels deep. An item shallower than the item
+before it is refused where placing it would rewrite an item that holds a positioned image (that
+item, or one between it and an item as shallow), and the refusal says to write the item at that
+item's level or to move the image in Google Docs first. A list item's text may start with a tab.
+Google Docs reads the tabs a paragraph starts with as its nesting level when it makes a list item
+of it, and removes them. So a new item is made a list item without the tabs of its own text, and
+they are written at the start of its text afterwards, in the same change. An item that has to be
+made a list item again to place a shallower item behind it has the tabs of its own text counted
+toward its level, and written back afterwards the same way, when the change writes or rewrites
+that item's line, or a line before it. Where such an item lies before the first line the change
+alters (for an append, anywhere in the list it lands behind), its tabs are not written back, so the
+change is refused, and the refusal says to remove that tab first or to write the new item at that
+item's level. A change whose
+result the model has no answer for is refused as one that "cannot be shown as it will read once
+applied", to be made in Google Docs, and a batch the model knows Google Docs refuses is refused
+with "Google Docs would refuse this change" and the reason. A tab whose content the model cannot
+index as Google Docs does is read-only: it reads as it is, every write to it is refused when it is
+called, the changes queued for it are dropped at the next read of it, and the document's other
+tabs take edits.
+
+Each approved change is one `batchUpdate`, pinned with `requiredRevisionId` to the revision it was
+built against, so a concurrent edit makes Google refuse it and nothing is written. It is built
+from the copy of the document the connection holds, or against a fresh read where the copy cannot
+serve or Google refuses the pin. The batch carries a named range marking the write; a retry after
+a lost response finds the marker and does not write again (see
+[Google Docs request costs](#google-docs-request-costs)).
+
+The limits, and what each is for:
+
+- A table is created with at most 20 columns, and columns are added only until a table has 20.
+  That is this connection's own limit, the width the Slides connection stops at too, at which a row
+  can still be read on an approval card; a table that is already wider keeps every other operation.
+- One change adds at most 1,000 cells that have text, an empty cell counting as half, and a column
+  is added only to a table of at most 500 rows: a change travels as one batch that has to answer
+  within the client's 30 seconds, and filling new cells takes longer the taller the table. For the
+  same reason one replacement in table cells sends at most 8,000 requests, which takes thousands of
+  texts or formatted stretches changed at once.
+- The text of one change's cells holds at most 2,000 paragraph breaks, the limit text edits have,
+  since each becomes a paragraph.
+- Tables, rows and columns are added only until the tables of one tab hold 5,000 cells in all, a
+  cell counting once for each paragraph it holds, those of tables inside cells and those no
+  replacement can edit included: a document is read whole, in one answer of
+  limited size, and one whose tables grow far past that cannot be read, and so cannot be changed,
+  through the connection (see [Known limitations](#known-limitations)).
+- One deletion removes at most 19,005 rows or columns, the most requests a batch holds.
+- A queued change, with the table it applies to, is at most 1 MiB, the size limit of a text edit,
+  so a table whose own HTML is larger takes no change through the table methods, to its look and
+  its merged cells included (the refusal says so; the text of its cells can still be replaced).
+  The changes waiting on one document record at most 4 MiB of table HTML between them (4,194,304
+  characters), because every read loads all of them: past that, a further change to an existing
+  table is refused until some are approved or rejected, while a new table, which records no table,
+  is still queued.
+- For `replaceText`, in a table as outside one, each of its two values holds at most 2,000 lines
+  and 5,000 Markdown formatting tokens, and the two together 1 MiB. Table HTML has a line for every
+  cell and two for every row, so a table of a few hundred rows cannot be quoted whole and is
+  changed in several calls.
+- Through Drive one change is held to 100 KiB, well under the two 1 MiB limits above (see
+  [Editing Docs, Sheets and Slides](#editing-docs-sheets-and-slides)).
+
+What Google Docs does with the requests is on record. `__tests__/fixtures/docs-live/` holds, for
+each scenario, the batches the request builders sent and the document Google Docs returned after
+each, and `__tests__/docs-live.test.ts` holds the model to them: applied to the document before a
+batch, it has to give the document Google returned after it. The recordings are re-made with
+`pnpm --filter @gadgets/google-gatekeeper record:docs-fixtures <token-file>`, and compared without
+writing anything with `--check`. The command needs an access token and, for the scenarios that
+start from a template document, one made by hand (`--template <docId>`), whose contents
+`__tests__/docs-live-recorder.ts` lists.
+
 ## Google Doc comments
 
 A directly bound Doc offers `listComments()`, `comment(text, { quote, tabId? })`, `suggestEdit(oldText, newText, { note?, tabId? })`, `reply(commentId, text)` and `resolve(commentId, text?)`. None takes a file ID: the binding's one Doc is the file, as an item is for the comments of the other gatekeepers. Its grant, `documents` and `drive.metadata.readonly`, reaches the comments through the Docs API; Drive's comment API refuses it. Through Docs it lists every comment, makes comments attached to text and suggestions, and replies to, resolves and reopens any comment attached to text, someone else's too. It cannot make a comment attached to no text, nor answer one (one made through Drive, or on the whole file). So `comment()` requires a quote, and a reply to or resolve of such a comment is refused with the resource URL of a read and write Drive connection to the file, which can answer it; `getMetadata()` returns the Doc's `id` for that URL.
@@ -386,10 +753,55 @@ Google shows a Doc's comments only to an account that can comment on it, and ref
 
 Connecting a Doc reads its Drive metadata once, to refuse an Office file (see
 [Office files](#office-files)). A read costs one full `documents.get`, replayed for 10 seconds and then revalidated by a
-revision-only `get`. Queuing an edit costs nothing more. Applying one costs a full `get` (the
-edit is materialized against the current revision), the `batchUpdate` carrying the edit and its
-write marker, and a second `batchUpdate` removing the marker; the document is reread after it only
-when more edits are queued behind it, since they must be replayed over the new revision.
+revision-only `get`. Queuing an edit costs nothing more. Applying one costs the `batchUpdate`
+carrying the edit and its write marker, built from the stored copy and pinned to the copy's
+revision, and a second `batchUpdate` removing the marker; the document is reread after it only
+when more edits are queued behind it, since they must be replayed over the new revision. A table
+change is one `batchUpdate` whatever its size (the rows or columns, and the text of their cells,
+travel together), so it costs what a text edit costs. Rejecting a change costs no request, and the
+read after it checks the document's revision (the revision-only `get`) and reads the document again
+only if that moved.
+
+A full `get` precedes an approved write only where the stored copy cannot serve: none is stored, a
+write landed since it was fetched, the change adds a tab, an earlier write's marker is still to be
+deleted, the copy's tab does not take the edit (the document as it is then decides), the copy
+already built a batch, the connection itself moved the document's revision since the copy's fetch
+began (it applied a comment or a suggestion, or deleted a write's marker, which a read made
+meanwhile does not hold), or the copy was fetched more than 24 hours ago, which is how long Google
+holds a revision id valid. The write is then built against that read and pinned to its revision.
+Google refuses a batch pinned to the copy's revision once the document has moved past it, and
+writes nothing; the approval then reads the document and builds the edit again, or fails with the
+reason the edit no longer applies, so it costs the refused `batchUpdate` more. A batch built from
+the copy that is not accepted is logged as `google.doc.action.apply.copy-refused`, with the edit's
+number and kind and Google's status, and no document text. A copy builds one batch: an approval
+tried again after a batch that did not land reads the document first, and finds there the marker
+of a write whose answer was lost (or finds it in the copy, when a read has stored the document
+since). That holds for as long as the instance that sent the batch lives, since it remembers the
+copy in memory: an instance started again in between builds from the stored copy once more, pinned
+as before, so nothing is written over a document that has moved.
+
+A read replays the queued changes of the tab it reads, over that tab of the copy, and no other
+tab's; `listTabs()` replays no tab, and only places the tabs that queued `addTab()` calls make in
+the list. A tab's replay is remembered while the connection's Durable Object stays in memory, so a
+change queued behind it costs one step more, and a change queued, dropped or rejected in another
+tab leaves it standing. A fetch stores again only the tabs whose content changed, whether it
+follows a revision-only `get` that found the document changed or an approved write, so a write to
+one tab does not store the others again. A tab that the fetch brings as it was stored keeps its
+replay.
+
+These are a directly bound Doc's costs. A Doc opened through Drive replays the same way and adds
+its connection's scope checks. It stores no copy: the sessions that one read and write connection
+opens on a document share a copy in the connection's memory, so the document is fetched whole once
+for them, reused for 10 seconds and then revalidated by the revision-only `get`, and fetched whole
+again at the first read after an edit is queued, the newest queued edit is rejected or fails, or a
+write lands, which replays the tab it reads from that tab's first queued change. An approved write
+is built from that shared copy under the same rules, while a read could still reuse it (no write
+landed and no edit was queued since it was fetched), the connection has not moved the revision
+since, and within 24 hours of its fetch: the first
+approval after a read saves the `get`, and one that follows a landed write, or an edit queued with
+no read since, does not. A read-only
+connection's session keeps a copy of its own, fetched at its first read (see
+[Editing Docs, Sheets and Slides](#editing-docs-sheets-and-slides)).
 
 Adding a tab costs the same: its `batchUpdate` carries the `addDocumentTab` and the marker, which
 goes in the new tab's parent or the first tab. Until Google names the tab, `addTab()` returns a
@@ -413,8 +825,18 @@ threads, or the suggestions, once.
 
 ## Known limitations
 
-Very large Google Docs can exceed Durable Objects' 2 MB value limit after Markdown conversion,
-causing tab listing, content reads, and edits to fail.
+A document is read whole, all its tabs in one answer, of which at most 10 MiB is read. A longer
+answer fails reads of the document's tabs and content, edits and approvals, for a bound Doc and for
+a Doc opened from a Drive binding, until the document is made smaller in Google Docs. The answer is
+asked for without indentation, so that the limit is reached later than it would be. A table cell
+takes far more of that answer than of the Markdown. For that reason the table methods add to the
+tables of one tab only up to 5,000 cells (see the limits of
+[Google Docs edits](#google-docs-edits)), so that a table grown through the table methods does not by
+itself take the document past the limit. A document whose tables were made larger in Google Docs,
+or that is large in its other tabs or in its text, can still be past it. The copy of the document
+that a bound Doc keeps is stored in parts, one that lists the tabs and one for each tab, each
+split across stored values, so that answer's limit is the only one on its size, and a read loads
+the list and the part of the tab it reads. A Doc opened through Drive stores no copy.
 
 A Google Slides presentation's slide summaries come from one response capped at 10 MiB. It holds the
 text of every slide's shapes and speaker notes, but no styles or geometry: about 4 KiB a slide on a
@@ -802,11 +1224,15 @@ What rests on Google's documentation and not on a live check: everything about s
 
 ### Editing Docs, Sheets and Slides
 
-A read and write binding opens a native Google Doc, Sheet or Slides presentation as the editable session one connected on its own has: `openGoogleDoc()` returns a `GoogleDocEditSession`, `openGoogleSheet()` a `GoogleSpreadsheetSession` and `openGoogleSlides()` a `GooglePresentationSession`, and a read-only binding returns the read sessions, with no write method at all, which code learns before it calls one from `getScope().access`. Every binding scope does: all of Drive, a folder (a live direct child of the positioned folder) and a single file. The changes are the editor's own: they are simulated, described, queued, ordered and applied as on the file's own connection (see [Google Docs request costs](#google-docs-request-costs), [Google Sheets edits](#google-sheets-edits) and [Google Slides edits](#google-slides-edits)), under the same action kinds, so a user enables a rule for them on the Drive connection under the same names. A rule is kept per connection, so a rule enabled on a file's own connection does not cover changes made to it through Drive, and a rule enabled on a Drive connection covers every file of that kind the connection reaches, which its label says. The card names the file first, by ID and by the name it had when the session opened it. An exact-file binding lists only the kinds of its own file's editor, as its `describe()` last read the file.
+A read and write binding opens a native Google Doc, Sheet or Slides presentation as the editable session one connected on its own has: `openGoogleDoc()` returns a `GoogleDocEditSession`, `openGoogleSheet()` a `GoogleSpreadsheetSession` and `openGoogleSlides()` a `GooglePresentationSession`, and a read-only binding returns the read sessions, with no write method at all, which code learns before it calls one from `getScope().access`. Every binding scope does: all of Drive, a folder (a live direct child of the positioned folder) and a single file. The changes are the editor's own: they are simulated, described, queued, ordered and applied as on the file's own connection (see [Google Docs edits](#google-docs-edits), [Google Sheets edits](#google-sheets-edits) and [Google Slides edits](#google-slides-edits)), under the same action kinds, so a user enables a rule for them on the Drive connection under the same names. A rule is kept per connection, so a rule enabled on a file's own connection does not cover changes made to it through Drive, and a rule enabled on a Drive connection covers every file of that kind the connection reaches, which its label says ("Table changes, in any Doc this connection reaches"). That is so for every kind a user may let apply without asking, those that delete included: a Doc's "Table changes", which also deletes tables, rows and columns, a spreadsheet's "Spreadsheet changes that delete sheets, rows, columns or merged cells' values", and a presentation's "Slide changes that delete elements, table rows or columns" and "Deleting slides". The card names the file first, by ID and by the name it had when the session opened it. An exact-file binding lists only the kinds of its own file's editor, as its `describe()` last read the file.
 
 Each change is one record in the binding's one journal, beside its comments, sharing changes and moves, and its payload names the file. Changes to one file are prepared one at a time and apply in the order they were queued; a change to another file does not hold them back, and an approval out of order is refused with "Approve or reject the earlier change to this file first". When a change is queued, and again when it is approved, the binding proves before anything else that it may still make changes (its access, the account's writes grant and `GOOGLE_DRIVE_ACCESS`) and that the file is still in its scope, still of its kind, not in the trash, and editable by the connected account. A missing grant or a deployment kept read-only leaves the change pending; anything else about the file fails it for good, without a request to the file's own API. Changing a file through Drive needs the same Drive writes grant as a comment. Disabling the Google Doc, Sheets or Slides resource type on the admin page does not stop it, just as it does not stop a Drive binding reading the file; `GOOGLE_DRIVE_ACCESS` does.
 
-A Doc opened that way is a `GoogleDocEditSession`: a directly bound Doc's `GoogleDocSession` without its comment methods, since the binding's own `comment()`, `suggestEdit()`, `reply()` and `resolve()` reach the file, and without `addTab()`: a Drive binding adds no tabs. One Doc edit, with the display fields its card is built from, has to fit in 100 KiB by the editors' estimate (two bytes for every character of it as JSON), about 50,000 characters, where a Doc's own connection takes 1 MiB of Markdown: every read of the binding's one journal loads every edit it holds, for any file. Split a larger append or replacement into several calls: an edit over the limit is refused. A Doc's reads do not wait on its approvals, as on its own connection; the receipt of a write that landed (`driveDocs:receipt:<id>`) and a count of the writes landed keep a read from showing an edit twice while its approval completes, and the write's marker is deleted, and the edits behind it replayed over the new revision, only once the edit's record is retired. An edit that no longer replays is failed in the journal, with the reason, where a Doc's own connection marks it in its record. The read that prepares a Doc edit through Drive is authorized, as a spreadsheet's and a presentation's are, so the approval card's file is recorded for the chat that queued it; a Doc's own connection authorizes it only when it fails.
+A Doc opened that way is a `GoogleDocEditSession`: a directly bound Doc's `GoogleDocSession` without its comment methods, since the binding's own `comment()`, `suggestEdit()`, `reply()` and `resolve()` reach the file, and without `addTab()`: a Drive binding adds no tabs. It has `replaceText()`, `appendText()` and the eleven table methods (see [Google Docs edits](#google-docs-edits)). One Doc change, with what its card is built from (the text of the tab that a replacement's card shows around it, how new text will read where that is not as it was typed, a table change's card), has to fit in 100 KiB by the editors' estimate (two bytes for every character of it as JSON), about 50,000 characters, where a Doc's own connection takes 1 MiB of Markdown in a text edit and 1 MiB in a table change with its table: every read of the binding's one journal loads every edit it holds, for any file. Split a larger append or replacement into several calls: a change over the limit is refused, and nothing is queued. A change to a table that exists records the table as it read, without its look, so through Drive a table whose HTML is past about 50,000 characters cannot be changed at all, not even a column's width, and one past about 25,000 cannot be deleted with `deleteTable()`, whose card shows the table as well; `insertTable()` records no table and is held only by its own cells.
+
+A Doc's reads do not wait on its approvals, as on its own connection; the receipt of a write that landed (`driveDocs:receipt:<id>`) and a count of the writes landed keep a read from showing an edit twice while its approval completes, and the write's marker is deleted, and the edits behind it replayed over the new revision, only once the edit's record is retired. An edit that no longer replays is failed in the journal, with the reason, where a Doc's own connection marks it in its record. The read that prepares a Doc edit through Drive is authorized, as a spreadsheet's and a presentation's are, so the approval card's file is recorded for the chat that queued it, and that read is also the one of the position `insertTable()` returns; a Doc's own connection authorizes a read only when the edit is refused, and for that position.
+
+A Doc opened through Drive holds its copy of the document (see [Google Docs edits](#google-docs-edits)) in its connection's memory, where a Doc's own connection stores it: one copy of a document, shared by the sessions the connection opens on it, and kept for the four documents opened most recently. A copy is reused only after a read that used it passed the connection's whole scope check, and not once a write has landed in the document or an edit was queued for it since the copy was fetched; so a revision fetched while the file was outside the connection's scope is never kept and never reaches a later read. That has two costs. The first read of a document after the connection's Durable Object is evicted fetches it whole, where a Doc's own connection still has its stored copy and checks only its revision. And with no stored copy to replay over, rejecting, through Drive, a change to a table's structure (a table, rows or columns added or deleted, cells merged or split) or a replacement of text in its cells fails the changes to existing tables queued behind it in that tab, a change to a table's look among them, where a directly bound Doc replays them over its stored copy and keeps those that still apply. Rejecting a paragraph edit, an append or a change to a table's look fails nothing: the changes behind it stay queued, as a new table and a text edit do behind any rejection, and the next replay of their tab judges them. A structure or cell-text change that fails when it is approved, or that an approval refuses for good because of the file (see above), fails the changes to existing tables behind it in the same way, so that none is approved later over a table that change never reached.
 
 A spreadsheet's marker list and the numbers of its applied changes, which its own connection keeps for its one file, are kept per spreadsheet (`driveSheets:file:<id>`), so a lost write to one spreadsheet holds back only that spreadsheet's later changes. Each spreadsheet's state also notes the numbers queued for it, and a new session drops the state of a spreadsheet the journal holds none of and none of whose markers can still land, keeping the 20 written most recently. Two connections that reach one spreadsheet do not see each other's markers, as is already so for two connections to it of any kind. A read of a spreadsheet's ranges or formats made while changes to its rows, columns or sheets are queued goes through an endpoint that needs a grant that may edit it, so such a read fails once the account no longer holds the writes grant, until the grant returns or those changes are decided.
 
