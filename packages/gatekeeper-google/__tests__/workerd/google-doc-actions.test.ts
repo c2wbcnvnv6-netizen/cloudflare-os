@@ -2412,6 +2412,26 @@ describe("Google Doc pending changes", () => {
       .toEqual([{ id: actionId, type: "appendText", markdown: "added" }]);
   });
 
+  it("reads a tab still to be added as saved empty, before and after it is added", async () => {
+    let docs = new DocsModel();
+    docs.setText(MAIN_TAB, "Intro");
+    docs.install();
+    let added = await addTab("pending-added-tab", "Notes");
+    let actionId = await hooks().submitAppend("pending-added-tab", "Hello", added.tabId);
+    let changes = [{ id: actionId, type: "appendText", markdown: "Hello" }];
+
+    expect(await hooks().readPendingChanges("pending-added-tab", added.tabId))
+      .toEqual({ savedMarkdown: "\n", markdown: "Hello\n", changes });
+    expect((await hooks().readPendingChanges("pending-added-tab", MAIN_TAB)).changes).toEqual([]);
+    expect(await hooks().readStyles("pending-added-tab", added.tabId))
+      .toMatchObject({ paragraphs: [{ line: 0, style: "NORMAL_TEXT" }], tables: [] });
+
+    expect(await hooks().applyAction("pending-added-tab", added.actionId)).toBeNull();
+    // The ID the agent was given still names the tab, and the edit queued under it.
+    expect(await hooks().readPendingChanges("pending-added-tab", added.tabId))
+      .toEqual({ savedMarkdown: "\n", markdown: "Hello\n", changes });
+  });
+
   it("requires a tab for a document with several, as getContent() does", async () => {
     nestedDocs();
 
