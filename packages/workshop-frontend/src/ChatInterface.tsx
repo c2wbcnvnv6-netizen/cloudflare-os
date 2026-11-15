@@ -4043,7 +4043,7 @@ function ChatInterface({
       if (selectedChatId === null) {
         // Create a new chat (with optional capsules).
         const newChatId = await overseer.newChat(
-            message, model, capsules, attachments, formats);
+            message, model, { capsules, attachments, formats });
         onNavigateToChatRef.current(newChatId);
       } else {
         // Send message to existing chat.
@@ -4051,9 +4051,7 @@ function ChatInterface({
           selectedChatId,
           message,
           model,
-          capsules || undefined,
-          attachments || undefined,
-          formats,
+          { capsules, attachments, formats },
         );
       }
     } catch (err) {
@@ -4081,7 +4079,7 @@ function ChatInterface({
     const model = modelId !== undefined ? modelId : selectedModel;
     try {
       const newChatId = await overseer.newChat(
-          message, model, capsules, attachments, formats);
+          message, model, { capsules, attachments, formats });
       onNavigateToChatRef.current(newChatId);
     } catch (err) {
       if (!logRpcFailure("Failed to create new chat:", err, { reportSite: "chat.new" })) {
