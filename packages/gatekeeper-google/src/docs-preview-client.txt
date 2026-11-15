@@ -149,7 +149,7 @@ function parseBlocks(markdown) {
       blank++;
       continue;
     }
-    pushEmpty(blocks.length ? blank >> 1 : blank);
+    pushEmpty(blank >> 1);
     if (blank) counters.length = 0;
     blank = 0;
     if (line.trim() === '<table>') {
@@ -179,7 +179,7 @@ function parseBlocks(markdown) {
       blocks.push(block);
     }
   }
-  pushEmpty(blocks.length ? blank - 1 : blank);
+  pushEmpty(blank >> 1);
   return blocks;
 }
 

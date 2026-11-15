@@ -2262,6 +2262,27 @@ describe("Google Doc with no revision ID", () => {
   });
 });
 
+describe("Google Doc styles", () => {
+  it("reads a tab's styles under one observation", async () => {
+    let docs = new DocsModel();
+    docs.setText(MAIN_TAB, "Draft");
+    docs.install();
+
+    expect(await hooks().readStyles("styles-read")).toEqual({
+      named: {}, paragraphs: [{ line: 0, style: "NORMAL_TEXT" }], runLooks: [], tables: [],
+    });
+    expect(await hooks().lastObservations).toEqual([`Read the styles of tab "Main" (${MAIN_TAB}).`]);
+  });
+
+  it("requires a tab for a document with several, as getContent() does", async () => {
+    nestedDocs();
+
+    await expect(Promise.resolve(hooks().readStyles("styles-no-tab")))
+      .rejects.toThrow("getStyles: tabId is required for documents with multiple tabs.");
+    expect(await hooks().lastObservations).toEqual(["Read the styles of one tab of the document."]);
+  });
+});
+
 describe("Google Doc images", () => {
   const LISTED = `Read the images in tab "Main" (${MAIN_TAB}).`;
 
