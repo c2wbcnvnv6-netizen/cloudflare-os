@@ -12,6 +12,7 @@ export default defineConfig({
         TRACKER_HOST: { className: "TrackerHost", useSQLite: true },
         HOOK_HOST: { className: "HookHost", useSQLite: true },
         CHUNKED_VALUE_HOST: { className: "ChunkedValueHost", useSQLite: true },
+        STORED_BASE_HOST: { className: "StoredBaseHost", useSQLite: true },
         CONFORMANCE_ACCOUNT: { className: "ConformanceAccount", useSQLite: true },
         CONFORMANCE_RESOURCE: { className: "ConformanceResource", useSQLite: true },
       },

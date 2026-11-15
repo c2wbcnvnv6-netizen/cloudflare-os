@@ -4,6 +4,7 @@ import { DurableObject, RpcTarget, WorkerEntrypoint, type RpcStub } from "cloudf
 import { ChunkedValues } from "../../src/chunked-value";
 import { HookRegistry } from "../../src/hook-registry";
 import { ObserverTracker } from "../../src/observers";
+import { StoredBase } from "../../src/simulation-store";
 export { ConformanceAccount, ConformanceResource, ConformanceVerifier } from "./conformance/gatekeeper";
 
 type VerifierProps = { allowed: readonly string[]; dropVerdicts?: number };
@@ -177,6 +178,76 @@ export class ChunkedValueHost extends DurableObject {
       this.put(name, length, seed);
       throw new Error("The transaction around the put failed.");
     });
+  }
+}
+
+const STORED_PARTITION_BYTES = 2_500;
+const STORED_TTL_MS = 1_000;
+
+/**
+ * A stored base over a real DO's storage. Its provider answers the partitions a test names, each
+ * as bytes made from a seed, and every answer here is small: a partition reads back as its seed.
+ */
+export class StoredBaseHost extends DurableObject {
+  #answer: { seeds: Record<string, number>; storableRevision: boolean } =
+    { seeds: {}, storableRevision: true };
+  #now = 0;
+  #decodes = 0;
+  #copy = this.#open();
+
+  // A partition of several chunks, so that a put of one is several writes.
+  #open(): StoredBase<Record<string, number>, number> {
+    return new StoredBase({
+      values: new ChunkedValues(this.ctx.storage, { prefix: "copy:", chunkBytes: 1_024 }),
+      name: "doc",
+      formatVersion: 1,
+      ttlMs: STORED_TTL_MS,
+      now: () => this.#now,
+      encode: seeds =>
+        new Map(Object.entries(seeds).map(([key, seed]) => [key, fixtureBytes(STORED_PARTITION_BYTES, seed)])),
+      decode: (_key, bytes) => {
+        this.#decodes++;
+        const seed = bytes[0];
+        const expected = fixtureBytes(STORED_PARTITION_BYTES, seed);
+        if (bytes.byteLength !== expected.byteLength || !bytes.every((byte, index) => byte === expected[index])) {
+          throw new Error("The stored bytes are not one partition's.");
+        }
+        return seed;
+      },
+      fetch: async () => ({
+        base: this.#answer.seeds,
+        // A revision storage refuses fails the put of the index, the last write of a keep.
+        revision: this.#answer.storableRevision ? "r1" : (() => {}) as unknown as string,
+      }),
+    });
+  }
+
+  /** Fetches the partitions `seeds` names, the stored copy being too old to serve; answers the keys. */
+  async read(seeds: Record<string, number>, storableRevision = true): Promise<readonly string[]> {
+    this.#answer = { seeds, storableRevision };
+    this.#now += STORED_TTL_MS;
+    return (await this.#copy.current()).keys;
+  }
+
+  /** Starts over as an activation after an eviction does: storage alone is kept. */
+  evict(): void {
+    this.#copy = this.#open();
+    this.#decodes = 0;
+  }
+
+  /** The seed of one partition of the stored copy, or `null` where it does not serve one. */
+  part(key: string): number | null {
+    return this.#copy.held()?.part(key) ?? null;
+  }
+
+  /** How many times a partition was decoded since the last eviction. */
+  decodes(): number {
+    return this.#decodes;
+  }
+
+  /** Every key under the copy's prefix. */
+  keys(): string[] {
+    return [...this.ctx.storage.kv.list({ prefix: "copy:" })].map(([key]) => key);
   }
 }
 

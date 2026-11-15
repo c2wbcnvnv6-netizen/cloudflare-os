@@ -1,6 +1,12 @@
-/** A remembered fold of pending actions over one entity at a time. */
+/**
+ * A remembered fold of pending actions over one entity at a time, and a stored,
+ * revision-checked base.
+ */
 
+import type { ChunkedValues } from "./chunked-value";
+import { requirePositiveInt } from "./positive-int";
 import type { SimulationRecord, SimulationStep } from "./simulation";
+import { SingleFlight } from "./single-flight";
 
 /**
  * What one record does to one entity: `applied` with the entity as it then is, `deleted`,
@@ -291,4 +297,462 @@ export function createSimulationStore<
       unbased.clear();
     },
   });
+}
+
+/**
+ * A base as `StoredBase` holds it, one partition at a time. It says when the copy was fetched,
+ * not whether the provider still holds it so: `held()` returns a copy of any age.
+ */
+export type HeldBase<Part> = {
+  /** The partition keys, in `encode`'s order. Reading them decodes nothing. */
+  readonly keys: readonly string[];
+  /**
+   * One partition, decoded on first use. One `StoredBase` gives the same object for the same
+   * stored bytes of a key, across reads and across fetches that brought those bytes again, so a
+   * simulation store can remember a fold over it. Do not change it.
+   *
+   * A copy is a view of what is stored, and a later fetch, a `noteWrite()` or a `drop()` replaces
+   * or retires what is stored. A partition is served while storage still holds this copy's bytes
+   * for it (the stored index lists the key with this copy's digest, and no write was noted
+   * since) or its decoded object is still remembered, so a copy held across a later fetch never
+   * serves the later copy's bytes, and may serve none: read the partitions wanted before
+   * awaiting, or call `current()` again.
+   * @param key A partition key, one of `keys`.
+   * @returns The partition, or `undefined` for a key the copy does not list, for a partition
+   * storage no longer holds as this copy had it (nothing is remembered of that, and `held()` is
+   * unaffected), and for a partition of the stored copy that cannot be read back (missing,
+   * incomplete, or `decode` throws), after which `held()` reads the copy as absent and the
+   * next `current()` fetches.
+   */
+  part(key: string): Part | undefined;
+  /** The clock when the fetch that produced this copy began. A revision check does not move it. */
+  readonly fetchedAt: number;
+  /** The provider's revision of the copy, when the fetch reported one. */
+  readonly revision?: string;
+};
+
+/** Storage, encoding, source and freshness of a `StoredBase`. */
+export type StoredBaseOptions<Base, Part> = {
+  /** Where the copy is kept. */
+  readonly values: ChunkedValues;
+  /**
+   * Names this base among those sharing `values`: letters, digits, `_` and `-`. The base owns
+   * the value named `name` and every value whose name starts `${name}/`.
+   */
+  readonly name: string;
+  /**
+   * The version of `encode`'s output, an integer. A copy stored under another version reads as
+   * absent.
+   */
+  readonly formatVersion: number;
+  /**
+   * Splits a base into named partitions (a document's tabs), each stored as its own value so
+   * that none is bounded by another's size and each is read and rewritten alone. A partition
+   * key is any well-formed Unicode string, the empty one included; `current()` rejects, storing
+   * nothing, for a key that is not. Equal bytes under a key are the same partition: give a
+   * partition the same bytes whenever its content is the same.
+   */
+  readonly encode: (base: Base) => ReadonlyMap<string, Uint8Array>;
+  /**
+   * Rebuilds one partition from the bytes `encode` produced under `key`. What is served is
+   * always `decode` of the stored bytes, never the fetched object, so reads agree before and
+   * after an eviction. A throw reads as a partition that cannot be read back.
+   */
+  readonly decode: (key: string, bytes: Uint8Array) => Part;
+  /** Fetches the base from the provider, with its revision if the provider reports one. */
+  readonly fetch: () => Promise<{ base: Base; revision?: string }>;
+  /** How long a copy is served without asking the provider anything. A positive integer. */
+  readonly ttlMs: number;
+  /**
+   * Whether the provider still holds this revision; cheaper than `fetch`. Asked once a copy with
+   * a revision is older than `ttlMs`. Absent, or with no revision held, an old copy is fetched
+   * again.
+   */
+  readonly unchanged?: (revision: string) => Promise<boolean>;
+  /** Clock, for tests. Defaults to `Date.now`. */
+  readonly now?: () => number;
+};
+
+// The record that names a stored copy, kept as the meta of the value named `name`, whose bytes
+// are empty. `stamp` is random per stored fetch. `partitions` lists every partition in `encode`'s
+// order with the lowercase hex SHA-256 of its bytes. `checkedAt` is the clock when the copy was
+// last fetched or confirmed, and a copy without one is due for a check; `stale` says a write
+// reached the provider since the copy was fetched: such a copy is served to no one, and its
+// digests say which partitions the next fetch need not store again.
+type Index = {
+  readonly version: 2;
+  readonly formatVersion: number;
+  readonly stamp: string;
+  readonly fetchedAt: number;
+  readonly revision?: string;
+  readonly partitions: readonly { readonly key: string; readonly digest: string }[];
+  readonly checkedAt?: number;
+  readonly stale?: true;
+};
+
+/** A base fetched and encoded, not stored: what `#keep` takes. */
+type Fetched = {
+  readonly epoch: number;
+  readonly fetchedAt: number;
+  readonly revision?: string;
+  /** Partition key to bytes, in `encode`'s order, and to the digest of those bytes. */
+  readonly parts: ReadonlyMap<string, Uint8Array>;
+  readonly digests: ReadonlyMap<string, string>;
+};
+
+const EMPTY = new Uint8Array(0);
+
+// `encodeURIComponent` throws for a string that is not well-formed Unicode, so no partition is
+// ever stored under such a key and none is looked for under one.
+const wellFormed = (key: unknown): key is string => typeof key === "string" && key.isWellFormed();
+
+function validIndex(value: unknown): value is Index {
+  if (!value || typeof value !== "object") return false;
+  const { version, formatVersion, stamp, fetchedAt, revision, partitions, checkedAt } =
+    value as Record<string, unknown>;
+  return version === 2 &&
+    typeof formatVersion === "number" &&
+    typeof stamp === "string" &&
+    Number.isFinite(fetchedAt) &&
+    (revision === undefined || typeof revision === "string") &&
+    (checkedAt === undefined || Number.isFinite(checkedAt)) &&
+    Array.isArray(partitions) &&
+    partitions.every(entry =>
+      !!entry && typeof entry === "object" && wellFormed(entry.key) &&
+      typeof entry.digest === "string"
+    );
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * A provider's state kept in Durable Object storage one partition at a time, served while
+ * fresh, checked against the provider's revision when old, and readable synchronously inside a
+ * transaction. A partition is loaded when it is read, and rewritten only when a fetch brought
+ * other bytes for it. It suits a base that is bounded (a document), not one read by range (a
+ * spreadsheet's cells).
+ *
+ * Storage is the truth: a partition is always decoded from its stored bytes, and a decoded
+ * partition in memory is served only for the digest of the bytes it was decoded from, so nothing
+ * is lost when the Durable Object is evicted. A fetch is encoded and digested before anything is
+ * stored, and stored in a second step. What is in memory only is the fetch in flight, so build
+ * one `StoredBase` per Durable Object activation and share it.
+ *
+ * `noteWrite()`, `recheck()`, `drop()` and a `current()` that stores or confirms the copy write
+ * through `ChunkedValues`, whose writes scan: none may run while a `kv.list` loop of the
+ * caller's is open (see `ChunkedValues`). `held()` and a copy's `part()` may.
+ *
+ * @example
+ * ```ts
+ * #copy = new StoredBase<Doc, Tab>({
+ *   values: new ChunkedValues(this.ctx.storage, { prefix: "copy:" }),
+ *   name: "doc", formatVersion: 1, ttlMs: 10_000,
+ *   encode: doc => new Map(doc.tabs.map(tab => [tab.id, encodeTab(tab)])),
+ *   decode: (key, bytes) => decodeTab(bytes),
+ *   fetch: async () => { const doc = await this.#api.get(); return { base: doc, revision: doc.revisionId }; },
+ *   unchanged: async revision => await this.#api.revision() === revision,
+ * });
+ *
+ * async tab(tabId: string): Promise<Tab | undefined> {
+ *   // Read at once: a copy is a view of what is stored, and a later fetch replaces that.
+ *   return (await this.#copy.current()).part(tabId);
+ * }
+ * ```
+ */
+export class StoredBase<Base, Part> {
+  readonly #values: ChunkedValues;
+  readonly #name: string;
+  readonly #formatVersion: number;
+  readonly #encode: (base: Base) => ReadonlyMap<string, Uint8Array>;
+  readonly #decode: (key: string, bytes: Uint8Array) => Part;
+  readonly #source: () => Promise<{ base: Base; revision?: string }>;
+  readonly #ttlMs: number;
+  readonly #unchanged: ((revision: string) => Promise<boolean>) | undefined;
+  readonly #now: () => number;
+  // The latest partition this instance decoded under each key, with the digest of the bytes it
+  // was decoded from. An entry is served to any copy that lists its key with that digest. It
+  // holds no key the stored copy does not list once a fetch has been stored.
+  readonly #decoded = new Map<string, { readonly digest: string; readonly part: Part }>();
+  // The stamp of a stored copy one of whose partitions could not be read back. That copy reads
+  // as absent.
+  #unreadable: string | undefined;
+  // Counts the calls that made work in flight worthless.
+  #epoch = 0;
+  readonly #flights = new SingleFlight<"current">();
+
+  /**
+   * @param options Storage, encoding, source and freshness. Throws for a `name` outside
+   * `[A-Za-z0-9_-]+`, a `formatVersion` that is not an integer, or a `ttlMs` that is not a
+   * positive integer.
+   */
+  constructor(options: StoredBaseOptions<Base, Part>) {
+    if (!/^[A-Za-z0-9_-]+$/.test(options.name)) {
+      throw new Error(
+        `A StoredBase name must be letters, digits, "_" or "-", got ${JSON.stringify(options.name)}.`,
+      );
+    }
+    // `NaN` never equals itself, so a copy stored under it would be fetched again on every read.
+    if (!Number.isSafeInteger(options.formatVersion)) {
+      throw new Error(`formatVersion must be a safe integer, got ${options.formatVersion}.`);
+    }
+    this.#values = options.values;
+    this.#name = options.name;
+    this.#formatVersion = options.formatVersion;
+    this.#encode = options.encode;
+    this.#decode = options.decode;
+    this.#source = options.fetch;
+    this.#ttlMs = requirePositiveInt("ttlMs", options.ttlMs);
+    this.#unchanged = options.unchanged;
+    this.#now = options.now ?? Date.now;
+  }
+
+  /**
+   * The base, as fresh as `ttlMs` asks. Serves the stored copy while it was fetched or confirmed
+   * less than `ttlMs` ago. Past that, a copy with a revision is confirmed with `unchanged`, which
+   * restarts its age without storing it again; otherwise the base is fetched, and the index and
+   * every partition whose bytes are not the stored ones are stored in one transaction. A fetched
+   * base is not decoded before it is stored: `decode` runs per partition, on first use, from the
+   * stored bytes, so a partition that cannot be decoded shows as `part()` answering `undefined`,
+   * and the next `current()` fetches. Calls share one fetch as long as no `noteWrite()`,
+   * `recheck()` or `drop()` comes between them; a call made after one of those is never answered
+   * by work begun before it. A failed `fetch`, `unchanged`, `encode` or store rejects and leaves
+   * the stored copy as it was.
+   * @returns The copy that was served or stored. Read the partitions wanted from it before
+   * awaiting anything else.
+   */
+  current(): Promise<HeldBase<Part>> {
+    return this.#flights.run("current", () => this.#load());
+  }
+
+  /**
+   * The stored copy, whatever its age. Synchronous and read-only in storage, for use inside
+   * `transactionSync` and while the provider is unreachable. It never throws for what is
+   * stored. It reads the index only: a partition is read when `part` asks, so this does not
+   * prove every partition readable. Nothing this class does changes a partition without
+   * replacing the index, so a listed partition is missing only if storage was damaged. It does
+   * not judge the copy's age. A copy `noteWrite()` was called after is not returned: it lacks a
+   * write the provider holds, so nothing may be replayed over it.
+   * @returns The copy, or `undefined` when none is stored, it was stored under another
+   * `formatVersion`, a write was noted since it was fetched, or a partition of it was asked for
+   * and could not be read back.
+   */
+  held(): HeldBase<Part> | undefined {
+    const index = this.#stored();
+    return index && !index.stale ? this.#view(index) : undefined;
+  }
+
+  /**
+   * Records that a write reached the provider. The stored copy lacks it and is served to no one
+   * again: `held()` answers `undefined`, a copy handed out earlier serves only the partitions it
+   * had decoded, and the next `current()` fetches without asking `unchanged`. The copy's bytes
+   * stay stored for that fetch to be compared with, so it stores again only the partitions the
+   * write changed, where a fetch after `drop()` stores them all. Work `current()` has in flight
+   * began before the write: its answer is neither stored nor served, its callers get the fetch
+   * that follows, and a `current()` called after this never joins it. Synchronous.
+   */
+  noteWrite(): void {
+    this.#supersede();
+    const index = this.#index();
+    if (index !== undefined && !index.stale) this.#putIndex({ ...index, stale: true });
+  }
+
+  /**
+   * Makes the next `current()` confirm the stored copy with `unchanged` (or fetch) whatever its
+   * age. Work `current()` has in flight starts over, and a `current()` called after this never
+   * joins it. Synchronous.
+   */
+  recheck(): void {
+    this.#supersede();
+    const index = this.#index();
+    if (index === undefined) return;
+    const { checkedAt, ...unchecked } = index;
+    if (checkedAt !== undefined) this.#putIndex(unchecked);
+  }
+
+  /**
+   * Removes the stored copy, its index and every partition the index lists, in one
+   * transaction, so the next fetch is stored whole: for a copy that is wrong or cannot be read,
+   * where `noteWrite()` is for one a write outdated. Work `current()` has in flight starts over,
+   * and a `current()` called after this never joins it. Synchronous.
+   */
+  drop(): void {
+    this.#supersede();
+    // The decoded partitions stay in memory: each is served only for the digest it was decoded
+    // from, so a drop that a caller's transaction undoes, and a fetch that brings the same bytes,
+    // give the same objects again.
+    this.#values.transaction(() => {
+      for (const key of this.#listed()) this.#values.delete(this.#partition(key));
+      this.#values.delete(this.#name);
+    });
+  }
+
+  // Makes work in flight worthless to every `current()` called from here on. The epoch alone is
+  // not enough: it tells work past an `await` that its answer predates this call, but work that
+  // has already answered stays joinable until its release microtask runs, and would hand a call
+  // made in that window the copy from before. So the flight is forgotten as well.
+  #supersede(): void {
+    this.#epoch++;
+    this.#flights.forget("current");
+  }
+
+  async #load(): Promise<HeldBase<Part>> {
+    // Read before anything else and compared after the `await`. Where it moved, this work was
+    // superseded and its flight forgotten, so `current()` joins the flight begun since or begins
+    // one, and every superseded caller shares that one.
+    const epoch = this.#epoch;
+    const index = this.#stored();
+    if (index !== undefined && !index.stale) {
+      const now = this.#now();
+      if (index.checkedAt !== undefined && now - index.checkedAt < this.#ttlMs) {
+        return this.#view(index);
+      }
+      if (index.revision !== undefined && this.#unchanged !== undefined) {
+        const same = await this.#unchanged(index.revision);
+        if (epoch !== this.#epoch) return this.current();
+        if (same) {
+          // The age restarts from when the question was asked, and only the index is put.
+          this.#putIndex({ ...index, checkedAt: now });
+          return this.#view(index);
+        }
+      }
+    }
+    return this.#keep(await this.#fetch()) ?? this.current();
+  }
+
+  /** Fetches the base and encodes it, storing nothing. */
+  async #fetch(): Promise<Fetched> {
+    const epoch = this.#epoch;
+    const fetchedAt = this.#now();
+    const { base, revision } = await this.#source();
+    const parts = this.#encode(base);
+    if (![...parts.keys()].every(wellFormed)) {
+      throw new Error("A StoredBase partition key must be well-formed Unicode.");
+    }
+    const digests = new Map(
+      await Promise.all(
+        [...parts].map(async ([key, bytes]) => [key, await sha256Hex(bytes)] as const),
+      ),
+    );
+    return { epoch, fetchedAt, ...(revision === undefined ? {} : { revision }), parts, digests };
+  }
+
+  /**
+   * Stores what `#fetch` returned, in one transaction, or stores nothing and answers `undefined`
+   * when a `noteWrite()`, `recheck()` or `drop()` came after the fetch began.
+   */
+  #keep(fetched: Fetched): HeldBase<Part> | undefined {
+    // The epoch is the whole check: `current()` runs one flight at a time and each of those
+    // calls moves the epoch, so no fetch is stored behind a later one without it having moved.
+    if (fetched.epoch !== this.#epoch) return undefined;
+    const { parts, digests } = fetched;
+    // The digests of the stored copy. A copy that reads as absent has none, so every partition
+    // is put over it.
+    const had = new Map(this.#stored()?.partitions.map(({ key, digest }) => [key, digest]));
+    const listed = this.#listed();
+    const index: Index = {
+      version: 2,
+      formatVersion: this.#formatVersion,
+      stamp: crypto.randomUUID(),
+      fetchedAt: fetched.fetchedAt,
+      ...(fetched.revision === undefined ? {} : { revision: fetched.revision }),
+      partitions: Array.from(digests, ([key, digest]) => ({ key, digest })),
+      checkedAt: fetched.fetchedAt,
+    };
+    // One transaction, the index last, so a reader finds the earlier copy or this one whole.
+    this.#values.transaction(() => {
+      for (const key of listed) {
+        if (!parts.has(key)) this.#values.delete(this.#partition(key));
+      }
+      for (const [key, bytes] of parts) {
+        if (had.get(key) !== digests.get(key)) this.#values.put(this.#partition(key), bytes);
+      }
+      this.#putIndex(index);
+    });
+    for (const key of this.#decoded.keys()) {
+      if (!parts.has(key)) this.#decoded.delete(key);
+    }
+    return this.#view(index);
+  }
+
+  // The copy `index` names, as a view of storage: it holds the copy's digests and no bytes.
+  #view(index: Index): HeldBase<Part> {
+    const digests = new Map(index.partitions.map(({ key, digest }) => [key, digest]));
+    return {
+      keys: [...digests.keys()],
+      part: key => this.#part(key, digests.get(key)),
+      fetchedAt: index.fetchedAt,
+      ...(index.revision === undefined ? {} : { revision: index.revision }),
+    };
+  }
+
+  // The partition under `key` whose bytes have `digest`, for a copy that lists it so: the
+  // decoded object in memory, else the stored bytes decoded, and only while the stored index
+  // still lists the key with that digest, so the bytes read are the ones the digest names, and
+  // no write was noted since, after which the stored bytes are kept to be compared, not served.
+  #part(key: string, digest: string | undefined): Part | undefined {
+    if (digest === undefined) return undefined;
+    const decoded = this.#decoded.get(key);
+    if (decoded?.digest === digest) return decoded.part;
+    const index = this.#index();
+    if (
+      index === undefined || index.formatVersion !== this.#formatVersion || index.stale ||
+      !index.partitions.some(entry => entry.key === key && entry.digest === digest)
+    ) return undefined;
+    let part: Part;
+    try {
+      const stored = this.#values.get(this.#partition(key));
+      if (stored === undefined) throw new Error("The partition is missing or incomplete.");
+      part = this.#decode(key, stored.bytes);
+    } catch {
+      this.#unreadable = index.stamp;
+      return undefined;
+    }
+    this.#decoded.set(key, { digest, part });
+    return part;
+  }
+
+  // The index of the stored copy, or `undefined` for a copy that reads as absent: none, one of
+  // another format version, or one a partition of which could not be read back.
+  #stored(): Index | undefined {
+    const index = this.#index();
+    return index === undefined || index.formatVersion !== this.#formatVersion ||
+        index.stamp === this.#unreadable
+      ? undefined
+      : index;
+  }
+
+  // The stored index, of any format version, or `undefined` when the record under the index name
+  // is not one this code understands.
+  #index(): Index | undefined {
+    const meta = this.#values.meta(this.#name);
+    return validIndex(meta) ? meta : undefined;
+  }
+
+  // The partition keys that whatever record is stored under the index name lists, for cleanup
+  // only: the record need not be an index this code understands, and an entry is a key or an
+  // object holding one. A key this class could not have stored a partition under is skipped.
+  #listed(): string[] {
+    const meta = this.#values.meta(this.#name);
+    if (!meta || typeof meta !== "object") return [];
+    const { partitions } = meta as Record<string, unknown>;
+    if (!Array.isArray(partitions)) return [];
+    return partitions
+      .map((entry: unknown) =>
+        entry && typeof entry === "object" ? (entry as Record<string, unknown>).key : entry
+      )
+      .filter(wellFormed);
+  }
+
+  // The name of a partition's value. Neither `:` nor `/` survives `encodeURIComponent`, so the
+  // name is one `ChunkedValues` accepts and no two keys share one.
+  #partition(key: string): string {
+    return `${this.#name}/${encodeURIComponent(key)}`;
+  }
+
+  #putIndex(index: Index): void {
+    this.#values.put(this.#name, EMPTY, index);
+  }
 }

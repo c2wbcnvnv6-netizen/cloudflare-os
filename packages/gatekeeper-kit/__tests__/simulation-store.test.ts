@@ -1,14 +1,18 @@
 import * as fc from "fast-check";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { PROPERTY_RUN_OPTIONS } from "@gadgets/scripts/property-runs";
+import { ChunkedValues } from "../src/chunked-value";
 import { createSimulationView, ProvisionalIds, type SimulationRecord } from "../src/simulation";
 import {
   createSimulationStore,
+  StoredBase,
   type EntityContext,
   type EntityFold,
   type EntityStep,
+  type HeldBase,
+  type StoredBaseOptions,
 } from "../src/simulation-store";
-import { fakeKv } from "./fake-kv";
+import { fakeKv, fakeStorage, type FakeStorage } from "./fake-kv";
 
 // The fixture is a gatekeeper whose entities are pages of lines. Its reducer refuses what it
 // cannot replay on a page and goes on, and the caller marks the refused records afterwards:
@@ -1057,4 +1061,1548 @@ describe("createSimulationStore", () => {
     // Enough was compared for the property to mean something.
     expect(reads).toBeGreaterThan(60_000);
   }, 120_000);
+});
+
+// The fixture is a document kept one tab per partition. `scratch` is on what the provider
+// answers and is not stored, which tells a served copy from a fetched one.
+type Tab = { id: string; text: string; scratch?: string };
+type Doc = { tabs: Tab[] };
+type Answer = { base: Doc; revision?: string };
+
+const TTL = 100;
+const utf8 = (text: string): Uint8Array => new TextEncoder().encode(text);
+const encodeDoc = (doc: Doc): Map<string, Uint8Array> =>
+  new Map(doc.tabs.map(({ id, text }) => [id, utf8(JSON.stringify({ id, text }))]));
+const decodeTab = (_key: string, bytes: Uint8Array): Tab =>
+  JSON.parse(new TextDecoder().decode(bytes)) as Tab;
+/** A document as the provider answers it, one tab per text. */
+const fetched = (...texts: string[]): Doc =>
+  ({ tabs: texts.map((text, index) => ({ id: `t.${index}`, text, scratch: "not stored" })) });
+/** The same document as it is stored and served. */
+const kept = (...texts: string[]): Doc =>
+  ({ tabs: texts.map((text, index) => ({ id: `t.${index}`, text })) });
+/** A document of one tab per id, as the provider answers it and as it is stored. */
+const named = (...ids: string[]): Doc =>
+  ({ tabs: ids.map(id => ({ id, text: `the text of ${id}` })) });
+
+/** Every partition of a copy, joined, or `undefined` when the copy serves one of them no more. */
+const whole = (held: HeldBase<Tab> | undefined): Doc | undefined => {
+  const tabs = held?.keys.map(key => held.part(key));
+  return tabs?.every(tab => tab !== undefined) ? { tabs } : undefined;
+};
+/** A copy as the tests compare it: its partitions joined, when it was fetched and its revision. */
+const seen = (held: HeldBase<Tab> | undefined) =>
+  held && {
+    base: whole(held),
+    fetchedAt: held.fetchedAt,
+    ...(held.revision === undefined ? {} : { revision: held.revision }),
+  };
+/** Whether two copies list the same keys and serve the same object for each, or both are absent. */
+const identical = (a: HeldBase<Tab> | undefined, b: HeldBase<Tab> | undefined): boolean =>
+  a === undefined || b === undefined
+    ? a === b
+    : a.keys.join("\n") === b.keys.join("\n") &&
+      a.keys.every(key => a.part(key) !== undefined && a.part(key) === b.part(key));
+
+/** One turn of the timer queue, by which every microtask queued so far has run. */
+const settle = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 0));
+/** Every stored key with its value, to tell whether anything in storage changed. */
+const snapshot = ({ kv }: FakeStorage): unknown[] => kv.keys().map(key => [key, kv.get(key)]);
+
+/** What outlives a Durable Object activation (storage, the clock) and the provider's stubs. */
+type World = {
+  readonly storage: FakeStorage;
+  now: number;
+  /** How many times the provider was asked for the base. */
+  fetches: number;
+  /** What the next fetches answer, in order. A fetch with nothing queued rejects. */
+  readonly answers: (Answer | Error | Promise<Answer>)[];
+  /** The revisions `unchanged` was asked about. */
+  readonly asked: string[];
+  /** What the next revision checks answer, in order. A check with nothing queued rejects. */
+  readonly verdicts: (boolean | Error | Promise<boolean>)[];
+};
+
+function world(storage: FakeStorage = fakeStorage()): World {
+  return { storage, now: 1_000, fetches: 0, answers: [], asked: [], verdicts: [] };
+}
+
+/** A `StoredBase` over the world's storage. A second one over the same world is an eviction. */
+function open(w: World, overrides: Partial<StoredBaseOptions<Doc, Tab>> = {}): {
+  copy: StoredBase<Doc, Tab>;
+  values: ChunkedValues;
+} {
+  const values = new ChunkedValues(w.storage, { prefix: "copy:", chunkBytes: 8 });
+  const copy = new StoredBase<Doc, Tab>({
+    values,
+    name: "doc",
+    formatVersion: 1,
+    ttlMs: TTL,
+    encode: encodeDoc,
+    decode: decodeTab,
+    fetch: async () => {
+      w.fetches++;
+      const next = w.answers.shift() ?? new Error("unexpected fetch");
+      if (next instanceof Error) throw next;
+      return next;
+    },
+    unchanged: async revision => {
+      w.asked.push(revision);
+      const next = w.verdicts.shift() ?? new Error("unexpected revision check");
+      if (next instanceof Error) throw next;
+      return next;
+    },
+    now: () => w.now,
+    ...overrides,
+  });
+  return { copy, values };
+}
+
+// Storage that refuses a write to any key `rejects` names, as storage out of room would, and a
+// delete of any key `keeps` names.
+function refusing(
+  storage: FakeStorage,
+  rejects: (key: string) => boolean,
+  keeps: (key: string) => boolean = () => false,
+): FakeStorage {
+  const { kv } = storage;
+  return {
+    transactionSync: callback => storage.transactionSync(callback),
+    kv: {
+      ...kv,
+      put: (key, value) => {
+        if (rejects(key)) throw new Error("storage refused the write");
+        kv.put(key, value);
+      },
+      delete: key => {
+        if (keeps(key)) throw new Error("storage refused the delete");
+        kv.delete(key);
+      },
+    },
+  };
+}
+
+/** A `ChunkedValues` that lists the names it was asked to put, in order. */
+class CountingValues extends ChunkedValues {
+  readonly puts: string[] = [];
+
+  override put(name: string, bytes: Uint8Array, meta?: unknown): void {
+    this.puts.push(name);
+    super.put(name, bytes, meta);
+  }
+}
+
+/** What a test can make fail in one `StoredBase`. */
+type Knobs = {
+  encode: (doc: Doc) => Map<string, Uint8Array>;
+  refuse: (key: string) => boolean;
+};
+/** The knobs of a copy nothing fails for. */
+const sound = (): Knobs => ({ encode: encodeDoc, refuse: () => false });
+/** Queues a changed revision and the base the fetch that follows answers. */
+const changed = (w: World, base: Doc = fetched("uno", "a second tab of several chunks")): void => {
+  w.verdicts.push(false);
+  w.answers.push({ base, revision: "r1" });
+};
+
+// An earlier copy for the rows that have one: past `ttlMs` and with no revision, so the next
+// `current()` fetches.
+const withEarlierCopy = async (w: World, copy: StoredBase<Doc, Tab>) => {
+  w.answers.push({ base: fetched("zero") });
+  const earlier = await copy.current();
+  w.now += TTL;
+  return earlier;
+};
+// Two fetches the test answers when it chooses, so storage can be read between the answers.
+const twoFetches = (w: World) => {
+  const answers = [Promise.withResolvers<Answer>(), Promise.withResolvers<Answer>()] as const;
+  w.answers.push(answers[0].promise, answers[1].promise);
+  return answers;
+};
+
+describe("StoredBase", () => {
+  it("fetches and stores when nothing is held", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("one"), revision: "r1" });
+
+    expect(copy.held()).toBeUndefined();
+    const got = await copy.current();
+
+    expect(w.fetches).toBe(1);
+    expect(seen(got)).toEqual({ base: kept("one"), fetchedAt: 1_000, revision: "r1" });
+    expect(seen(copy.held())).toEqual(seen(got));
+  });
+
+  it("serves what it stored, not what was fetched", async () => {
+    const w = world();
+    const { copy } = open(w);
+    const answer = Promise.withResolvers<Answer>();
+    w.answers.push(answer.promise);
+    const base = fetched("one");
+
+    const reading = copy.current();
+    w.now = 1_050;
+    answer.resolve({ base });
+    const got = await reading;
+
+    expect(got.keys).toEqual(["t.0"]);
+    expect(got.part("t.0")).not.toBe(base.tabs[0]);
+    expect(got.part("t.0")).toEqual({ id: "t.0", text: "one" });
+    expect(got.part("t.0")).not.toHaveProperty("scratch");
+    expect(got.part("t.1")).toBeUndefined();
+    expect(got.fetchedAt).toBe(1_000);
+    expect(got).not.toHaveProperty("revision");
+    expect(seen(copy.held())).toEqual(seen(got));
+
+    // The copy ages from when the fetch began as well, not from when it was answered.
+    w.answers.push({ base: fetched("two") });
+    w.now = 1_000 + TTL - 1;
+    await copy.current();
+    expect(w.fetches).toBe(1);
+    w.now = 1_000 + TTL;
+    await copy.current();
+    expect(w.fetches).toBe(2);
+  });
+
+  it("stores one value per partition and an index", async () => {
+    const w = world();
+    const { copy, values } = open(w);
+    const ids = ["t.0", "a:b", "a/b", "", "éß中", "\u{1F600}"];
+    const tabs = ids.map(id => ({ id, text: `the text of ${id}` }));
+    w.answers.push({ base: { tabs } });
+
+    await copy.current();
+
+    for (const tab of tabs) {
+      expect(values.get(`doc/${encodeURIComponent(tab.id)}`)).toEqual(
+        { bytes: utf8(JSON.stringify(tab)), meta: undefined });
+    }
+    expect(values.get("doc")?.bytes).toEqual(new Uint8Array(0));
+    expect(values.meta("doc")).toMatchObject({ partitions: ids.map(key => ({ key })) });
+    expect(whole(copy.held())).toEqual({ tabs });
+  });
+
+  it("serves the held copy while it is younger than ttlMs", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("one"), revision: "r1" });
+    const first = await copy.current();
+
+    w.now += TTL - 1;
+    const again = await copy.current();
+
+    expect(w.fetches).toBe(1);
+    expect(w.asked).toEqual([]);
+    expect(identical(again, first)).toBe(true);
+    expect(identical(copy.held(), first)).toBe(true);
+    expect(identical(await copy.current(), first)).toBe(true);
+  });
+
+  it("confirms an old copy by its revision and restarts its age", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("one", "two"), revision: "r1" });
+    const first = await copy.current();
+    const written = w.storage.kv.writes.length;
+    const verdict = Promise.withResolvers<boolean>();
+    w.verdicts.push(verdict.promise);
+
+    w.now = 1_000 + TTL;
+    const reading = copy.current();
+    // The provider answers later than it was asked.
+    w.now += 30;
+    verdict.resolve(true);
+    const confirmed = await reading;
+
+    expect(w.asked).toEqual(["r1"]);
+    expect(w.fetches).toBe(1);
+    expect(identical(confirmed, first)).toBe(true);
+    expect(confirmed.fetchedAt).toBe(1_000);
+    expect(seen(copy.held())).toEqual(seen(first));
+    expect(w.storage.kv.writes.slice(written)).toEqual(["copy:doc:manifest"]);
+
+    w.now = 1_000 + TTL + TTL - 1;
+    await copy.current();
+    expect(w.asked).toEqual(["r1"]);
+
+    w.now = 1_000 + TTL + TTL;
+    w.verdicts.push(true);
+    await copy.current();
+    expect(w.asked).toEqual(["r1", "r1"]);
+    expect(w.fetches).toBe(1);
+  });
+
+  it("fetches again when the revision changed", async () => {
+    const w = world();
+    const { copy, values } = open(w);
+    w.answers.push({ base: fetched("one", "two"), revision: "r1" });
+    const first = await copy.current();
+
+    w.now += TTL;
+    w.verdicts.push(false);
+    w.answers.push({ base: fetched("uno"), revision: "r2" });
+    const second = await copy.current();
+
+    expect(w.asked).toEqual(["r1"]);
+    expect(w.fetches).toBe(2);
+    expect(identical(second, first)).toBe(false);
+    expect(seen(second)).toEqual({ base: kept("uno"), fetchedAt: 1_000 + TTL, revision: "r2" });
+    expect(seen(copy.held())).toEqual(seen(second));
+    expect(values.get("doc/t.1")).toBeUndefined();
+    expect(w.storage.kv.keys().filter(key => key.startsWith("copy:doc/t.1"))).toEqual([]);
+    expect(values.meta("doc")).toMatchObject({ partitions: [{ key: "t.0" }] });
+  });
+
+  it("fetches an old copy that has no revision", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("one") }, { base: fetched("uno") });
+    await copy.current();
+
+    w.now += TTL;
+    const second = await copy.current();
+
+    expect(w.asked).toEqual([]);
+    expect(w.fetches).toBe(2);
+    expect(whole(second)).toEqual(kept("uno"));
+  });
+
+  it("fetches an old copy when unchanged is not given", async () => {
+    const w = world();
+    const { copy } = open(w, { unchanged: undefined });
+    w.answers.push({ base: fetched("one"), revision: "r1" }, { base: fetched("uno"), revision: "r2" });
+    await copy.current();
+
+    w.now += TTL;
+    const second = await copy.current();
+
+    expect(w.fetches).toBe(2);
+    expect(seen(second)).toEqual({ base: kept("uno"), fetchedAt: 1_000 + TTL, revision: "r2" });
+  });
+
+  it("shares one fetch between concurrent calls", async () => {
+    const w = world();
+    const { copy } = open(w);
+    const answer = Promise.withResolvers<Answer>();
+    w.answers.push(answer.promise);
+
+    const readings = [copy.current(), copy.current()];
+    answer.resolve({ base: fetched("one"), revision: "r1" });
+    const [first, second] = await Promise.all(readings);
+
+    expect(w.fetches).toBe(1);
+    expect(seen(second)).toEqual(seen(first));
+    expect(identical(second, first)).toBe(true);
+  });
+
+  it.each([
+    ["is unchanged", true, 1],
+    ["changed", false, 2],
+  ])("shares one revision check between concurrent calls when the revision %s", async (_, same, fetches) => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("one"), revision: "r1" }, { base: fetched("uno"), revision: "r2" });
+    const held = await copy.current();
+    const verdict = Promise.withResolvers<boolean>();
+    w.verdicts.push(verdict.promise);
+
+    w.now += TTL;
+    const readings = [copy.current(), copy.current()];
+    verdict.resolve(same);
+    const [first, second] = await Promise.all(readings);
+
+    expect(w.asked).toEqual(["r1"]);
+    expect(w.fetches).toBe(fetches);
+    expect(identical(second, first)).toBe(true);
+    expect(identical(first, held)).toBe(same);
+    expect(whole(first)).toEqual(same ? kept("one") : kept("uno"));
+  });
+
+  it.each<[string, (w: World, knobs: Knobs) => void, string]>([
+    ["fetch", w => {
+      w.verdicts.push(false);
+      w.answers.push(new Error("fetch failed"));
+    }, "fetch failed"],
+    ["unchanged", w => {
+      w.verdicts.push(new Error("check failed"));
+    }, "check failed"],
+    ["encode", (w, knobs) => {
+      changed(w);
+      knobs.encode = () => {
+        throw new Error("encode failed");
+      };
+    }, "encode failed"],
+    ["a partition key that is not well formed", w => {
+      changed(w, { tabs: [{ id: "t.0", text: "uno" }, { id: "t\uD800", text: "dos" }] });
+    }, "A StoredBase partition key must be well-formed Unicode."],
+    ["storage, in the middle of the store", (w, knobs) => {
+      changed(w);
+      knobs.refuse = key => key === "copy:doc/t.1:chunk:0001";
+    }, "storage refused the write"],
+    ["storage, at the index that ends the store", (w, knobs) => {
+      changed(w);
+      knobs.refuse = key => key === "copy:doc:manifest";
+    }, "storage refused the write"],
+  ])("leaves the stored copy as it was when %s fails", async (_, arm, message) => {
+    const knobs = sound();
+    const w = world(refusing(fakeStorage(), key => knobs.refuse(key)));
+    const { copy } = open(w, { encode: doc => knobs.encode(doc) });
+    w.answers.push({ base: fetched("one", "two", "three"), revision: "r0" });
+    const earlier = await copy.current();
+    const before = snapshot(w.storage);
+
+    w.now += TTL;
+    arm(w, knobs);
+    const error: unknown = await copy.current().catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(URIError);
+    expect((error as Error).message).toBe(message);
+    const held = copy.held();
+    expect(seen(held)).toEqual(seen(earlier));
+    expect(identical(held, earlier)).toBe(true);
+    expect(snapshot(w.storage)).toEqual(before);
+
+    Object.assign(knobs, sound());
+    w.verdicts.push(false);
+    w.answers.push({ base: fetched("again"), revision: "r2" });
+    expect(seen(await copy.current())).toEqual(
+      { base: kept("again"), fetchedAt: 1_000 + TTL, revision: "r2" });
+  });
+
+  it.each([
+    ["nothing is", false],
+    ["an earlier copy is", true],
+  ])("neither stores nor serves a fetch in flight when a write lands and %s stored", async (_, has) => {
+    const w = world();
+    const { kv } = w.storage;
+    const { copy } = open(w);
+    if (has) await withEarlierCopy(w, copy);
+    const began = w.fetches;
+    const [a, b] = twoFetches(w);
+    let settled = false;
+    const mark = (): void => {
+      settled = true;
+    };
+
+    const first = copy.current();
+    void first.then(mark, mark);
+    copy.noteWrite();
+    const keys = kv.keys();
+    const written = kv.writes.length;
+
+    a.resolve({ base: fetched("A"), revision: "ra" });
+    // The superseded fetch is encoded and digested before it is refused, and only then does the
+    // next one begin.
+    await vi.waitFor(() => expect(w.fetches - began).toBe(2));
+    await settle();
+
+    expect(kv.keys()).toEqual(keys);
+    expect(kv.writes).toHaveLength(written);
+    // A copy stored before the write lacks it, so it is held for no one.
+    expect(copy.held()).toBeUndefined();
+    expect(w.fetches - began).toBe(2);
+    expect(settled).toBe(false);
+
+    b.resolve({ base: fetched("B"), revision: "rb" });
+    const got = await first;
+
+    expect(whole(got)).toEqual(kept("B"));
+    expect(got.revision).toBe("rb");
+    expect(seen(copy.held())).toEqual(seen(got));
+    expect(identical(copy.held(), got)).toBe(true);
+  });
+
+  it("joins a call that a write superseded to the fetch begun after the write", async () => {
+    const w = world();
+    const { kv } = w.storage;
+    const { copy } = open(w);
+    const [a, b] = twoFetches(w);
+
+    const first = copy.current();
+    copy.noteWrite();
+    const second = copy.current();
+    expect(w.fetches).toBe(2);
+    const keys = kv.keys();
+    const written = kv.writes.length;
+
+    a.resolve({ base: fetched("A"), revision: "ra" });
+    await settle();
+
+    expect(kv.keys()).toEqual(keys);
+    expect(kv.writes).toHaveLength(written);
+    expect(copy.held()).toBeUndefined();
+
+    b.resolve({ base: fetched("B"), revision: "rb" });
+    const [one, two] = await Promise.all([first, second]);
+
+    expect(w.fetches).toBe(2);
+    expect(whole(one)).toEqual(kept("B"));
+    expect(identical(two, one)).toBe(true);
+  });
+
+  const overtakers = (["in one turn", "in two microtasks"] as const).flatMap(form => [
+    { method: "noteWrite", form, same: undefined, how: "noteWrite" },
+    { method: "recheck", form, same: false, how: "recheck, the revision changed" },
+    { method: "recheck", form, same: true, how: "recheck, the revision unchanged" },
+    { method: "drop", form, same: undefined, how: "drop" },
+  ] as const);
+
+  it.each(overtakers)(
+    "never answers a call made after $how with work begun before it, $form",
+    async ({ method, form, same }) => {
+      const w = world();
+      const { copy } = open(w);
+      w.answers.push({ base: fetched("v1"), revision: "r1" }, { base: fetched("v2"), revision: "r2" });
+      const v1 = await copy.current();
+      if (same !== undefined) w.verdicts.push(same);
+
+      let before: Promise<unknown>;
+      let after: Promise<Awaited<ReturnType<typeof copy.current>>>;
+      if (form === "in one turn") {
+        before = copy.current();
+        copy[method]();
+        after = copy.current();
+      } else {
+        // How a read and an apply interleave in a Durable Object.
+        const gate = Promise.resolve();
+        before = gate.then(() => copy.current());
+        after = gate.then(() => {
+          copy[method]();
+          return copy.current();
+        });
+      }
+      await Promise.allSettled([before, after]);
+      const got = await after;
+
+      if (same === true) {
+        expect(w.fetches).toBe(1);
+        expect(identical(got, v1)).toBe(true);
+      } else {
+        expect(w.fetches).toBe(2);
+        expect(seen(got)).toEqual({ base: kept("v2"), fetchedAt: 1_000, revision: "r2" });
+      }
+      expect(w.asked).toEqual(method === "recheck" ? ["r1"] : []);
+      const held = copy.held();
+      expect(seen(held)).toEqual(seen(got));
+      expect(identical(held, got)).toBe(true);
+    },
+  );
+
+  it("does not credit a revision check that a write overtook", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("v1"), revision: "r1" }, { base: fetched("v2"), revision: "r2" });
+    await copy.current();
+    const verdict = Promise.withResolvers<boolean>();
+    w.verdicts.push(verdict.promise);
+
+    w.now += TTL;
+    const reading = copy.current();
+    copy.noteWrite();
+    verdict.resolve(true);
+    const got = await reading;
+
+    expect(w.asked).toEqual(["r1"]);
+    expect(w.fetches).toBe(2);
+    expect(whole(got)).toEqual(kept("v2"));
+    expect(seen(copy.held())).toEqual(seen(got));
+  });
+
+  it("fetches after a write without asking for the revision, and holds the copy from before it for no one", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("v1"), revision: "r1" }, { base: fetched("v2"), revision: "r2" });
+    await copy.current();
+
+    copy.noteWrite();
+
+    expect(copy.held()).toBeUndefined();
+    // What an eviction finds is the same: the mark is stored.
+    expect(open(w).copy.held()).toBeUndefined();
+
+    const v2 = await copy.current();
+
+    expect(w.fetches).toBe(2);
+    expect(w.asked).toEqual([]);
+    expect(whole(v2)).toEqual(kept("v2"));
+    expect(seen(copy.held())).toEqual(seen(v2));
+    expect(identical(copy.held(), v2)).toBe(true);
+
+    // The fetched copy is fresh: the write marked the copy it replaced.
+    expect(identical(await copy.current(), v2)).toBe(true);
+    expect(w.fetches).toBe(2);
+    expect(w.asked).toEqual([]);
+  });
+
+  it("rechecks on demand whatever the age", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("v1"), revision: "r1" });
+    const v1 = await copy.current();
+
+    copy.recheck();
+    w.now += 10;
+    w.verdicts.push(true);
+    const confirmed = await copy.current();
+
+    expect(w.asked).toEqual(["r1"]);
+    expect(w.fetches).toBe(1);
+    expect(identical(confirmed, v1)).toBe(true);
+
+    // The age restarted at the check: nothing is asked for another `ttlMs`.
+    w.now += TTL - 1;
+    await copy.current();
+    expect(w.asked).toEqual(["r1"]);
+    w.now += 1;
+    w.verdicts.push(true);
+    await copy.current();
+    expect(w.asked).toEqual(["r1", "r1"]);
+  });
+
+  it("fetches on a recheck when the copy has no revision", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("v1") }, { base: fetched("v2") });
+    await copy.current();
+
+    copy.recheck();
+    const got = await copy.current();
+
+    expect(w.asked).toEqual([]);
+    expect(w.fetches).toBe(2);
+    expect(whole(got)).toEqual(kept("v2"));
+  });
+
+  // An approval and then a rejection with no read between them: the write's mark and the
+  // recheck's are kept apart, so the provider's revision is not asked about a copy a write
+  // outdated.
+  it.each([
+    ["a write and then a recheck", ["noteWrite", "recheck"]],
+    ["a recheck and then a write", ["recheck", "noteWrite"]],
+  ] as const)("fetches without asking for the revision after %s", async (_, calls) => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("v1"), revision: "r1" }, { base: fetched("v2"), revision: "r2" });
+    await copy.current();
+
+    for (const call of calls) copy[call]();
+    const got = await open(w).copy.current();
+
+    expect(w.asked).toEqual([]);
+    expect(w.fetches).toBe(2);
+    expect(whole(got)).toEqual(kept("v2"));
+  });
+
+  it("asks again when a recheck comes while a check is in flight", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("v1"), revision: "r1" });
+    const v1 = await copy.current();
+    const verdict = Promise.withResolvers<boolean>();
+    w.verdicts.push(verdict.promise, true);
+
+    w.now += TTL;
+    const reading = copy.current();
+    copy.recheck();
+    verdict.resolve(true);
+    const got = await reading;
+
+    expect(w.asked).toEqual(["r1", "r1"]);
+    expect(w.fetches).toBe(1);
+    expect(identical(got, v1)).toBe(true);
+  });
+
+  it("asks again when a second recheck comes while the check the first asked for is in flight", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("v1"), revision: "r1" });
+    const v1 = await copy.current();
+    const verdict = Promise.withResolvers<boolean>();
+    w.verdicts.push(verdict.promise, true);
+
+    copy.recheck();
+    const reading = copy.current();
+    copy.recheck();
+    verdict.resolve(true);
+    const got = await reading;
+
+    expect(w.asked).toEqual(["r1", "r1"]);
+    expect(w.fetches).toBe(1);
+    expect(identical(got, v1)).toBe(true);
+  });
+
+  it("joins a check that a recheck superseded to the check begun after the recheck", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("v1"), revision: "r1" });
+    const v1 = await copy.current();
+    const verdicts = [Promise.withResolvers<boolean>(), Promise.withResolvers<boolean>()] as const;
+    w.verdicts.push(verdicts[0].promise, verdicts[1].promise);
+
+    w.now += TTL;
+    const first = copy.current();
+    copy.recheck();
+    const second = copy.current();
+    const both = Promise.allSettled([first, second]);
+
+    verdicts[0].resolve(true);
+    await settle();
+
+    // The superseded call waits on the check the later call began: it asks nothing itself.
+    expect(w.asked).toEqual(["r1", "r1"]);
+
+    verdicts[1].resolve(true);
+
+    expect((await both).map(({ status }) => status)).toEqual(["fulfilled", "fulfilled"]);
+    expect(seen(await first)).toEqual(seen(v1));
+    expect(seen(await second)).toEqual(seen(v1));
+    expect(identical(await first, v1)).toBe(true);
+    expect(identical(await second, v1)).toBe(true);
+    expect(w.asked).toEqual(["r1", "r1"]);
+    expect(w.fetches).toBe(1);
+  });
+
+  it("drops the copy", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("one", "two"), revision: "r1" }, { base: fetched("uno") });
+    await copy.current();
+
+    copy.drop();
+
+    expect(w.storage.kv.keys()).toEqual([]);
+    expect(copy.held()).toBeUndefined();
+    expect(whole(await copy.current())).toEqual(kept("uno"));
+    expect(w.fetches).toBe(2);
+  });
+
+  it("removes nothing when storage refuses part of a drop", async () => {
+    let keep = false;
+    const w = world(refusing(fakeStorage(), () => false, key => keep && key === "copy:doc:manifest"));
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("one", "two"), revision: "r1" });
+    const got = await copy.current();
+    const before = snapshot(w.storage);
+
+    keep = true;
+    expect(() => copy.drop()).toThrow("storage refused the delete");
+
+    expect(snapshot(w.storage)).toEqual(before);
+    expect(seen(open(w).copy.held())).toEqual(seen(got));
+
+    keep = false;
+    copy.drop();
+
+    expect(w.storage.kv.keys()).toEqual([]);
+  });
+
+  it.each([
+    ["nothing is", false],
+    ["an earlier copy is", true],
+  ])("neither stores nor serves a fetch in flight when the copy is dropped and %s stored", async (_, has) => {
+    const w = world();
+    const { kv } = w.storage;
+    const { copy } = open(w);
+    if (has) await withEarlierCopy(w, copy);
+    const began = w.fetches;
+    const [a, b] = twoFetches(w);
+    let settled = false;
+    const mark = (): void => {
+      settled = true;
+    };
+
+    const first = copy.current();
+    void first.then(mark, mark);
+    copy.drop();
+    expect(kv.keys()).toEqual([]);
+    const written = kv.writes.length;
+
+    a.resolve({ base: fetched("A"), revision: "ra" });
+    // The superseded fetch is encoded and digested before it is refused, and only then does the
+    // next one begin.
+    await vi.waitFor(() => expect(w.fetches - began).toBe(2));
+    await settle();
+
+    expect(copy.held()).toBeUndefined();
+    expect(kv.keys()).toEqual([]);
+    expect(kv.writes).toHaveLength(written);
+    expect(w.fetches - began).toBe(2);
+    expect(settled).toBe(false);
+
+    b.resolve({ base: fetched("B"), revision: "rb" });
+    const got = await first;
+
+    expect(whole(got)).toEqual(kept("B"));
+    expect(seen(copy.held())).toEqual(seen(got));
+    expect(identical(copy.held(), got)).toBe(true);
+  });
+
+  // A call that finds nothing to mark, or its mark already there, writes nothing and still makes
+  // the work in flight worthless.
+  it.each([
+    ["a second write, the copy already stale", "noteWrite", true],
+    ["a recheck with nothing stored", "recheck", false],
+  ] as const)("starts a fetch in flight over after %s", async (_, method, stale) => {
+    const w = world();
+    const { kv } = w.storage;
+    const { copy } = open(w);
+    if (stale) {
+      w.answers.push({ base: fetched("v1"), revision: "r1" });
+      await copy.current();
+      copy.noteWrite();
+    }
+    const earlier = copy.held();
+    const began = w.fetches;
+    const [a, b] = twoFetches(w);
+
+    const first = copy.current();
+    const written = kv.writes.length;
+    copy[method]();
+    expect(kv.writes).toHaveLength(written);
+
+    a.resolve({ base: fetched("A"), revision: "ra" });
+    // The superseded fetch is encoded and digested before it is refused, and only then does the
+    // next one begin.
+    await vi.waitFor(() => expect(w.fetches - began).toBe(2));
+    await settle();
+
+    expect(w.fetches - began).toBe(2);
+    expect(kv.writes).toHaveLength(written);
+    expect(identical(copy.held(), earlier)).toBe(true);
+
+    b.resolve({ base: fetched("B"), revision: "rb" });
+
+    expect(whole(await first)).toEqual(kept("B"));
+    expect(w.asked).toEqual([]);
+    expect(copy.held()?.revision).toBe("rb");
+  });
+
+  it.each(["noteWrite", "recheck", "drop"] as const)(
+    "does nothing to storage when nothing is held: %s",
+    method => {
+      const w = world();
+      const { copy } = open(w);
+
+      copy[method]();
+
+      expect(w.storage.kv.keys()).toEqual([]);
+      expect(w.storage.kv.writes).toEqual([]);
+      expect(copy.held()).toBeUndefined();
+    },
+  );
+
+  it("reads a copy of another format version as absent, and replaces it whole", async () => {
+    const w = world();
+    const { kv } = w.storage;
+    w.answers.push({ base: fetched("one", "two"), revision: "r1" }, { base: fetched("uno"), revision: "r2" });
+    await open(w).copy.current();
+    const { copy, values } = open(w, { formatVersion: 2 });
+
+    expect(copy.held()).toBeUndefined();
+    const got = await copy.current();
+
+    expect(w.fetches).toBe(2);
+    expect(whole(got)).toEqual(kept("uno"));
+    expect(seen(copy.held())).toEqual(seen(got));
+    expect(values.get("doc/t.1")).toBeUndefined();
+    expect(kv.keys().filter(key => key.startsWith("copy:doc/t.1"))).toEqual([]);
+    expect(open(w).copy.held()).toBeUndefined();
+  });
+
+  it("marks a copy of another format version", async () => {
+    const w = world();
+    w.answers.push({ base: fetched("v1"), revision: "r1" }, { base: fetched("v2"), revision: "r2" });
+    await open(w).copy.current();
+    const other = open(w, { formatVersion: 2 }).copy;
+
+    other.recheck();
+    w.verdicts.push(true);
+    await open(w).copy.current();
+
+    expect(w.asked).toEqual(["r1"]);
+    expect(w.fetches).toBe(1);
+
+    other.noteWrite();
+    const got = await open(w).copy.current();
+
+    expect(w.asked).toEqual(["r1"]);
+    expect(w.fetches).toBe(2);
+    expect(whole(got)).toEqual(kept("v2"));
+  });
+
+  it.each<[string, (kv: FakeStorage["kv"]) => void]>([
+    ["incomplete", kv => kv.delete("copy:doc/t.0:chunk:0001")],
+    ["missing", kv => {
+      for (const key of kv.keys()) if (key.startsWith("copy:doc/t.0:")) kv.delete(key);
+    }],
+  ])("answers undefined for a partition that is %s, then fetches", async (_, damage) => {
+    const w = world();
+    const { kv } = w.storage;
+    const warm = open(w).copy;
+    const text = "a text of several chunks";
+    w.answers.push({ base: fetched(text, "two") }, { base: fetched(text, "two") });
+    const got = await warm.current();
+    const first = got.part("t.0");
+    const keys = kv.keys();
+
+    damage(kv);
+
+    // The instance that decoded the partition does not read it again.
+    expect(warm.held()?.part("t.0")).toBe(first);
+    // Another reads the index alone until the partition is asked for.
+    const cold = open(w).copy;
+    const held = cold.held();
+    expect(held?.keys).toEqual(["t.0", "t.1"]);
+    expect(held?.part("t.1")).toEqual({ id: "t.1", text: "two" });
+    expect(cold.held()).toBeDefined();
+    expect(held?.part("t.0")).toBeUndefined();
+    expect(cold.held()).toBeUndefined();
+    expect(w.storage.transactionSync(() => cold.held())).toBeUndefined();
+
+    const repaired = await cold.current();
+
+    expect(w.fetches).toBe(2);
+    expect(kv.keys()).toEqual(keys);
+    expect(seen(cold.held())).toEqual(seen(repaired));
+    expect(whole(repaired)).toEqual(kept(text, "two"));
+  });
+
+  it("reads a copy as absent once a partition of it does not decode, and replaces it", async () => {
+    const w = world();
+    w.answers.push({ base: fetched("unreadable", "two") }, { base: fetched("readable", "two") });
+    await open(w).copy.current();
+    const { copy } = open(w, {
+      decode: (key, bytes) => {
+        const tab = decodeTab(key, bytes);
+        if (tab.text === "unreadable") throw new Error("cannot decode");
+        return tab;
+      },
+    });
+
+    const held = copy.held();
+    expect(held?.part("t.1")).toEqual({ id: "t.1", text: "two" });
+    expect(held?.part("t.0")).toBeUndefined();
+    expect(copy.held()).toBeUndefined();
+    expect(w.storage.transactionSync(() => copy.held())).toBeUndefined();
+
+    const got = await copy.current();
+
+    expect(w.fetches).toBe(2);
+    expect(whole(got)).toEqual(kept("readable", "two"));
+    expect(seen(copy.held())).toEqual(seen(got));
+  });
+
+  it("removes the partitions listed by an index it does not understand", async () => {
+    const w = world();
+    const { kv } = w.storage;
+    const { copy, values } = open(w);
+    const foreign = (): void => {
+      values.put("doc/old", utf8("left by other code"));
+      values.put("doc", new Uint8Array(0), { version: 3, partitions: ["old"] });
+    };
+    foreign();
+    const written = kv.writes.length;
+
+    expect(copy.held()).toBeUndefined();
+    copy.noteWrite();
+    copy.recheck();
+    expect(kv.writes).toHaveLength(written);
+
+    w.answers.push({ base: fetched("one") });
+    const got = await copy.current();
+
+    expect(values.get("doc/old")).toBeUndefined();
+    expect(seen(copy.held())).toEqual(seen(got));
+
+    copy.drop();
+    foreign();
+    copy.drop();
+
+    expect(kv.keys()).toEqual([]);
+  });
+
+  it("never throws for a stored partition key that is not well formed", async () => {
+    const w = world();
+    const { kv } = w.storage;
+    const { copy, values } = open(w);
+    const foreign = (): void => {
+      values.put("doc/ok", utf8("left by other code"));
+      values.put("doc", new Uint8Array(0), {
+        version: 2,
+        formatVersion: 1,
+        stamp: "a stamp",
+        fetchedAt: 1_000,
+        checkedAt: 1_000,
+        partitions: [{ key: "ok", digest: "00" }, { key: "t\uD800", digest: "00" }],
+      });
+    };
+    foreign();
+    const written = kv.writes.length;
+
+    expect(copy.held()).toBeUndefined();
+    expect(w.storage.transactionSync(() => copy.held())).toBeUndefined();
+    copy.noteWrite();
+    copy.recheck();
+    expect(kv.writes).toHaveLength(written);
+
+    w.answers.push({ base: fetched("one") });
+    const got = await copy.current();
+
+    expect(w.fetches).toBe(1);
+    expect(values.get("doc/ok")).toBeUndefined();
+    expect(seen(copy.held())).toEqual(seen(got));
+
+    copy.drop();
+    foreign();
+    copy.drop();
+
+    expect(kv.keys()).toEqual([]);
+  });
+
+  it.each<[string, Record<string, unknown>]>([
+    ["another version", { version: 3 }],
+    ["a stamp that is not a string", { stamp: 3 }],
+    ["no stamp", { stamp: undefined }],
+    ["a fetchedAt that is not a number", { fetchedAt: "x" }],
+    ["a fetchedAt that is not finite", { fetchedAt: Number.NaN }],
+    ["a revision that is not a string", { revision: 5 }],
+    ["a checkedAt that is not a number", { checkedAt: "x" }],
+    ["a checkedAt that is not finite", { checkedAt: Number.POSITIVE_INFINITY }],
+    ["a formatVersion that is not a number", { formatVersion: "1" }],
+    ["no formatVersion", { formatVersion: undefined }],
+  ])("reads a stored record with %s as absent, and replaces it", async (_, change) => {
+    const w = world();
+    const { kv } = w.storage;
+    const { copy: warm, values } = open(w);
+    w.answers.push({ base: fetched("one", "two"), revision: "r1" }, { base: fetched("uno"), revision: "r2" });
+    await warm.current();
+    // The record a fetch stored, its partitions beside it, wrong in this one respect.
+    values.put("doc", new Uint8Array(0), { ...(values.meta("doc") as object), ...change });
+    const written = kv.writes.length;
+    const { copy } = open(w);
+
+    expect(copy.held()).toBeUndefined();
+    expect(w.storage.transactionSync(() => copy.held())).toBeUndefined();
+    copy.noteWrite();
+    copy.recheck();
+    expect(kv.writes).toHaveLength(written);
+
+    const got = await copy.current();
+
+    expect(w.fetches).toBe(2);
+    expect(seen(got)).toEqual({ base: kept("uno"), fetchedAt: 1_000, revision: "r2" });
+    expect(seen(copy.held())).toEqual(seen(got));
+    expect(values.get("doc/t.1")).toBeUndefined();
+  });
+
+  it.each<[string, unknown]>([
+    ["a string", "t.0"],
+    ["absent", undefined],
+    ["an object with a length", { length: 1 }],
+    ["a list of keys without digests", ["t.0"]],
+    ["a list of digests without keys", [{ digest: "00" }]],
+    ["a list holding nothing to read", [null]],
+  ])("never throws for a stored record whose partitions is %s", async (_, partitions) => {
+    const w = world();
+    const { kv } = w.storage;
+    const { copy: warm, values } = open(w);
+    w.answers.push({ base: fetched("one"), revision: "r1" }, { base: fetched("uno"), revision: "r2" });
+    await warm.current();
+    // The record a fetch stored, its partition beside it, listing nothing a reader can walk.
+    values.put("doc", new Uint8Array(0), { ...(values.meta("doc") as object), partitions });
+    const written = kv.writes.length;
+    const { copy } = open(w);
+
+    expect(copy.held()).toBeUndefined();
+    expect(w.storage.transactionSync(() => copy.held())).toBeUndefined();
+    copy.noteWrite();
+    copy.recheck();
+    expect(kv.writes).toHaveLength(written);
+
+    const got = await copy.current();
+
+    expect(w.fetches).toBe(2);
+    expect(seen(got)).toEqual({ base: kept("uno"), fetchedAt: 1_000, revision: "r2" });
+    expect(seen(copy.held())).toEqual(seen(got));
+
+    copy.drop();
+
+    expect(kv.keys()).toEqual([]);
+  });
+
+  it.each<[string, unknown]>([
+    ["null", null],
+    ["a string", "t.0"],
+    ["a number", 7],
+    ["an array", ["t.0"]],
+  ])("never throws for a stored record that is %s", async (_, meta) => {
+    const w = world();
+    const { kv } = w.storage;
+    const { copy, values } = open(w);
+    w.answers.push({ base: fetched("uno"), revision: "r2" });
+    // A record under the index name that is no object with fields to read.
+    const foreign = (): void => values.put("doc", new Uint8Array(0), meta);
+    foreign();
+    const written = kv.writes.length;
+
+    expect(copy.held()).toBeUndefined();
+    expect(w.storage.transactionSync(() => copy.held())).toBeUndefined();
+    copy.noteWrite();
+    copy.recheck();
+    expect(kv.writes).toHaveLength(written);
+
+    const got = await copy.current();
+
+    expect(w.fetches).toBe(1);
+    expect(seen(got)).toEqual({ base: kept("uno"), fetchedAt: 1_000, revision: "r2" });
+    expect(seen(copy.held())).toEqual(seen(got));
+
+    copy.drop();
+    foreign();
+    copy.drop();
+
+    expect(kv.keys()).toEqual([]);
+  });
+
+  it("works after an eviction", async () => {
+    const w = world();
+    w.answers.push({ base: fetched("v1"), revision: "r1" });
+    const got = await open(w).copy.current();
+
+    const second = open(w).copy;
+    const held = second.held();
+    expect(seen(held)).toEqual(seen(got));
+    expect(identical(held, got)).toBe(false);
+    w.now += TTL - 1;
+    expect(seen(await second.current())).toEqual(seen(got));
+    expect(w.fetches).toBe(1);
+    expect(w.asked).toEqual([]);
+
+    second.recheck();
+    const third = open(w).copy;
+    w.verdicts.push(true);
+    expect(seen(await third.current())).toEqual(seen(got));
+    expect(w.asked).toEqual(["r1"]);
+    expect(w.fetches).toBe(1);
+
+    third.noteWrite();
+    const fourth = open(w).copy;
+    w.answers.push({ base: fetched("v2"), revision: "r2" });
+    expect(whole(await fourth.current())).toEqual(kept("v2"));
+    expect(w.asked).toEqual(["r1"]);
+    expect(w.fetches).toBe(2);
+  });
+
+  it("decodes again once another instance replaced the stored copy", async () => {
+    const w = world();
+    const first = open(w).copy;
+    const second = open(w).copy;
+    w.answers.push({ base: fetched("v1"), revision: "r1" }, { base: fetched("v2"), revision: "r2" });
+    const v1 = await first.current();
+
+    second.noteWrite();
+    const v2 = await second.current();
+
+    const held = first.held();
+    expect(seen(held)).toEqual(seen(v2));
+    expect(identical(held, v1)).toBe(false);
+    expect(identical(first.held(), held)).toBe(true);
+  });
+
+  it("reads and marks inside a transaction, and is undone with it", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("v1"), revision: "r1" });
+    const got = await copy.current();
+
+    expect(() => w.storage.transactionSync(() => {
+      expect(seen(copy.held())).toEqual(seen(got));
+      copy.recheck();
+      throw new Error("undone");
+    })).toThrow("undone");
+
+    expect(identical(await copy.current(), got)).toBe(true);
+    expect(w.asked).toEqual([]);
+    expect(w.fetches).toBe(1);
+
+    expect(() => w.storage.transactionSync(() => {
+      copy.drop();
+      expect(copy.held()).toBeUndefined();
+      throw new Error("undone");
+    })).toThrow("undone");
+
+    expect(seen(copy.held())).toEqual(seen(got));
+    expect(identical(copy.held(), got)).toBe(true);
+  });
+
+  it("keeps two bases on one store apart", async () => {
+    const w = world();
+    const first = open(w).copy;
+    const second = open(w, { name: "doc-2" }).copy;
+    w.answers.push({ base: fetched("first") }, { base: fetched("second") });
+    const one = await first.current();
+    const two = await second.current();
+
+    expect(seen(first.held())).toEqual(seen(one));
+    expect(seen(second.held())).toEqual(seen(two));
+
+    first.drop();
+
+    expect(first.held()).toBeUndefined();
+    expect(seen(second.held())).toEqual(seen(two));
+    expect(seen(open(w, { name: "doc-2" }).copy.held())).toEqual(seen(two));
+    expect(w.storage.kv.keys().every(key => key.startsWith("copy:doc-2"))).toBe(true);
+
+    second.drop();
+
+    expect(w.storage.kv.keys()).toEqual([]);
+  });
+
+  it("lists the partitions in the order encode gave them", async () => {
+    const w = world();
+    const tabs = [{ id: "b", text: "second by key" }, { id: "a", text: "first by key" }];
+    w.answers.push({ base: { tabs } });
+    const warm = await open(w).copy.current();
+    const given: string[] = [];
+    const cold = open(w, {
+      decode: (key, bytes) => {
+        given.push(key);
+        return decodeTab(key, bytes);
+      },
+    }).copy;
+
+    const held = cold.held();
+
+    expect(warm.keys).toEqual(["b", "a"]);
+    expect(held?.keys).toEqual(["b", "a"]);
+    expect(given).toEqual([]);
+    expect(whole(held)).toEqual({ tabs });
+    expect(given).toEqual(["b", "a"]);
+    expect(identical(await cold.current(), held)).toBe(true);
+    expect(w.fetches).toBe(1);
+  });
+
+  it("decodes only the partition that is read", async () => {
+    const w = world();
+    w.answers.push({ base: fetched("one", "two", "three"), revision: "r1" });
+    await open(w).copy.current();
+    const decoded: string[] = [];
+    const { copy } = open(w, {
+      decode: (key, bytes) => {
+        decoded.push(key);
+        return decodeTab(key, bytes);
+      },
+    });
+
+    const held = copy.held();
+
+    expect(held?.keys).toEqual(["t.0", "t.1", "t.2"]);
+    expect(decoded).toEqual([]);
+    expect(held?.part("t.1")).toEqual({ id: "t.1", text: "two" });
+    expect((await copy.current()).part("t.1")).toBe(held?.part("t.1"));
+    expect(decoded).toEqual(["t.1"]);
+    expect(w.fetches).toBe(1);
+  });
+
+  it("gives the same object for a partition a refetch brought unchanged", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("one", "two") }, { base: fetched("one", "dos") });
+    const first = await copy.current();
+    const [one, two] = [first.part("t.0"), first.part("t.1")];
+
+    w.now += TTL;
+    const second = await copy.current();
+
+    expect(w.fetches).toBe(2);
+    expect(second.part("t.0")).toBe(one);
+    expect(second.part("t.1")).not.toBe(two);
+    expect(second.part("t.1")).toEqual({ id: "t.1", text: "dos" });
+    expect(copy.held()?.part("t.0")).toBe(one);
+  });
+
+  it("does not rewrite a partition a fetch returned unchanged", async () => {
+    const w = world();
+    const values = new CountingValues(w.storage, { prefix: "copy:", chunkBytes: 8 });
+    const { copy } = open(w, { values });
+    w.answers.push(
+      { base: fetched("one", "two", "three"), revision: "r1" },
+      { base: fetched("one", "dos", "three"), revision: "r2" },
+    );
+    await copy.current();
+    expect(values.puts).toEqual(["doc/t.0", "doc/t.1", "doc/t.2", "doc"]);
+
+    values.puts.length = 0;
+    w.now += TTL;
+    w.verdicts.push(false);
+    const got = await copy.current();
+
+    expect(values.puts).toEqual(["doc/t.1", "doc"]);
+    expect(seen(got)).toEqual(
+      { base: kept("one", "dos", "three"), fetchedAt: 1_000 + TTL, revision: "r2" });
+    // What an eviction finds is the later copy whole: two partitions left alone and one put.
+    expect(seen(open(w).copy.held())).toEqual(seen(got));
+  });
+
+  it("stores again only the partitions a noted write changed, and serves none of the copy from before it", async () => {
+    const w = world();
+    const values = new CountingValues(w.storage, { prefix: "copy:", chunkBytes: 8 });
+    const { copy } = open(w, { values });
+    w.answers.push(
+      { base: fetched("one", "two", "three"), revision: "r1" },
+      { base: fetched("one", "dos", "three"), revision: "r2" },
+    );
+    const before = await copy.current();
+    const one = before.part("t.0");
+    values.puts.length = 0;
+
+    copy.noteWrite();
+
+    // Only the index is put, and the copy from before the write serves what it had decoded.
+    expect(values.puts).toEqual(["doc"]);
+    expect(copy.held()).toBeUndefined();
+    expect(before.part("t.0")).toBe(one);
+    expect(before.part("t.1")).toBeUndefined();
+    expect(before.part("t.2")).toBeUndefined();
+
+    values.puts.length = 0;
+    const got = await copy.current();
+
+    expect(w.asked).toEqual([]);
+    expect(values.puts).toEqual(["doc/t.1", "doc"]);
+    expect(seen(got)).toEqual({ base: kept("one", "dos", "three"), fetchedAt: 1_000, revision: "r2" });
+    // A partition the write left alone keeps its decoded object.
+    expect(got.part("t.0")).toBe(one);
+    expect(seen(open(w).copy.held())).toEqual(seen(got));
+  });
+
+  it("rewrites every partition after one could not be read back", async () => {
+    const w = world();
+    const values = new CountingValues(w.storage, { prefix: "copy:", chunkBytes: 8 });
+    const { copy } = open(w, { values });
+    w.answers.push({ base: fetched("one", "two") }, { base: fetched("one", "two") });
+    await copy.current();
+    values.delete("doc/t.1");
+    values.puts.length = 0;
+
+    expect(copy.held()?.part("t.1")).toBeUndefined();
+    const got = await copy.current();
+
+    expect(w.fetches).toBe(2);
+    expect(values.puts).toEqual(["doc/t.0", "doc/t.1", "doc"]);
+    expect(whole(got)).toEqual(kept("one", "two"));
+  });
+
+  it("keeps the same objects across a drop and a fetch of the same bytes", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("one", "two") }, { base: fetched("one", "two") });
+    const first = await copy.current();
+    const [one, two] = [first.part("t.0"), first.part("t.1")];
+
+    copy.drop();
+    const second = await copy.current();
+
+    expect(w.fetches).toBe(2);
+    expect(second.part("t.0")).toBe(one);
+    expect(second.part("t.1")).toBe(two);
+  });
+
+  it.each(["noteWrite", "recheck", "drop"] as const)(
+    "stores nothing of a fetch a %s() came after",
+    async method => {
+      const w = world();
+      const { copy } = open(w);
+      await withEarlierCopy(w, copy);
+      const began = w.fetches;
+      const [a, b] = twoFetches(w);
+
+      const reading = copy.current();
+      copy[method]();
+      const left = snapshot(w.storage);
+      a.resolve({ base: fetched("A"), revision: "ra" });
+      await vi.waitFor(() => expect(w.fetches - began).toBe(2));
+      await settle();
+
+      expect(snapshot(w.storage)).toEqual(left);
+
+      b.resolve({ base: fetched("B"), revision: "rb" });
+
+      expect(seen(await reading)).toEqual(
+        { base: kept("B"), fetchedAt: 1_000 + TTL, revision: "rb" });
+      expect(w.fetches - began).toBe(2);
+    },
+  );
+
+  it("forgets the decoded partition of a key a later copy does not list", async () => {
+    const w = world();
+    const decoded: string[] = [];
+    const { copy } = open(w, {
+      decode: (key, bytes) => {
+        decoded.push(key);
+        return decodeTab(key, bytes);
+      },
+    });
+    w.answers.push({ base: named("a", "b") }, { base: named("a") }, { base: named("a", "b") });
+    const first = await copy.current();
+    const [a, b] = [first.part("a"), first.part("b")];
+
+    w.now += TTL;
+    await copy.current();
+    w.now += TTL;
+    const third = await copy.current();
+
+    expect(third.part("a")).toBe(a);
+    expect(third.part("b")).toEqual(b);
+    expect(third.part("b")).not.toBe(b);
+    expect(decoded).toEqual(["a", "b", "b"]);
+  });
+
+  it("a copy held across a later keep never serves the later copy's bytes", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push(
+      { base: fetched("one", "two") },
+      { base: fetched("uno", "two") },
+      { base: fetched("one", "two") },
+    );
+    // Held with neither partition decoded.
+    const first = await copy.current();
+
+    w.now += TTL;
+    const second = await copy.current();
+
+    expect(first.part("t.0")).toBeUndefined();
+    expect(copy.held()).toBeDefined();
+    expect(first.part("t.1")).toEqual({ id: "t.1", text: "two" });
+    expect(second.part("t.0")).toEqual({ id: "t.0", text: "uno" });
+    expect(second.part("t.1")).toBe(first.part("t.1"));
+    expect(copy.held()).toBeDefined();
+
+    // The first bytes of the partition come back, and are decoded as what they are.
+    w.now += TTL;
+    const third = await copy.current();
+
+    expect(third.part("t.0")).toEqual({ id: "t.0", text: "one" });
+    expect(first.part("t.0")).toBe(third.part("t.0"));
+    expect(second.part("t.0")).toBeUndefined();
+    expect(copy.held()).toBeDefined();
+    expect(w.fetches).toBe(3);
+  });
+
+  it("a copy held across a drop serves nothing it had not decoded, and what it had", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push({ base: fetched("one", "two") });
+    const got = await copy.current();
+    const one = got.part("t.0");
+
+    copy.drop();
+
+    expect(got.keys).toEqual(["t.0", "t.1"]);
+    expect(got.part("t.0")).toBe(one);
+    expect(got.part("t.1")).toBeUndefined();
+    expect(copy.held()).toBeUndefined();
+    expect(w.storage.kv.keys()).toEqual([]);
+  });
+
+  it("reads a copy stored under the earlier index layout as absent, and removes its partitions at the next keep", async () => {
+    const w = world();
+    const { kv } = w.storage;
+    const { copy, values } = open(w);
+    values.put("doc/t.0", utf8(JSON.stringify({ id: "t.0", text: "one" })));
+    values.put("doc/gone", utf8(JSON.stringify({ id: "gone", text: "left behind" })));
+    values.put("doc", new Uint8Array(0), {
+      version: 1,
+      formatVersion: 1,
+      stamp: "a stamp",
+      fetchedAt: 900,
+      checkedAt: 900,
+      partitions: ["t.0", "gone"],
+    });
+    const written = kv.writes.length;
+
+    expect(copy.held()).toBeUndefined();
+    copy.noteWrite();
+    copy.recheck();
+    expect(kv.writes).toHaveLength(written);
+
+    w.answers.push({ base: fetched("one") });
+    const got = await copy.current();
+
+    expect(w.fetches).toBe(1);
+    expect(seen(got)).toEqual({ base: kept("one"), fetchedAt: 1_000 });
+    // The partition whose bytes the earlier layout already held is put all the same.
+    expect(kv.writes.slice(written)).toContain("copy:doc/t.0:manifest");
+    expect(kv.keys().filter(key => key.startsWith("copy:doc/gone"))).toEqual([]);
+    expect(values.meta("doc")).toMatchObject({ version: 2, partitions: [{ key: "t.0" }] });
+  });
+
+  it("refuses a name outside letters, digits, _ and -, a formatVersion that is not an integer, and a ttlMs that is not a positive integer", () => {
+    const w = world();
+
+    for (const name of ["", "a/b", "a:b", "a b", "a.b", "é"]) {
+      expect(() => open(w, { name })).toThrow(
+        `A StoredBase name must be letters, digits, "_" or "-", got ${JSON.stringify(name)}.`);
+    }
+    expect(() => open(w, { name: "Doc_2-b" })).not.toThrow();
+
+    for (const formatVersion of [Number.NaN, 1.5, Number.POSITIVE_INFINITY]) {
+      expect(() => open(w, { formatVersion })).toThrow(
+        `formatVersion must be a safe integer, got ${formatVersion}.`);
+    }
+    for (const formatVersion of [0, 1]) expect(() => open(w, { formatVersion })).not.toThrow();
+
+    for (const ttlMs of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => open(w, { ttlMs })).toThrow(
+        `ttlMs must be a positive safe integer, got ${ttlMs}.`);
+    }
+  });
+
+  it("gives a simulation store the same partition until a fetch changes its bytes", async () => {
+    const w = world();
+    const { copy } = open(w);
+    w.answers.push(
+      { base: fetched("v1", "other"), revision: "r1" },
+      { base: fetched("v1", "changed"), revision: "r2" },
+      { base: fetched("v2", "changed"), revision: "r3" },
+    );
+    let reduced = 0;
+    const store = createSimulationStore<"t.0", Tab, number, SimulationRecord<string>>({
+      initial: () => 0,
+      reduce: (count = 0) => {
+        reduced++;
+        return { kind: "applied", value: count + 1 };
+      },
+    });
+    const pending = [{ id: 1, action: "edit" }];
+    const fold = async (): Promise<void> => {
+      store.fold("t.0", (await copy.current()).part("t.0"), pending);
+    };
+
+    await fold();
+    await fold();
+    expect(reduced).toBe(1);
+
+    w.now += TTL;
+    w.verdicts.push(true);
+    await fold();
+    expect(w.asked).toEqual(["r1"]);
+    expect(reduced).toBe(1);
+
+    // A fetch that changed another partition leaves this one's fold remembered.
+    w.now += TTL;
+    w.verdicts.push(false);
+    await fold();
+    expect(w.fetches).toBe(2);
+    expect(reduced).toBe(1);
+
+    w.now += TTL;
+    w.verdicts.push(false);
+    await fold();
+    expect(w.fetches).toBe(3);
+    expect(reduced).toBe(2);
+  });
 });
