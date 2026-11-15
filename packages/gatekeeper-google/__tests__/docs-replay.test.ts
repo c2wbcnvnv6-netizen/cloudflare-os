@@ -14,6 +14,7 @@ import {
 import type { DocEdit, DocRefusal, QueuedDocEdit, QueuedDocRecord } from "../src/docs-replay";
 import { docCopy } from "../src/docs-replica";
 import type { DocCopy, DocTabCopy } from "../src/docs-replica";
+import { prepareTableChange, prepareTextReplacement } from "../src/docs-table-actions";
 import {
   tableChangeRequests, tableGateRefusal, tableIdentity, textReplacementRequests,
 } from "../src/docs-tables";
@@ -661,6 +662,7 @@ describe("an edit made in a tab", () => {
     fullReindexes: replayCost.fullReindexes - before.fullReindexes,
     renders: replayCost.renders - before.renders,
   });
+  const NO_PASS = { tabClones: 0, fullReindexes: 0, renders: 0 };
 
   it("answers what it made for the same tab and the same edit, whatever else the edit " +
     "carries", () => {
@@ -751,6 +753,38 @@ describe("an edit made in a tab", () => {
 
     expect(again).not.toBe(t1);
     expect(again).toEqual(t1);
+  });
+
+  it("folds a record from the tab its prepare made", () => {
+    let tab = PROSE();
+    let part = copyOf(tab).tab(TAB);
+    let prepared = prepareTextReplacement(tab, "world", "there", "the document");
+    let before = { ...replayCost };
+    let step = docTabReducer.reduce(
+      tab, record(1, storedAs(replaceWorld)), { id: TAB, base: part, refusals: [] });
+
+    if (step.kind !== "applied") throw new Error(`Expected an applied step, not ${step.kind}`);
+    expect(step.value).toBe(applyDocEdit(tab, replaceWorld));
+    // The rendering the card was made from is the read's.
+    expect(renderTab(step.value).markdown).toBe("Hello there\n\nEnd\n");
+    expect(renderTab(step.value).markdown).toContain(prepared.shown.rendered);
+    expect(passesSince(before)).toEqual(NO_PASS);
+  });
+
+  it("folds the record of a new table from the tab its prepare made", () => {
+    let tab = PROSE();
+    let part = copyOf(tab).tab(TAB);
+    let { change } = prepareTableChange(
+      tab, { method: "insertTable", table: { rows: 1, columns: 2, cells: [["a", "b"]] } },
+      "the document");
+    let before = { ...replayCost };
+    let step = docTabReducer.reduce(
+      tab, record(1, storedAs(change)), { id: TAB, base: part, refusals: [] });
+
+    if (step.kind !== "applied") throw new Error(`Expected an applied step, not ${step.kind}`);
+    expect(step.value).toBe(applyDocEdit(tab, change));
+    expect(renderTab(step.value).sourceMap.tables).toHaveLength(1);
+    expect(passesSince(before)).toEqual(NO_PASS);
   });
 });
 

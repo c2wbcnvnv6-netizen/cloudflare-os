@@ -25,6 +25,196 @@ export type DocSuggestEditOptions = {
   tabId?: string;
 };
 
+/** A table to add with `insertTable()`. */
+export type NewDocTable = {
+  /** How many rows the table has: at least 1. */
+  rows: number;
+
+  /** How many columns it has: 1 to 20. */
+  columns: number;
+
+  /**
+   * `cells[row][column]` is each cell's text. Rows left out at the end, and cells left out at
+   * the end of a row, are empty; an empty cell before a filled one is `""`. The text is plain:
+   * nothing in it is read as Markdown or HTML. `\n` starts a new paragraph in the cell and
+   * `\u000b` breaks a line within one. The cells of one call hold at most 2,000 `\n` in all.
+   */
+  cells?: string[][];
+
+  /**
+   * Where the table goes: Markdown that occurs exactly once in the tab, found as `replaceText()`
+   * finds `oldMarkdown`. The table follows the paragraph, heading, list item or table that the
+   * text ends in (text inside a table names that whole table); line breaks at the end of the
+   * text only help to make it unique. To make it unique, add the text before it or the line
+   * break that ends its paragraph: text added after it names a later paragraph. A line break at
+   * the start of the text stands for the start of a line, the tab's first line included. Omit
+   * `after` to add the table at the end of the tab.
+   */
+  after?: string;
+};
+
+/** Rows or columns to add to a table, for `insertTableRows()` and `insertTableColumns()`. */
+export type DocTableInsertion = {
+  /** The table: its position among the tab's tables, counting from 0. */
+  table: number;
+
+  /**
+   * The row or column, counting from 0, that the new ones go before. Omit it, or give the
+   * table's number of rows or columns, to add them after the last.
+   */
+  at?: number;
+
+  /**
+   * How many to add. For rows, when left out, it is as many as `cells` holds, or 1 without
+   * `cells`. For columns it is 1 unless given: `cells` never sets it. `cells` may fill fewer
+   * rows or columns than `count`, which leaves the rest empty, but not more.
+   */
+  count?: number;
+
+  /**
+   * The new cells' text, as in `NewDocTable.cells`: plain, with cells left out at the end
+   * empty and an empty cell before a filled one `""`. For rows, `cells[i][column]` is the text
+   * of the i-th new row's cell in that column. For columns, `cells[row][i]` is the text of the
+   * i-th new column's cell in that row of the table: one array per row of the table, each
+   * holding one text per new column.
+   */
+  cells?: string[][];
+};
+
+/** Rows or columns to delete from a table, for `deleteTableRows()` and `deleteTableColumns()`. */
+export type DocTableDeletion = {
+  /** The table: its position among the tab's tables, counting from 0. */
+  table: number;
+
+  /** The first row or column to delete, counting from 0. */
+  at: number;
+
+  /** How many to delete: 1 by default. */
+  count?: number;
+};
+
+/** A block of cells of a table, for `setTableCellStyle()`. */
+export type DocTableCells = {
+  /** The table: its position among the tab's tables, counting from 0. */
+  table: number;
+
+  /** The block's first row, counting from 0. */
+  row: number;
+
+  /** The block's first column, counting from 0. */
+  column: number;
+
+  /** How many rows the block spans: 1 by default. */
+  rows?: number;
+
+  /** How many columns the block spans: 1 by default. */
+  columns?: number;
+};
+
+/** One edge of a table cell. */
+export type DocTableBorder = {
+  /** Its width in points, from 0 to 24. An edge 0 wide is not drawn, as `getContent()`'s `none`. */
+  width: number;
+
+  /** How it is drawn: `"solid"` unless given. */
+  dash?: "solid" | "dotted" | "dashed";
+
+  /** Its colour as `#rrggbb`: black unless given. */
+  color?: string;
+};
+
+/**
+ * What `setTableCellStyle()` sets, at least one field of it. A field left out stays as it is.
+ * Lengths are in points, with at most three decimals.
+ */
+export type DocTableCellStyle = {
+  /** The cells' shading as `#rrggbb`, or `null` for none. */
+  background?: string | null;
+
+  /** Where the cells' text sits between their top and bottom. */
+  verticalAlign?: "top" | "middle" | "bottom";
+
+  /** Each side's padding, from 0 to 100 points. */
+  padding?: { top?: number; right?: number; bottom?: number; left?: number };
+
+  /** Every edge of every cell of the block, those between its cells included; `null` hides them. */
+  border?: DocTableBorder | null;
+
+  /**
+   * Edges of the block, set after `border`, `null` hiding one: its outer `top`, `bottom`,
+   * `left` and `right`, and those between its rows (`innerHorizontal`, for a block of two rows
+   * or more) and between its columns (`innerVertical`, for two columns or more).
+   */
+  borders?: {
+    top?: DocTableBorder | null;
+    bottom?: DocTableBorder | null;
+    left?: DocTableBorder | null;
+    right?: DocTableBorder | null;
+    innerHorizontal?: DocTableBorder | null;
+    innerVertical?: DocTableBorder | null;
+  };
+};
+
+/** Columns of a table and their width, for `setTableColumnWidths()`. */
+export type DocTableColumnWidths = {
+  /** The table: its position among the tab's tables, counting from 0. */
+  table: number;
+
+  /** The first column, counting from 0. Omit it, and `count`, to set every column. */
+  at?: number;
+
+  /** How many columns: 1 by default when `at` is given. */
+  count?: number;
+
+  /**
+   * Each column's width in points, from 5 to 1,000 with at most three decimals, or `null` for
+   * columns that share the width the fixed ones leave of the page.
+   */
+  width: number | null;
+};
+
+/** Rows of a table and their least height, for `setTableRowHeights()`. */
+export type DocTableRowHeights = {
+  /** The table: its position among the tab's tables, counting from 0. */
+  table: number;
+
+  /** The first row, counting from 0. Omit it, and `count`, to set every row. */
+  at?: number;
+
+  /** How many rows: 1 by default when `at` is given. */
+  count?: number;
+
+  /**
+   * Each row's least height in points, from 0 to 1,000 with at most three decimals: a row with
+   * more text than fits grows past it, and one of 0 is as tall as its text.
+   */
+  height: number;
+};
+
+/** A block of a table's cells to merge into one, for `mergeTableCells()`. */
+export type DocTableMerge = {
+  /** The table: its position among the tab's tables, counting from 0. */
+  table: number;
+
+  /** The block's top-left cell: its row and column, counting from 0. */
+  row: number;
+  column: number;
+
+  /** How many rows and columns the block spans; it holds at least two cells. */
+  rows: number;
+  columns: number;
+};
+
+/** A merged cell to split, for `unmergeTableCells()`: its top-left cell. */
+export type DocTableCell = {
+  /** The table: its position among the tab's tables, counting from 0. */
+  table: number;
+
+  /** The row and column of the merged cell's top-left cell, counting from 0. */
+  row: number;
+  column: number;
+};
+
 /**
  * Read/write access to one native Google Doc: one bound directly, or one a Google Drive binding
  * with read and write access opened.
