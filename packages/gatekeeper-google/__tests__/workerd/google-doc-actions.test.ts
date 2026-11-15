@@ -1,7 +1,8 @@
 import { abortAllDurableObjects, env, runInDurableObject } from "cloudflare:test";
 import {
-  afterEach, beforeEach, describe, expect, it, vi, type MockInstance,
+  afterAll, afterEach, beforeEach, describe, expect, it, vi, type MockInstance,
 } from "vitest";
+import { ChunkedValues } from "@gadgets/gatekeeper-kit/chunked-value";
 import type { ActionField } from "@gadgets/workshop-shared/gatekeeper";
 import {
   docTabToMarkdown, LIST_LEVEL_TOO_DEEP, MARKDOWN_RENDERING_VERSION, POSITIONED_ITEM_BEFORE,
@@ -16,9 +17,10 @@ import {
 import type { GoogleDocSession } from "../../src/docs-types";
 import { applyDocsRequests, replayCost, unindexedTabRefusal } from "../../src/docs-model";
 import { pruneTab } from "../../src/docs-replica";
+import { MAX_TAB_TABLE_CELLS } from "../../src/docs-tables";
 import type { ModelParagraphStyle } from "../../src/docs-model";
 import {
-  buildTab, cardField, grid, heading, para, presetLevels, seeded,
+  buildTab, cardField, grid, heading, para, presetLevels, seeded, sized,
 } from "../doc-fixture";
 import { DriveFiles, DOC_MIME as DRIVE_DOC_MIME, FOLDER_MIME } from "../drive-files";
 import { serveFakes, type ProviderFake } from "../slides-provider";
@@ -6281,6 +6283,320 @@ function docsProvider(...models: DocsModel[]): ProviderFake {
 function occurrences(content: string, text: string): number {
   return content.split(text).length - 1;
 }
+
+// What a queue of edits to two large documents spends, phase by phase, in both hosts. Every
+// assertion is a count taken under a frozen clock, never a time, so the load of the machine
+// changes none of them. The table of every phase is printed once the block has run.
+describe("Google Doc replay cost", () => {
+  /** The edits queued for the large tab, each followed by a read of it. */
+  const N = 4;
+  const TABLES = 10;
+  /** The Drive binding the hooks open the document through in the run through Drive. */
+  const DRIVE_DOC = { scope: { kind: "file", fileId: "doc-1" }, access: "write" } as const;
+
+  /** What a phase is measured in, in the order the table prints them. */
+  const MEASURES = [
+    "renders", "tabClones", "fullReindexes", "folds", "queueReads", "fingerprints",
+    "lookupSteps", "documentFetches", "revisionProbes", "fetches", "requestBytes",
+    "responseBytes", "copyPuts", "copyBytes",
+  ] as const;
+  type Measure = typeof MEASURES[number];
+  type Row = { phase: string; pending: number } & Record<Measure, number>;
+
+  const padded = (number: number, width: number) => String(number).padStart(width, "0");
+
+  /**
+   * The two documents, each with a second tab of 20 short paragraphs. `body` is the large tab.
+   * `texts(i)` is what edit `i` of the large tab replaces and with what, `dropped` the text of
+   * edit 2 and what a collaborator makes of it, and `last` queues edit `N`.
+   */
+  const DOCUMENTS = {
+    // 20,000 paragraphs, each a line of its own. Edit `i` replaces line `i * 100`.
+    paragraphs: {
+      body: () => buildTab(Array.from(
+        { length: 20_000 }, (_, line) => para(`line ${padded(line, 5)} alpha`))).body,
+      texts: (i: number) =>
+        [`line ${padded(i * 100, 5)} alpha`, `line ${padded(i * 100, 5)} edited`] as const,
+      dropped: ["line 00200 alpha", "line 00200 omega"],
+      last: (facet: string) =>
+        edit(facet, "replaceText", ...DOCUMENTS.paragraphs.texts(N), MAIN_TAB),
+    },
+    // Ten tables that hold the most cells a tab's tables may, one word to a cell, and a paragraph
+    // between each two. Edit 1 replaces a cell of the first table, edit 2 the paragraph after the
+    // fifth, edit 3 a cell of the second, and each edit after it a cell of the next table.
+    cells: {
+      body: () => buildTab(Array.from({ length: TABLES }, (_, table) => [
+        ...table === 0 ? [] : [para(`between ${padded(table - 1, 2)} gamma`)],
+        sized(MAX_TAB_TABLE_CELLS / TABLES / 20, 20, `t${table}r`),
+      ]).flat()).body,
+      texts: (i: number) => {
+        if (i === 2) return ["between 04 gamma", "between 04 edited"] as const;
+        let word = `t${i === 1 ? 0 : i - 2}r1c1`;
+        return [`<td><p>${word}</p></td>`, `<td><p>${word}x</p></td>`] as const;
+      },
+      dropped: ["between 04 gamma", "between 04 omega"],
+      // Names the last table, which no queued replacement touches, and adds no cell.
+      last: (facet: string) =>
+        edit(facet, "setTableColumnWidths", { table: TABLES - 1, width: 100 }, MAIN_TAB),
+    },
+  };
+  type Shape = keyof typeof DOCUMENTS;
+
+  /** The fake Google holding the document `shape` names. */
+  function documentOf(shape: Shape): DocsModel {
+    let docs = new DocsModel();
+    docs.setBody(MAIN_TAB, DOCUMENTS[shape].body());
+    docs.addTab(SECOND_TAB, "Notes", MAIN_TAB,
+      Array.from({ length: 20 }, (_, line) => `note ${padded(line, 2)} beta`).join("\n"));
+    docs.install();
+    return docs;
+  }
+
+  /** A collaborator rewrites the paragraph reading `from` to a text as long, so no index moves. */
+  function rewrite(docs: DocsModel, [from, to]: string[]): void {
+    let { body } = docs.bodyTab(MAIN_TAB);
+    let text = body.content.flatMap(element => element.paragraph?.elements ?? [])
+      .find(part => part.textRun?.content === `${from}\n`)?.textRun;
+    if (!text || from.length !== to.length) throw new Error(`No paragraph to rewrite: ${from}`);
+    text.content = `${to}\n`;
+    docs.externalBody(MAIN_TAB, body);
+  }
+
+  /** The edits `facet` holds for approval, oldest first, a dropped one with its reason. */
+  async function queued(facet: string): Promise<{ id: number; reason?: string }[]> {
+    if (run.drive) {
+      let ids = await rawHooks().driveQueued(`drive:${facet}`, DRIVE_DOC);
+      return ids.map(id => ({ id }));
+    }
+    let keys = (await hooks().storedKeys(facet, "doc"))
+      .filter(key => key.startsWith("pending:action:"));
+    let records = await Promise.all(keys.map(async key => {
+      let { kv = "{}" } = await hooks().storedValue(facet, "doc", key);
+      let { invalidatedReason: reason } = JSON.parse(kv) as { invalidatedReason?: string };
+      return { id: Number(key.slice("pending:action:".length)), ...reason ? { reason } : {} };
+    }));
+    return records.toSorted((a, b) => a.id - b.id);
+  }
+
+  const measured: { name: string; rows: Row[] }[] = [];
+
+  afterAll(() => {
+    if (measured.length === 0) return;
+    let header = ["document, host", "phase", ...MEASURES, "pending"];
+    let lines = measured.flatMap(({ name, rows }) => rows.map(row =>
+      [name, row.phase, ...MEASURES.map(column => String(row[column])), String(row.pending)]));
+    let widths = header.map((title, column) =>
+      Math.max(title.length, ...lines.map(line => line[column].length)));
+    let print = (line: string[]) =>
+      line.map((cell, column) => column < 2 ? cell.padEnd(widths[column])
+        : cell.padStart(widths[column])).join("  ");
+    console.log([
+      "Google Doc replay cost",
+      `${N} edits of the large tab queued behind one of the other tab. copyPuts and copyBytes ` +
+      "are the stored copy's values (its partitions and its index) and the bytes of its " +
+      "partitions, without the pending records' own writes; pending is the edits queued that " +
+      "no replay has dropped. The fake Google applies an approved batch with the same model, " +
+      "so the approval rows hold its clone and re-indexes, and it answers a revision probe " +
+      "with the whole document, which responseBytes counts.",
+      print(header), ...lines.map(print),
+    ].join("\n"));
+  });
+
+  /**
+   * Runs the queue over the document `shape` names, in the host of the current run: the row of
+   * each phase, which the table printed after the block holds too.
+   */
+  async function measure(shape: Shape): Promise<Row[]> {
+    // Frozen, so that no count depends on how long the machine took: the copy's time to live
+    // passes only where a phase moves the clock.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-03-02T09:00:00Z"));
+    let docs = documentOf(shape);
+    let put = vi.spyOn(ChunkedValues.prototype, "put");
+    let facet = `replay-cost-${shape}`;
+    let { texts, dropped, last } = DOCUMENTS[shape];
+    let totals = (): Record<Measure, number> => ({
+      ...replayCost,
+      documentFetches: docs.documentFetches, revisionProbes: docs.revisionProbes,
+      fetches: docs.fetches, requestBytes: docs.requestBytes, responseBytes: docs.responseBytes,
+      copyPuts: put.mock.calls.length,
+      copyBytes: put.mock.calls.reduce((sum, [, bytes]) => sum + bytes.byteLength, 0),
+    });
+    /** The edits queued that no replay has dropped, oldest first. */
+    let active = async () =>
+      (await queued(facet)).filter(({ reason }) => !reason).map(({ id }) => id);
+    let rows: Row[] = [];
+    /** Runs one phase and records what it added to each measure. */
+    let phase = async (name: string, body: () => Promise<unknown>) => {
+      let before = totals();
+      await body();
+      let after = totals();
+      let spent = Object.fromEntries(MEASURES.map(column =>
+        [column, after[column] - before[column]])) as Record<Measure, number>;
+      rows.push({ phase: name, ...spent, pending: (await active()).length });
+    };
+    let read = () => hooks().readContent(facet, MAIN_TAB);
+    let ids: number[] = [];
+    let queue = async (submitted: Promise<{ actionId: number }>) => {
+      ids.push((await submitted).actionId);
+    };
+
+    await phase("cold read", read);
+    await phase("queue", async () => {
+      await queue(edit(facet, "replaceText", "note 07 beta", "note 07 edited", SECOND_TAB));
+      await hooks().readContent(facet, SECOND_TAB);
+      // As an agent reads after each edit.
+      for (let i = 1; i <= N; i++) {
+        await queue(i === N ? last(facet) : edit(facet, "replaceText", ...texts(i), MAIN_TAB));
+        await read();
+      }
+    });
+    expect(await queued(facet)).toEqual(ids.map(id => ({ id })));
+    let [other, first, stale, rejected] = ids;
+
+    await phase("reads", async () => {
+      for (let i = 0; i < 3; i++) await read();
+    });
+
+    await phase("dropped edit", async () => {
+      rewrite(docs, dropped);
+      passSnapshotTtl();
+      await read();
+    });
+    // A bound Doc keeps the dropped edit with its reason, and a Drive binding fails it.
+    expect(await queued(facet)).toEqual(ids.flatMap(id => id !== stale ? [{ id }]
+      : run.drive ? [] : [{ id, reason: expect.stringContaining("oldMarkdown was not found") }]));
+
+    await phase("rejection", () => Promise.resolve(hooks().rejectAction(facet, rejected)));
+    // A Drive binding fails the change that names a table with the cell replacement before it.
+    let failed = run.drive && shape === "cells" ? [ids[N]] : [];
+    expect(await active())
+      .toEqual(ids.filter(id => ![stale, rejected, ...failed].includes(id)));
+
+    await phase("read after rejection", read);
+    await phase("approval (other tab)", async () =>
+      expect(await hooks().applyAction(facet, other)).toBeNull());
+    await phase("approval", async () =>
+      expect(await hooks().applyAction(facet, first)).toBeNull());
+    await phase("read after approval", read);
+
+    measured.push({ name: `${shape}, ${run.name}`, rows });
+    return rows;
+  }
+
+  /**
+   * What each phase spends, in the order of `MEASURES` and then `pending`: the counts a later
+   * change must not raise without saying so. The queue is built to show two things. The edit a
+   * collaborator's change drops is a replacement outside tables, so it is the only edit its
+   * replay drops. And the rejected edit of the tables document has a change that names a table
+   * queued behind it, so a bound Doc's rejection replays the queue there and not in the
+   * paragraphs document, while a Drive binding fails that change with the rejection.
+   *
+   * What the rows hold of the replay, one tab at a time. `dropped edit` folds the large tab's
+   * four edits once, over one read of the queue, and none of the other tab's. The bound
+   * `rejection` of the tables document reads the queue twice, once for each replay, and folds
+   * the large tab's two edits still queued once: the replay with the rejected edit still queued
+   * is remembered, and the one without it folds that tab afresh; the read after it folds
+   * nothing. The bound `approval (other tab)` folds nothing: the fetch after it brought the
+   * large tab as it was stored, so that tab's fold stands, and the tab is not stored again. An
+   * approval puts three values: the index that retires the copy the write outdated, then the
+   * tab the write changed and the index of the copy fetched after it. A stored copy is its
+   * outline, its tabs and its index: four values for these two tabs.
+   *
+   * `documentFetches` shows where an approved write was built. A bound Doc's two approvals read
+   * the document once each, after the write, for the edits queued behind it: the write is built
+   * from the stored copy, whose tab the reads before it rendered, and pinned to its revision, so
+   * no document is read and nothing is rendered before it. Through Drive `approval (other tab)`
+   * builds from the snapshot the read before it left, and reads the document once, after the
+   * write. Its `approval` follows a write that landed, so no snapshot may build it: the document
+   * is read before the write, and in the paragraphs document after it too, one edit being still
+   * queued.
+   *
+   * Through Drive the sessions share the document's source. `reads` fetches and folds nothing,
+   * its requests being each read's scope check. `queue` fetches once for each edit, at the read
+   * after it, which finds an edit queued since the snapshot and folds the tab's queue over the
+   * document it fetches. `dropped edit` asks for the revision before it fetches, and the paragraphs
+   * document's `read after rejection` reuses the snapshot, where the tables document's finds the
+   * newest edit queued gone and fetches.
+   *
+   * `tabClones`, `fullReindexes` and `renders` show the passes over a tab that an edit costs. A
+   * bound Doc's `queue` holds one clone and one rendering for each edit, since the read after
+   * an edit folds its record from the tab the edit's check made, and one rendering more, of the
+   * other tab as it was fetched. An edit recomputes its tab's indexes once, after its requests.
+   * The first edit over a tab of the copy recomputes them before its requests too, that tab
+   * being one the model did not return, and the tables document's last edit, which sets widths
+   * and moves no index, recomputes none. Through Drive the read after an edit folds the tab's
+   * queue over a document fetched anew, so every step of it clones and renders, and only its
+   * first recomputes the indexes before its requests.
+   *
+   * `fingerprints` shows that a bound Doc serializes no queue to queue an edit, and that through
+   * Drive each queued edit serializes its tab's queue twice: at its check, and once the read
+   * that made the check was authorized.
+   *
+   * `lookupSteps` shows a lookup halving its way to its place, wherever in the tab that is: 14
+   * or 15 comparisons to a paragraph of the paragraphs document's 20,000, and 13 to 16 to a
+   * cell's paragraph in the tables document, through the body's 20 elements, a table's 25 rows
+   * and a row's 20 cells.
+   */
+  const EXPECTED: Record<string, Record<string, number[]>> = {
+    "paragraphs, bound directly": {
+      "cold read": [1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 4278245, 4, 4278337, 0],
+      "queue": [6, 5, 7, 5, 10, 0, 576, 0, 0, 0, 0, 0, 0, 0, 5],
+      "reads": [0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5],
+      "dropped edit": [4, 3, 4, 4, 1, 0, 396, 1, 1, 2, 0, 8556490, 2, 4274040, 4],
+      "rejection": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 3],
+      "read after rejection": [2, 2, 3, 2, 1, 0, 264, 0, 1, 1, 0, 4278245, 1, 0, 3],
+      "approval (other tab)": [0, 1, 2, 0, 1, 0, 42, 1, 0, 3, 599, 4278584, 3, 4303, 2],
+      "approval": [1, 2, 4, 1, 1, 0, 264, 1, 0, 3, 610, 4278737, 3, 4274193, 1],
+      "read after approval": [1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    },
+    "cells, bound directly": {
+      "cold read": [1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1273180, 4, 1273272, 0],
+      "queue": [6, 5, 6, 5, 10, 0, 232, 0, 0, 0, 0, 0, 0, 0, 5],
+      "reads": [0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5],
+      "dropped edit": [4, 3, 3, 4, 1, 0, 142, 1, 1, 2, 0, 2546360, 2, 1268975, 4],
+      "rejection": [1, 2, 2, 2, 2, 0, 73, 0, 0, 0, 0, 0, 1, 0, 3],
+      "read after rejection": [1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 1273180, 1, 0, 3],
+      "approval (other tab)": [0, 1, 2, 0, 1, 0, 42, 1, 0, 3, 599, 1273519, 3, 4303, 2],
+      "approval": [1, 2, 3, 1, 1, 0, 73, 1, 0, 3, 515, 1273665, 3, 1269124, 1],
+      "read after approval": [1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    },
+    "paragraphs, opened from a read and write Drive binding": {
+      "cold read": [1, 0, 0, 0, 1, 0, 0, 1, 0, 2, 0, 4278370, 0, 0, 0],
+      "queue": [23, 16, 23, 11, 10, 10, 1938, 5, 0, 20, 2060, 21393915, 0, 0, 5],
+      "reads": [0, 0, 0, 0, 3, 0, 0, 0, 0, 3, 0, 375, 0, 0, 5],
+      "dropped edit": [4, 3, 4, 4, 1, 0, 396, 1, 1, 3, 0, 8556615, 0, 0, 4],
+      "rejection": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+      "read after rejection": [2, 2, 3, 2, 1, 0, 264, 0, 0, 1, 0, 125, 0, 0, 3],
+      "approval (other tab)": [3, 3, 5, 2, 1, 0, 306, 1, 0, 5, 1423, 4279160, 0, 0, 2],
+      "approval": [2, 2, 4, 1, 1, 0, 264, 2, 0, 6, 1434, 8557708, 0, 0, 1],
+      "read after approval": [2, 1, 2, 1, 1, 0, 138, 1, 0, 2, 0, 4278673, 0, 0, 1],
+    },
+    "cells, opened from a read and write Drive binding": {
+      "cold read": [1, 0, 0, 0, 1, 0, 0, 1, 0, 2, 0, 1273305, 0, 0, 0],
+      "queue": [23, 16, 21, 11, 10, 10, 836, 5, 0, 20, 2060, 6368590, 0, 0, 5],
+      "reads": [0, 0, 0, 0, 3, 0, 0, 0, 0, 3, 0, 375, 0, 0, 5],
+      "dropped edit": [4, 3, 3, 4, 1, 0, 142, 1, 1, 3, 0, 2546485, 0, 0, 4],
+      "rejection": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+      "read after rejection": [2, 1, 2, 1, 1, 0, 69, 1, 0, 2, 0, 1273305, 0, 0, 2],
+      "approval (other tab)": [2, 2, 4, 1, 1, 0, 111, 1, 0, 5, 1423, 1274095, 0, 0, 1],
+      "approval": [1, 1, 2, 0, 0, 0, 69, 1, 0, 5, 1339, 1274092, 0, 0, 0],
+      "read after approval": [1, 0, 0, 0, 1, 0, 0, 1, 0, 2, 0, 1273604, 0, 0, 0],
+    },
+  };
+
+  describe.each(RUNS)("$name", r => {
+    inRun(r);
+
+    it.each(["paragraphs", "cells"] as const)(
+      "replays a queue on the document of %s for the counts recorded", async shape => {
+        let rows = await measure(shape);
+        expect(Object.fromEntries(rows.map(row =>
+          [row.phase, [...MEASURES.map(column => row[column]), row.pending]])))
+          .toEqual(EXPECTED[`${shape}, ${r.name}`]);
+      });
+  });
+});
 
 describe("Google Doc edits through a read and write Drive binding", () => {
   inRun(THROUGH_DRIVE);
