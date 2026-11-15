@@ -13,7 +13,7 @@ import type {
 } from "../src/drive-types";
 import { WRITE_ATTEMPT_PREFIX, type WriteAttempt } from "../src/drive-writes";
 import type { DriveAccessLevel } from "../src/resources";
-import type { DocMetadata, GoogleDocSession, GoogleDocTab } from "../src/docs-types";
+import type { DocMetadata, GoogleDocSession, GoogleDocTab, NewDocTable } from "../src/docs-types";
 import type { MarkerEntry } from "../src/sheets-actions";
 import type { SpreadsheetInfo, SpreadsheetRange } from "../src/sheets-read-types";
 import type { GoogleSpreadsheetSession } from "../src/sheets-types";
@@ -102,7 +102,10 @@ type TestGoogleDocGatekeeper = GoogleDocGatekeeperImpl & {
 };
 
 /** The methods of a Google Doc session that queue an edit. */
-type DocWriteMethod = "replaceText" | "appendText";
+type DocWriteMethod =
+  | "replaceText" | "appendText" | "insertTable" | "insertTableRows" | "insertTableColumns"
+  | "deleteTableRows" | "deleteTableColumns" | "deleteTable" | "setTableCellStyle"
+  | "setTableColumnWidths" | "setTableRowHeights" | "mergeTableCells" | "unmergeTableCells";
 
 /** An action the queue received: its ID and its card's title. */
 type SubmittedAction = { actionId: number; title: string };
@@ -504,6 +507,54 @@ export class TestHooks extends DurableObject<Env> {
         actionId: queue.actionId,
         ...(typeof returned === "number" ? { returned } : {}),
       };
+    });
+  }
+
+  /**
+   * Four calls sent on one session without waiting for one another, the first held where it
+   * authorizes a read: `insertTable()`, then `appendText()`, `getContent()` and `getMetadata()`.
+   * Returns the actions in the order the approval queue received them, the position
+   * `insertTable()` resolved to, the content read, and the metadata's `lastModified` as epoch
+   * milliseconds.
+   */
+  async callsDuringTableRead(
+    facetName: string, table: NewDocTable, markdown: string, tabId?: string,
+  ): Promise<{ received: SubmittedAction[]; returned: number; read: string; modified: number }> {
+    return this.#withSession(facetName, async (session, queue) => {
+      let { promise: reached, resolve: reach } = Promise.withResolvers<void>();
+      let { promise: released, resolve: release } = Promise.withResolvers<void>();
+      queue.holdObservation = { reach, released };
+      try {
+        // Each is handled below, once all are sent; this only keeps it from reporting as unhandled.
+        let inserting = Promise.resolve(session.insertTable(table, tabId));
+        inserting.catch(() => {});
+        // A table call that stores first, or authorizes nothing, would never reach the hold.
+        let held = await Promise.race([
+          reached.then(() => true), inserting.then(() => false, () => false),
+        ]);
+        if (!held) throw new Error("insertTable authorized no read before settling");
+
+        // The table call is waiting for a read to be authorized, inside its turn.
+        let appending = Promise.resolve(session.appendText(markdown, tabId));
+        appending.catch(() => {});
+        let reading = Promise.resolve(session.getContent(tabId));
+        reading.catch(() => {});
+        let describing = Promise.resolve(session.getMetadata());
+        describing.catch(() => {});
+        // Calls on one stub are delivered in order, and a table call refused on its arguments
+        // waits for no turn: once it returns, the three before it have arrived and are waiting
+        // behind the table. A read would wait for the turns itself, the held one among them.
+        await Promise.resolve(session.insertTable({ rows: 1, columns: 0 }, tabId)).catch(() => {});
+        release();
+
+        let [returned, , read, metadata] =
+          await Promise.all([inserting, appending, reading, describing]);
+        return {
+          received: queue.submitted, returned, read, modified: metadata.lastModified.valueOf(),
+        };
+      } finally {
+        release();
+      }
     });
   }
 

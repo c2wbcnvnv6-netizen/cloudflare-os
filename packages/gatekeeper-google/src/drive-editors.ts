@@ -189,7 +189,10 @@ const DOCS_EDITOR: DriveEditor<DocHost> = {
   host: (drive, fileId) => drive.editors.docs(fileId),
 };
 
-/** The Doc edits a Drive binding queues: the text edits, since a Drive binding adds no tabs. */
+/**
+ * The Doc edits a Drive binding queues: every edit of a Doc's own binding but the add of a tab,
+ * since a Drive binding adds no tabs.
+ */
 export type DriveDocEdits = Omit<GoogleDocEdits, "addTab">;
 
 const { addTab: _addTab, ...DOC_EDIT_DEFINITIONS } = DOC_DEFINITIONS;

@@ -15,10 +15,11 @@ import {
 import { replayCost } from "../../src/docs-model";
 import { renderTab } from "../../src/docs-replay";
 import { pruneTab, type DocCopy } from "../../src/docs-replica";
+import { tableGateRefusal, tableIdentity } from "../../src/docs-tables";
 import type { DriveApi } from "../../src/drive-api";
-import { MARKDOWN_RENDERING_VERSION } from "../../src/markdown-converter";
+import { docTabToMarkdown, MARKDOWN_RENDERING_VERSION } from "../../src/markdown-converter";
 import {
-  buildTab, cardField, grid, item, NUMBERED_LIST, para, type BlockSpec,
+  buildTab, cardField, grid, item, NUMBERED_LIST, para, tableAt, type BlockSpec,
 } from "../doc-fixture";
 
 type Append = Parameters<typeof DOC_DEFINITIONS.appendText.describe>[0];
@@ -60,9 +61,11 @@ function document(text: string): GoogleDocsDocument {
 }
 
 describe("Google Doc edit definitions", () => {
-  it("declares text edits and new tabs under their two kinds, applied without a claim", () => {
+  it("declares text edits, new tabs and table changes under their three kinds, applied without a claim", () => {
     for (let [name, definition] of Object.entries(DOC_DEFINITIONS)) {
-      expect(definition.kind.tag, name).toBe(name === "addTab" ? "addDocumentTab" : "editDocument");
+      expect(definition.kind.tag, name).toBe(
+        name === "addTab" ? "addDocumentTab"
+          : name === "replaceText" || name === "appendText" ? "editDocument" : "document-tables");
       expect(definition.autoApprovable, name).toBe(true);
       expect(definition.delivery, name).toBe("continue-with-simulation");
       // A retried approval settles from the write's own marker instead.
@@ -100,6 +103,27 @@ describe("Google Doc edit definitions", () => {
       description: "Add a new, empty tab at the top level, after the tabs already there.",
       fields: [{ label: "Title", value: "Notes" }],
     });
+
+    // A table change shows the card prepared when it was queued, which is stored with it.
+    let rows: Parameters<typeof DOC_DEFINITIONS.insertTableRows.describe>[0] = {
+      ...BASE, type: "insertTableRows", expected: "<table>\n  <tr>\n    <td>Name</td>\n  </tr>\n</table>",
+      at: 1, cells: [["Ana"]],
+      display: {
+        title: "Add a row to a table in a Google Doc",
+        description: {
+          description: "Add 1 row to table 1 of tab \"Main\" (tab-1).",
+          fields: [{ label: "New row", kind: "text", value: "Ana" }],
+        },
+      },
+    };
+    expect(DOC_DEFINITIONS.insertTableRows.describe(rows, undefined as never)).toEqual({
+      title: "Add a row to a table in a Google Doc",
+      description: "Add 1 row to table 1 of tab \"Main\" (tab-1).",
+      fields: [{ label: "New row", kind: "text", value: "Ana" }],
+      implementsRevert: false,
+    });
+    expect(() => DOC_DEFINITIONS.insertTableRows.describe({ ...rows, display: undefined }, undefined as never))
+      .toThrow("This Google Doc edit has no card to show.");
 
     // A record stored before cards were built from records is never described again.
     expect(() => DOC_DEFINITIONS.appendText.describe({ ...APPEND, display: undefined }, undefined as never))
@@ -317,6 +341,21 @@ function watched(copy: DocCopy) {
   let watching: DocCopy = { outline: copy.outline, tab: tabId => (read.push(tabId), copy.tab(tabId)) };
   return { copy: watching, read };
 }
+
+const TABLE: BlockSpec[] = [para("Before"), grid(["a", "b"], ["c", "d"]), para("After")];
+/** The identity of the one table of `TABLE`, as a change to it records it. */
+const TABLE_IDENTITY = tableIdentity(tableAt(docTabToMarkdown(buildTab(TABLE)), 0));
+const STALE_IDENTITY = tableIdentity(docTabToMarkdown(buildTab([grid(["gone"])])).markdown.trim());
+
+/** A table change of tab `tabId`: rows added to, or deleted from, the table that reads `expected`. */
+function tableChange(
+  tabId: string, type: "insertTableRows" | "deleteTableRows", expected = TABLE_IDENTITY,
+): GoogleDocAction {
+  return type === "insertTableRows"
+    ? { ...BASE, tabId, type, at: 1, cells: [["x", "y"]], expected }
+    : { ...BASE, tabId, type, at: 0, count: 1, expected };
+}
+
 describe("a Doc's pending actions replayed on a copy of it", () => {
   it("puts a queued tab where Google will, under its provisional ID, and replays edits into it", () => {
     let { copy } = googleDocSnapshot(document("Draft"));
@@ -562,6 +601,41 @@ describe("replaying a Doc's queue one tab at a time", () => {
       else expect(pending.map(({ action }) => !!action.invalidatedReason)).toEqual([true, true, true, false]);
     });
 
+  it.each(INVALIDATORS)(
+    "leaves out a record that carries a reason, and one it invalidated, in a queue that %s",
+    invalidator => {
+      // A record that carries a reason is never reduced, whatever it would do.
+      let stale = { invalidatedReason: "It was dropped." };
+      let carried = countedQueue([
+        { id: 1, action: { ...tableChange("tab-1", "deleteTableRows", STALE_IDENTITY), ...stale } },
+        { id: 2, action: { ...add("pending-tab-a", {}), ...stale } },
+        { id: 3, action: { ...appendTo("pending-tab-a", "First words"), ...stale } },
+        { id: 4, action: tableChange("tab-1", "insertTableRows") },
+      ], invalidator);
+      let tabled = googleDocSnapshot(documentOf(TABLE)).copy;
+      let read = spending(() => {
+        let replay = replayGoogleDoc(carried.queue, tabled, REPLAY_CONTEXT);
+        expect(replay.outline.map(({ tabId }) => tabId)).toEqual(["tab-1"]);
+        return markdownOf(replay, "tab-1");
+      });
+      expect(read.folds).toBe(1);
+      expect(read.value).toContain("<td><p>x</p></td>");
+      expect(carried.reasons.size).toBe(0);
+
+      // An edit the tab tree refused is not reduced again by the fold of the only tab, though a
+      // queue that removes it leaves the record in hand as it was.
+      let refused = countedQueue([
+        { id: 1, action: add("pending-tab-a", {}) },
+        { id: 2, action: unnamed(appendTo("tab-1", "More")) },
+      ], invalidator);
+      let one = googleDocSnapshot(document("Draft")).copy;
+      let made = spending(() => replayGoogleDoc(refused.queue, one, REPLAY_CONTEXT));
+      expect(made.folds).toBe(2);
+      expect([...refused.reasons]).toEqual([[2, dropped(PREDATES_TABS)]]);
+      expect(spending(() => markdownOf(made.value, "tab-1"))).toMatchObject({ value: "Draft\n", folds: 0 });
+      expect(refused.reasons.size).toBe(1);
+    });
+
   it("applies an edit that names no tab to a document of one tab", () => {
     let pending = [{ id: 1, action: unnamed(appendTo("tab-1", "More")) }];
     let replay = replayGoogleDoc(
@@ -641,6 +715,26 @@ describe("replaying a Doc's queue one tab at a time", () => {
       // The tab tree refused it, so the fold of the only tab is not given it.
       expect(spending(() => markdownOf(made.value, "tab-1"))).toMatchObject({ value: "Draft\n", folds: 0 });
     });
+
+  it("refuses the table changes behind a refused one in its tab, and none in another tab", () => {
+    let copy = googleDocSnapshot(documentOf(TABLE, TABLE)).copy;
+    let pending = [
+      { id: 1, action: tableChange("tab-1", "deleteTableRows", STALE_IDENTITY) },
+      { id: 2, action: tableChange("tab-1", "insertTableRows") },
+      { id: 3, action: tableChange("tab-2", "insertTableRows") },
+      { id: 4, action: appendTo("tab-1", "More") },
+    ];
+    let replay = replayGoogleDoc(countedQueue(pending).queue, copy, REPLAY_CONTEXT);
+    expect(markdownOf(replay, "tab-1")).not.toContain("<td><p>x</p></td>");
+    expect(markdownOf(replay, "tab-1")).toContain("More\n");
+    expect(markdownOf(replay, "tab-2")).toContain("<td><p>x</p></td>");
+    expect(pending[0].action.invalidatedReason).toMatch(
+      new RegExp(`^${REPLAY_CONTEXT}: deleteTableRows: `));
+    expect(pending[1].action.invalidatedReason)
+      .toBe(dropped(tableGateRefusal("insertTableRows").message));
+    expect(pending[2].action.invalidatedReason).toBeUndefined();
+    expect(pending[3].action.invalidatedReason).toBeUndefined();
+  });
 
   it("replays every tab a pending edit targets after an approval, over one read of the queue", () => {
     let { copy, read } = watched(

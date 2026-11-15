@@ -26,7 +26,8 @@ import {
   docCopy, googleDocNamedRangeIds, googleDocNamedRanges, googleDocWriteMarkerName, pruneTab,
   type DocCopy, type DocTabCopy, type GoogleDocTabIdentity,
 } from "./docs-replica";
-import { namesTable, tableGateRefusal } from "./docs-tables";
+import { DOCUMENT_TABLES, type PreparedTableChange } from "./docs-table-actions";
+import { namesTable, tableGateRefusal, type TableChange } from "./docs-tables";
 import { insertDocTab, type DocTabPlacement } from "./docs-tabs";
 import {
   assertMarkdownWriteComplexity, canonicalizeMarkdownForWrite, type DocTabSnapshot,
@@ -110,8 +111,19 @@ export type GoogleDocAddTabAction = GoogleDocActionBase & DocTabPlacement & {
   display?: GoogleDocAddTabDisplay;
 }
 
-/** A change to one tab's content: a text edit, replayed and applied as `docs-replay` makes it. */
-export type GoogleDocEditAction = GoogleDocReplaceAction | GoogleDocAppendAction;
+/** A change to a tab's tables, stored as replay and approval make it. */
+type GoogleDocTableAction = GoogleDocActionBase & TableChange & {
+  tabId?: string;
+  /** The card prepared for it, from the tab before and after the change. */
+  display?: Pick<PreparedTableChange, "title" | "description">;
+};
+
+/**
+ * A change to one tab's content: a text edit or a change to its tables, replayed and applied as
+ * `docs-replay` makes it.
+ */
+export type GoogleDocEditAction =
+  GoogleDocReplaceAction | GoogleDocAppendAction | GoogleDocTableAction;
 export type GoogleDocAction = GoogleDocEditAction | GoogleDocAddTabAction;
 
 export const DOC_WRITE_RECEIPT_KEY = "docWriteReceipt";
@@ -692,7 +704,10 @@ function materializeGoogleDocAddTab(
   return { tab, requests: [request] };
 }
 
-/** The kind of the text edits, replaceText and appendText. A new tab has a kind of its own. */
+/**
+ * The kind of the text edits: replaceText, in table cells too, and appendText. A new tab has a
+ * kind of its own, and so has every change to a table (`DOCUMENT_TABLES`), to its look too.
+ */
 export const EDIT_DOCUMENT_ACTION: ActionKind = {
   tag: "editDocument",
   label: "Document edits",
@@ -888,6 +903,10 @@ export function describeDocEdit(action: GoogleDocAction): ActionPresentation {
       let description = buildDescription(display.placement).inline("Title", action.title);
       return { title: "Add tab to Google Doc", ...description.finish(), implementsRevert: false };
     }
+    default: {
+      let display = requireDocDisplay(action.display);
+      return { title: display.title, ...display.description, implementsRevert: false };
+    }
   }
 }
 
@@ -914,13 +933,24 @@ function docEdit<A extends GoogleDocAction>(kind: ActionKind): ActionDefinition<
 }
 
 /**
- * Each Doc edit's definition. Text edits are "Document edits", and new tabs "New document tabs";
- * a user may let both apply without asking.
+ * Each Doc edit's definition. Text edits are "Document edits", new tabs "New document tabs" and
+ * every change to a table "Table changes"; a user may let each kind apply without asking.
  */
 export const DOC_DEFINITIONS: { [T in keyof GoogleDocEdits]: ActionDefinition<GoogleDocEdits[T], DocHost> } = {
   replaceText: docEdit(EDIT_DOCUMENT_ACTION),
   appendText: docEdit(EDIT_DOCUMENT_ACTION),
   addTab: docEdit(ADD_DOCUMENT_TAB_ACTION),
+  insertTable: docEdit(DOCUMENT_TABLES),
+  insertTableRows: docEdit(DOCUMENT_TABLES),
+  insertTableColumns: docEdit(DOCUMENT_TABLES),
+  deleteTableRows: docEdit(DOCUMENT_TABLES),
+  deleteTableColumns: docEdit(DOCUMENT_TABLES),
+  deleteTable: docEdit(DOCUMENT_TABLES),
+  setTableCellStyle: docEdit(DOCUMENT_TABLES),
+  setTableColumnWidths: docEdit(DOCUMENT_TABLES),
+  setTableRowHeights: docEdit(DOCUMENT_TABLES),
+  mergeTableCells: docEdit(DOCUMENT_TABLES),
+  unmergeTableCells: docEdit(DOCUMENT_TABLES),
 };
 
 /** The definition `action` is applied and described by. */

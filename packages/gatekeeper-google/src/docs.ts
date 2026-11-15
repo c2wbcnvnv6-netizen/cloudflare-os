@@ -14,7 +14,9 @@ import { SerialTaskQueue } from "@gadgets/gatekeeper-kit/serial-queue";
 import { StoredBase, type HeldBase } from "@gadgets/gatekeeper-kit/simulation-store";
 import {
   GoogleDocSession, DocMetadata, type GoogleDocEditSession, type DocCommentOptions, type DocSuggestEditOptions,
-  type GoogleDocReadSession, type GoogleDocTab,
+  type GoogleDocReadSession, type GoogleDocTab, type DocTableCell, type DocTableCells,
+  type DocTableCellStyle, type DocTableColumnWidths, type DocTableDeletion, type DocTableInsertion,
+  type DocTableMerge, type DocTableRowHeights, type NewDocTable,
 } from "./docs-types";
 import {
   DOC_COMMENT_ACTIONS, DocCommentSession, docsThreads, type DocCommentQueue,
@@ -28,7 +30,10 @@ import {
   DOC_COPY_FORMAT_VERSION, DOC_COPY_UNREADABLE, decodeDocCopyPart, docCopy, encodeDocCopy,
   storedDocCopy, type DocCopy, type DocCopyPart,
 } from "./docs-replica";
-import { prepareAppend, prepareTextReplacement } from "./docs-table-actions";
+import {
+  assertTableQueueRoom, checkTableCall, DOCUMENT_TABLES, prepareAppend, prepareTableChange,
+  prepareTextReplacement, type PreparedTableChange, type TableCall,
+} from "./docs-table-actions";
 import { closesTableGate, namesTable } from "./docs-tables";
 import { checkDocTabTitle, insertDocTab } from "./docs-tabs";
 import {
@@ -331,7 +336,10 @@ export class GoogleDocGatekeeperImpl
   }
 
   async getAutoApprovableActions(): Promise<ActionKind[]> {
-    return [EDIT_DOCUMENT_ACTION, ADD_DOCUMENT_TAB_ACTION, ...this.#comments.autoApprovableKinds()];
+    return [
+      EDIT_DOCUMENT_ACTION, ADD_DOCUMENT_TAB_ACTION, DOCUMENT_TABLES,
+      ...this.#comments.autoApprovableKinds(),
+    ];
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
@@ -802,7 +810,7 @@ type GoogleDocSelectedTab = {
 };
 
 /** The session methods that select a tab, as the messages about a tab name them. */
-type GoogleDocTabOperation = "getContent" | "replaceText" | "appendText";
+type GoogleDocTabOperation = "getContent" | "replaceText" | "appendText" | TableCall["method"];
 
 /**
  * A Google Doc session: its reads, its edits and, bound directly, its comments. A Doc opened from
@@ -1195,6 +1203,105 @@ export class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession 
       return { action, result: undefined };
     });
   }
+
+  async insertTable(table: NewDocTable, tabId?: string): Promise<number> {
+    let prepared = await this.#submitTableChange({ method: "insertTable", table }, tabId);
+    // The action layer reports the position of every table it prepares: this holds it to that.
+    if (prepared.table === undefined) throw new Error("insertTable: no position was reported.");
+    return prepared.table;
+  }
+
+  async insertTableRows(rows: DocTableInsertion, tabId?: string): Promise<void> {
+    await this.#submitTableChange({ method: "insertTableRows", lines: rows }, tabId);
+  }
+
+  async insertTableColumns(columns: DocTableInsertion, tabId?: string): Promise<void> {
+    await this.#submitTableChange({ method: "insertTableColumns", lines: columns }, tabId);
+  }
+
+  async deleteTableRows(rows: DocTableDeletion, tabId?: string): Promise<void> {
+    await this.#submitTableChange({ method: "deleteTableRows", lines: rows }, tabId);
+  }
+
+  async deleteTableColumns(columns: DocTableDeletion, tabId?: string): Promise<void> {
+    await this.#submitTableChange({ method: "deleteTableColumns", lines: columns }, tabId);
+  }
+
+  async deleteTable(table: number, tabId?: string): Promise<void> {
+    await this.#submitTableChange({ method: "deleteTable", table }, tabId);
+  }
+
+  async setTableCellStyle(
+    cells: DocTableCells & { style: DocTableCellStyle }, tabId?: string,
+  ): Promise<void> {
+    await this.#submitTableChange({ method: "setTableCellStyle", cells }, tabId);
+  }
+
+  async setTableColumnWidths(columns: DocTableColumnWidths, tabId?: string): Promise<void> {
+    await this.#submitTableChange({ method: "setTableColumnWidths", columns }, tabId);
+  }
+
+  async setTableRowHeights(rows: DocTableRowHeights, tabId?: string): Promise<void> {
+    await this.#submitTableChange({ method: "setTableRowHeights", rows }, tabId);
+  }
+
+  async mergeTableCells(cells: DocTableMerge, tabId?: string): Promise<void> {
+    await this.#submitTableChange({ method: "mergeTableCells", cells }, tabId);
+  }
+
+  async unmergeTableCells(cell: DocTableCell, tabId?: string): Promise<void> {
+    await this.#submitTableChange({ method: "unmergeTableCells", cell }, tabId);
+  }
+
+  /**
+   * Queues one table change: checks the call's arguments, then, as the call's turn among the
+   * connection's writes, checks it against the tab as it reads with every pending edit, and
+   * queues the change with the card that check prepared.
+   *
+   * `insertTable()` hands the new table's position back, which is read from the document. Where
+   * the read that prepares an edit is not itself authorized, that read is authorized before
+   * anything is stored: the authorization is a round trip, and a record left stored across one
+   * would be orphaned if the connection's object were reset meanwhile. The tab is then read and
+   * checked again, since an approval or a rejection takes no turn and can land during the wait;
+   * the position returned is the one found by the check the store follows.
+   */
+  async #submitTableChange(
+    call: TableCall, tabId: string | undefined,
+  ): Promise<PreparedTableChange> {
+    // Refused on its arguments alone, a call reads nothing, authorizes nothing and takes no turn.
+    checkTableCall(call);
+    let check = ({ tab }: GoogleDocSelectedTab) => {
+      let prepared = prepareTableChange(tab, call, googleDocTabLabel(tab));
+      assertTableQueueRoom(this.#changes.pending().map(({ action }) => action), prepared.change);
+      return prepared;
+    };
+    return this.#changes.queue(async () => {
+      if (call.method === "insertTable" && !this.#changes.authorizesPreparation) {
+        let { selected: { tab } } = await this.#prepare(tabId, call.method, check);
+        await this.#read(async () => undefined, () => ({
+          title: "Read Google Doc content",
+          description:
+            `Read the position of a new table among the tables of tab ${googleDocTabLabel(tab)}.`,
+        }));
+      }
+
+      // Where the preparation is not an authorized read, nothing is awaited from this check to
+      // the submission but the check's own return.
+      let { selected: { snapshot, tab }, value: prepared } =
+        await this.#prepare(tabId, call.method, check);
+      let action: GoogleDocAction = {
+        ...prepared.change,
+        // Read again: the add of a tab selected before the await above may have applied since.
+        tabId: this.#changes.adoptedTabId(tab.tabId),
+        submittedAt: Date.now(),
+        markdownVersion: MARKDOWN_RENDERING_VERSION,
+        baseRevisionId: snapshot.revisionId,
+        writeId: crypto.randomUUID(),
+        display: { title: prepared.title, description: prepared.description },
+      };
+      return { action, result: prepared };
+    });
+  }
 }
 
 /** The stored copy `held` as a snapshot, or `undefined` where it is no copy (`storedDocCopy`). */
@@ -1444,5 +1551,51 @@ export class GoogleDocEditSessionImpl extends RpcTarget implements GoogleDocEdit
 
   appendText(markdown: string, tabId?: string): Promise<void> {
     return this.#session.appendText(markdown, tabId);
+  }
+
+  insertTable(table: NewDocTable, tabId?: string): Promise<number> {
+    return this.#session.insertTable(table, tabId);
+  }
+
+  insertTableRows(rows: DocTableInsertion, tabId?: string): Promise<void> {
+    return this.#session.insertTableRows(rows, tabId);
+  }
+
+  insertTableColumns(columns: DocTableInsertion, tabId?: string): Promise<void> {
+    return this.#session.insertTableColumns(columns, tabId);
+  }
+
+  deleteTableRows(rows: DocTableDeletion, tabId?: string): Promise<void> {
+    return this.#session.deleteTableRows(rows, tabId);
+  }
+
+  deleteTableColumns(columns: DocTableDeletion, tabId?: string): Promise<void> {
+    return this.#session.deleteTableColumns(columns, tabId);
+  }
+
+  deleteTable(table: number, tabId?: string): Promise<void> {
+    return this.#session.deleteTable(table, tabId);
+  }
+
+  setTableCellStyle(
+    cells: DocTableCells & { style: DocTableCellStyle }, tabId?: string,
+  ): Promise<void> {
+    return this.#session.setTableCellStyle(cells, tabId);
+  }
+
+  setTableColumnWidths(columns: DocTableColumnWidths, tabId?: string): Promise<void> {
+    return this.#session.setTableColumnWidths(columns, tabId);
+  }
+
+  setTableRowHeights(rows: DocTableRowHeights, tabId?: string): Promise<void> {
+    return this.#session.setTableRowHeights(rows, tabId);
+  }
+
+  mergeTableCells(cells: DocTableMerge, tabId?: string): Promise<void> {
+    return this.#session.mergeTableCells(cells, tabId);
+  }
+
+  unmergeTableCells(cell: DocTableCell, tabId?: string): Promise<void> {
+    return this.#session.unmergeTableCells(cell, tabId);
   }
 }
