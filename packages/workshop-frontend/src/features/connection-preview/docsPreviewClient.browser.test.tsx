@@ -153,3 +153,24 @@ it('lists the tabs again on a refresh, and leaves a tab that has gone for the fi
   expect(buttons()).toHaveLength(0)
   expect(frame!.contentDocument!.getElementById('error')).toBeNull()
 })
+
+it('lists the headings in an outline, marks a section that holds a change, and scrolls to one', async () => {
+  const filler = Array.from({ length: 60 }, (_, line) => `Line ${line}`).join('\n\n')
+  const savedMarkdown = `# Intro\n\n${filler}\n\n## Details\n\nOld text\n\n# Last\n\nEnd\n`
+  const { page } = await draw({ savedMarkdown, markdown: savedMarkdown.replace('Old text', 'New text') })
+  const outline = frame!.contentDocument!.getElementById('outline')!
+  const entries = () => [...outline.querySelectorAll('button')]
+
+  // The frame is too narrow for the outline to stand beside the page, so it starts closed.
+  expect(outline.hidden).toBe(true)
+  frame!.contentDocument!.getElementById('outline-toggle')!.click()
+
+  expect(entries().map(entry => entry.textContent)).toEqual(['Intro', 'Details', 'Last'])
+  expect(entries().map(entry => entry.classList.contains('touched'))).toEqual([false, true, false])
+  expect(entries().map(entry => entry.style.paddingLeft)).toEqual(['8px', '20px', '8px'])
+
+  entries()[1].click()
+  const details = page.querySelector('h2')!
+  await expect.poll(() => Math.round(details.getBoundingClientRect().top)).toBeLessThan(40)
+  expect(outline.hidden).toBe(true)
+})

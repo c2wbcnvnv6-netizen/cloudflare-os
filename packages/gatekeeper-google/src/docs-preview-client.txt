@@ -88,6 +88,41 @@ style.textContent = `
   #nav button { width: 24px; height: 24px; border: 0; border-radius: 50%; background: none;
     color: var(--dim); }
   #nav button:hover { background: var(--chip); color: var(--ink); }
+  /* The outline stands beside the page where there is room, and over it where there is not. */
+  #outline-toggle { position: fixed; z-index: 3; top: 6px; left: 10px; display: grid;
+    place-items: center; width: 28px; height: 28px; border: 0; border-radius: 50%; background: none;
+    color: var(--dim); transition: background .15s, color .15s; }
+  #outline-toggle:hover, #outline-toggle[aria-expanded="true"] { background: var(--chip); color: var(--ink); }
+  #outline { position: fixed; z-index: 2; inset: 0 auto 0 0; box-sizing: border-box; width: 240px;
+    padding: 0 10px 24px 14px; overflow-y: auto; scrollbar-width: thin; background: var(--desk);
+    font-size: 12px; animation: slide .2s ease-out; }
+  #outline h2 { position: sticky; z-index: 1; top: 0; margin: 0 -10px 6px -14px; padding: 0 0 0 48px;
+    background: inherit; font-size: 11px; font-weight: 700; line-height: 40px; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--dim); }
+  /* One rail down the headings, and a thumb on it that slides to the one being read. */
+  #rail { position: relative; border-left: 1px solid var(--line); }
+  #thumb { position: absolute; top: 0; left: -2px; width: 3px; border-radius: 3px;
+    background: var(--link); transition: transform .2s ease-out, height .2s ease-out; }
+  #rail button { display: flex; align-items: center; gap: 6px; width: 100%; padding: 5px 8px;
+    border: 0; border-radius: 0 6px 6px 0; background: none; color: var(--dim); line-height: 1.4;
+    text-align: left; transition: background .12s, color .12s; }
+  #rail button > span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #rail button.top { color: var(--ink); font-weight: 700; }
+  #rail button:hover { background: var(--chip); color: var(--ink); }
+  #rail button[aria-current="true"] { color: var(--link); }
+  #rail .touched::after { content: ''; flex: none; width: 6px; height: 6px; margin-right: 3px;
+    border-radius: 50%; background: var(--mark-ink); box-shadow: 0 0 0 3px var(--mark); }
+  @keyframes slide { from { opacity: 0; transform: translateX(-12px); } }
+  body { transition: padding-left .2s ease-out; }
+  .has-outline #tabs { padding-left: 48px; }
+  .outlined { padding-left: 240px; }
+  @media (max-width: 999px) {
+    .outlined { padding-left: 0; }
+    #outline { background: var(--page); border-radius: 0 12px 12px 0;
+      box-shadow: var(--paper), 8px 0 32px rgb(0 0 0 / .18); }
+  }
+  @media (prefers-reduced-motion: reduce) { body, #thumb { transition: none; } }
+  :is(h1, h2, h3, h4, h5, h6) { scroll-margin-top: 12px; }
   #error { max-width: 480px; margin: 80px auto; text-align: center; color: var(--dim); }
   #error button { margin-top: 12px; padding: 4px 12px; }
   @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
@@ -108,6 +143,30 @@ staleNote.id = 'stale';
 staleNote.hidden = true;
 const page = document.body.appendChild(make('div'));
 page.id = 'page';
+const outlineToggle = document.body.appendChild(make('button'));
+outlineToggle.id = 'outline-toggle';
+{
+  const SVG = 'http://www.w3.org/2000/svg';
+  const icon = outlineToggle.appendChild(document.createElementNS(SVG, 'svg'));
+  for (const [name, value] of Object.entries({ viewBox: '0 0 20 20', width: 18, height: 18,
+    fill: 'none', stroke: 'currentColor', 'stroke-width': 1.7, 'stroke-linecap': 'round' })) {
+    icon.setAttribute(name, value);
+  }
+  icon.appendChild(document.createElementNS(SVG, 'path'))
+    .setAttribute('d', 'M4 5h.5M8 5h8M4 10h.5M8 10h8M4 15h.5M8 15h8');
+}
+outlineToggle.hidden = true;
+outlineToggle.setAttribute('aria-label', 'Document outline');
+outlineToggle.addEventListener('click', () => showOutline(outlineChosen = outline.hidden));
+const outline = document.body.appendChild(make('nav'));
+outline.id = 'outline';
+outline.hidden = true;
+outline.setAttribute('aria-label', 'Document outline');
+outline.appendChild(make('h2', '', 'Outline'));
+const rail = outline.appendChild(make('div'));
+rail.id = 'rail';
+const thumb = make('div');
+thumb.id = 'thumb';
 const bar = document.body.appendChild(make('div'));
 bar.id = 'bar';
 const statusLine = bar.appendChild(make('span'));
@@ -711,6 +770,77 @@ function showError(error, retry) {
   });
 }
 
+// ---------------------------------------------------------------------------------------------
+// The outline: the tab's headings as Docs lists them beside the page, with a dot on each whose
+// section holds a change.
+
+const HEADINGS = 'h1, h2, h3, h4, h5, h6';
+const roomForOutline = () => matchMedia('(min-width: 1000px)').matches;
+// Whether the person opened or closed the outline; until they do it is open where there is room.
+let outlineChosen;
+let headings = [];
+let entries = [];
+let reading = -1;
+
+function showOutline(open) {
+  outline.hidden = !open;
+  outlineToggle.setAttribute('aria-expanded', String(open));
+  document.body.classList.toggle('outlined', open);
+  markHeading();
+}
+
+function renderOutline() {
+  // As in Docs, a heading inside a table is not listed; one being removed is no longer there.
+  headings = [...page.querySelectorAll(HEADINGS)]
+    .filter(heading => !heading.closest('.removed, table') && heading.textContent.trim());
+  const blocks = headings.map(heading => heading.closest('#page > *'));
+  const top = Math.min(...headings.map(heading => Number(heading.tagName[1])));
+  entries = headings.map((heading, index) => {
+    const copy = heading.cloneNode(true);
+    for (const gone of copy.querySelectorAll('del')) gone.remove();
+    const level = Number(heading.tagName[1]) - top;
+    const entry = make('button', level ? '' : 'top');
+    entry.appendChild(make('span', '', copy.textContent.trim()));
+    entry.title = entry.textContent;
+    entry.style.paddingLeft = `${8 + level * 12}px`;
+    // A heading that has just arrived arrives here as it does on the page.
+    if (heading.closest('.fresh')) entry.classList.add('fresh');
+    for (let block = blocks[index]; block; block = block.nextElementSibling) {
+      if (block !== blocks[index] && blocks.includes(block)) break;
+      if (block.matches('.added, .removed, .changed')) entry.classList.add('touched');
+    }
+    entry.addEventListener('click', () => {
+      heading.scrollIntoView({ block: 'start', behavior: motion() });
+      if (!roomForOutline()) showOutline(outlineChosen = false);
+    });
+    return entry;
+  });
+  rail.replaceChildren(thumb, ...entries);
+  reading = -1;
+  outlineToggle.hidden = headings.length === 0;
+  document.body.classList.toggle('has-outline', headings.length > 0);
+  showOutline(headings.length > 0 && (outlineChosen ?? roomForOutline()));
+}
+
+/** Marks the heading the top of the view is under. */
+function markHeading() {
+  if (outline.hidden) return;
+  let current = 0;
+  headings.forEach((heading, index) => {
+    if (heading.getBoundingClientRect().top <= 96) current = index;
+  });
+  entries.forEach((entry, index) => entry.setAttribute('aria-current', String(index === current)));
+  const entry = entries[current];
+  if (!entry) return;
+  thumb.style.transform = `translateY(${entry.offsetTop}px)`;
+  thumb.style.height = `${entry.offsetHeight}px`;
+  // The outline follows the reading, so the heading being read stays in it.
+  if (current !== reading) entry.scrollIntoView({ block: 'nearest' });
+  reading = current;
+}
+
+addEventListener('scroll', () => requestAnimationFrame(markHeading), { passive: true });
+
 function renderTabs() {
   tabBar.replaceChildren();
   if (tabs.length < 2) return;
@@ -808,6 +938,7 @@ async function load() {
     page.hidden = false;
     page.removeAttribute('aria-busy');
     document.getElementById('error')?.remove();
+    renderOutline();
     document.scrollingElement.scrollTop = scrollTop;
     // A new change is what to look at; on opening, so is the first one there is.
     (firstFresh ?? (loaded ? undefined : stops[0]))?.scrollIntoView({ block: 'nearest', behavior: motion() });
