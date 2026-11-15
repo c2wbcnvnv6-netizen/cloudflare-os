@@ -54,7 +54,8 @@ import {
   selectTab,
 } from "./drive-comment-body";
 import {
-  ALREADY_RESOLVED, COMMENT_NOT_FOUND, commentParent, hasPendingResolve, overlayPending,
+  ALREADY_RESOLVED, COMMENT_NOT_FOUND, commentEntries, commentParent, hasPendingResolve,
+  overlayPending,
   pendingComment, pendingCommentRefusal, pendingReply, pendingSuggestion, readLiveComment,
   REPLY_RESOLVE_PENDING, RESOLVE_PENDING, toDriveComment, type CommentTargetPayload,
   type DriveCommentActions,
@@ -2481,7 +2482,14 @@ export class GoogleDriveGatekeeperImpl
         this.#journal.wasApplied(actionId);
       if (!record?.fence || settled) {
         this.#adoptOrphanedClaim(actionId);
-        await this.#actions.apply(actionId);
+        let [comment] = record ? commentEntries([{ id: actionId, ...record }]) : [];
+        try {
+          await this.#actions.apply(actionId);
+        } finally {
+          // Also for a send that failed, which may have landed: the snapshot held of a Doc
+          // commented on builds no edit after it.
+          if (comment) this.#editors.commented(comment.action.payload.fileId);
+        }
         this.#attempts.delete(actionId);
         return;
       }

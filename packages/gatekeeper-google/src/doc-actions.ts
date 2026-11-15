@@ -19,8 +19,8 @@ import {
 } from "./docs-api";
 import { replayCost } from "./docs-model";
 import {
-  assertDocEditReplayable, docEditTab, docRefusal, docTabReducer, materializeDocEdit, renderTab,
-  replayableDocEdits, type DocEdit, type DocRefusal,
+  assertDocEditReplayable, docEditRequests, docEditTab, docRefusal, docTabReducer,
+  materializeDocEdit, renderTab, replayableDocEdits, type DocEdit, type DocRefusal,
 } from "./docs-replay";
 import {
   docCopy, googleDocNamedRangeIds, googleDocNamedRanges, googleDocWriteMarkerName, pruneTab,
@@ -29,6 +29,7 @@ import {
 import { DOCUMENT_TABLES, type PreparedTableChange } from "./docs-table-actions";
 import { namesTable, tableGateRefusal, type TableChange } from "./docs-tables";
 import { insertDocTab, type DocTabPlacement } from "./docs-tabs";
+import { GoogleApiError } from "./google-response";
 import {
   assertMarkdownWriteComplexity, canonicalizeMarkdownForWrite, type DocTabSnapshot,
 } from "./markdown-converter";
@@ -130,6 +131,17 @@ export const DOC_WRITE_RECEIPT_KEY = "docWriteReceipt";
 export const DOC_METADATA_REVISION_KEY = "docMetadataRevision";
 /** How long the copy of the document is served before its revision is checked. */
 export const DOC_SNAPSHOT_TTL_MS = 10_000;
+/**
+ * How long after Google returned a revision id a write may be pinned to it. Google documents
+ * a revision id as valid for 24 hours after it was returned, so a copy fetched longer ago
+ * builds no write and the document is read.
+ */
+export const DOC_REVISION_PIN_MS = 24 * 60 * 60 * 1000;
+
+/** Whether a write may be pinned at `now` to a revision id Google returned at `returnedAt`. */
+export function docRevisionPins(returnedAt: number, now: number = Date.now()): boolean {
+  return now - returnedAt <= DOC_REVISION_PIN_MS;
+}
 /** Prefix of the ID `addTab()` returns for a tab Google has not added yet. */
 export const PROVISIONAL_TAB_PREFIX = "pending-tab-";
 /** Each added tab's provisional ID to the ID Google gave it, oldest first. */
@@ -747,6 +759,25 @@ export type DocHost = {
    * changes queued behind it in its tab when it is one that changes tables.
    */
   unapplyable(id: number, action: GoogleDocAction, reason: string): Promise<void>;
+  /**
+   * The copy of the document this connection holds and a write may be built from, with the
+   * revision it was fetched at, or `undefined` for none: nothing held, a write landed or (on a
+   * connection that reads through a scope check) an edit was queued since it was fetched, the
+   * connection moved the revision otherwise since its fetch began (a comment write applied, a
+   * write marker deleted), no read that used it was authorized, a batch was already built from
+   * it (`spendCopy`), or its revision was returned longer ago than a write may be pinned to it
+   * (`docRevisionPins`). Asks Google nothing. Read the tabs wanted from it before awaiting
+   * anything.
+   */
+  heldCopy(): GoogleDocSnapshot | undefined;
+  /**
+   * Records that a batch built from `copy`, which `heldCopy()` answered, is about to be sent.
+   * A copy builds one batch: whatever becomes of it, `heldCopy()` does not answer that copy
+   * again for as long as the host remembers this, so a retry of a batch that did not land
+   * reads the document. A host may keep it in memory: one that forgot answers the copy once
+   * more, and the pin to its revision keeps that write safe. Reads are not affected.
+   */
+  spendCopy(copy: GoogleDocSnapshot): void;
 };
 
 /**
@@ -774,16 +805,105 @@ async function reconcileDocWriteReceipt(
 }
 
 /**
- * Writes `action`, edit `id`, unless its write already landed: one `batchUpdate` built against a
- * fresh read, pinned to that read's revision, carrying a named range that marks the write. A
- * retry that finds its own marker, or a receipt naming this edit, settles without writing again;
- * a retry of an add that landed without its reply is refused. The caller has given the edit a
- * write ID.
+ * What the copy `held` says of `action`'s write: the marker of a write that already landed,
+ * or the batch to send pinned to the copy's revision. `undefined` where the copy cannot say
+ * and the document as it is then decides: no revision to pin the batch to, a tab the copy
+ * lacks, cannot index or cannot read back, an edit the copy's tab refuses or that changes
+ * nothing in it, or more than one marker of the write.
+ */
+function planFromCopy(action: GoogleDocEditAction, held: GoogleDocSnapshot):
+  | { landed: GoogleDocWriteMarker }
+  | { write: MaterializedGoogleDocAction; revisionId: string }
+  | undefined {
+  let { revisionId, copy } = held;
+  // A batch built from the copy never leaves unpinned: the pin is all that keeps a copy the
+  // document has moved past from being written over it, and `batchUpdate` pins only to a
+  // revision that is not empty.
+  if (!revisionId) return undefined;
+  try {
+    let markers = new Map<string, GoogleDocWriteMarker>();
+    for (let { tabId } of googleDocActionTabs([...copy.outline], action)) {
+      let part = copy.tab(tabId);
+      if (!part) return undefined;
+      for (let marker of part.writeMarkers) {
+        if (marker.writeId === action.writeId) markers.set(marker.id, { id: marker.id, tabId });
+      }
+    }
+    if (markers.size > 1) return undefined;
+    let [landed] = markers.values();
+    if (landed) return { landed };
+
+    assertDocEditReplayable(action);
+    let part = copy.tab(docEditTab(copy.outline, action).tabId);
+    if (!part || part.unindexed) return undefined;
+    let tab = renderTab(part.tab);
+    let requests = docEditRequests(tab, action);
+    return requests.length > 0 ? { write: { tab, requests }, revisionId } : undefined;
+  } catch {
+    // A tab that cannot be read back, or an edit the copy's tab refuses.
+    return undefined;
+  }
+}
+
+/**
+ * Writes `action`, edit `id`, unless its write already landed: one `batchUpdate` pinned to the
+ * revision it was built against, carrying a named range that marks the write. An edit is built
+ * from the copy the connection holds, when it holds one that can say, and the host is told so
+ * that the copy builds no second batch; where Google refuses that batch, and wherever the copy
+ * cannot say, it is built against a fresh read. A retry that finds its own marker, or a receipt
+ * naming this edit, settles without writing again; a retry of an add that landed without its
+ * reply is refused. The caller has given the edit a write ID.
  */
 async function applyDocEdit(action: GoogleDocAction, host: DocHost, id: number): Promise<void> {
   let { api, documentId } = host;
   if (!action.writeId) throw new Error(`Google Doc action ${id} has no write ID`);
   let writeMarkerName = googleDocWriteMarkerName(action.writeId);
+  // An add of a tab reads the document: its retry is checked against the tab tree as it is
+  // then, and only Google's reply names the tab. So does an approval made while an earlier
+  // write's marker is still to be deleted: deleting it moves the revision past the copy's.
+  if (action.type !== "addTab" && !host.receipt()) {
+    let held = host.heldCopy();
+    let plan = held && planFromCopy(action, held);
+    if (plan && "landed" in plan) {
+      host.landed(id, plan.landed);
+      return;
+    }
+    if (held && plan) {
+      // Before the batch leaves: no outcome of it leaves a copy that builds the same batch
+      // again, so an approval tried again reads the document.
+      host.spendCopy(held);
+      let { tab, requests } = plan.write;
+      let result = await api.batchUpdate(documentId, requests, plan.revisionId, {
+        name: writeMarkerName,
+        rangeStart: tab.bodyEndIndex - 1,
+        tabId: tab.tabId,
+      }).catch((error: unknown) => {
+        let failure = docsWriteFailure(error);
+        // Nothing of the document, and not the caught value: the logger writes its message.
+        logger.warn("Google Doc write built from the copy held was not accepted", {
+          event: "google.doc.action.apply.copy-refused",
+          actionId: id,
+          operation: action.type,
+          failure,
+          providerStatus: error instanceof GoogleApiError ? error.providerStatus : undefined,
+          // What the approval does next: reads the document now, or fails and reads it when
+          // tried again.
+          fallback: failure === "absent" ? "read" : "retry",
+        });
+        // Google answered and refused the batch whole, as it does once the document has moved
+        // past the copy: the document is read below. Any other failure may have written.
+        if (failure !== "absent") throw error;
+        return undefined;
+      });
+      if (result) {
+        if (!result.writeMarkerId) {
+          throw new Error(`Google Docs did not return a write marker for action ${id}`);
+        }
+        host.landed(id, { id: result.writeMarkerId, tabId: tab.tabId });
+        return;
+      }
+    }
+  }
   let doc = await api.getDocument(documentId);
   // A receipt names this edit when its write landed and its record outlived the receipt: settled
   // from it, before any cleanup could delete the marker that proves it. Its tab is not recorded,

@@ -1,25 +1,33 @@
 import { ActionApplyError } from "@gadgets/gatekeeper-kit/actions";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import type { ApprovalQueue } from "@gadgets/workshop-shared/gatekeeper";
 import type { RpcStub } from "cloudflare:workers";
 import {
-  assertGoogleDocDisplaySize, describeDocEdit, DOC_DEFINITIONS, forgetGoogleDocTab,
-  googleDocSnapshot, replayGoogleDoc, replayGoogleDocActions, REPLAY_CONTEXT, type DocHost,
-  type GoogleDocAction, type GoogleDocPendingAction, type GoogleDocReplay,
-  type GoogleDocReplayQueue,
+  assertGoogleDocDisplaySize, describeDocEdit, DOC_DEFINITIONS, DOC_REVISION_PIN_MS,
+  DOC_SNAPSHOT_TTL_MS, docDefinition, docRevisionPins, forgetGoogleDocTab, googleDocSnapshot,
+  replayGoogleDoc, replayGoogleDocActions, REPLAY_CONTEXT, type DocHost, type GoogleDocAction,
+  type GoogleDocEditAction, type GoogleDocPendingAction, type GoogleDocReplay,
+  type GoogleDocReplayQueue, type GoogleDocSnapshot,
 } from "../../src/doc-actions";
 import { driveDocSource, GoogleDocSessionImpl, type DocChangeQueue } from "../../src/docs";
 import {
   blankDocsTab, type GoogleDocsApi, type GoogleDocsDocument, type GoogleDocsTab,
 } from "../../src/docs-api";
 import { replayCost } from "../../src/docs-model";
-import { renderTab } from "../../src/docs-replay";
-import { pruneTab, type DocCopy } from "../../src/docs-replica";
+import { applyDocEdit, materializeDocEdit, renderTab, type DocEdit } from "../../src/docs-replay";
+import {
+  DOC_COPY_UNREADABLE, pruneTab, type DocCopy, type DocTabCopy,
+} from "../../src/docs-replica";
+import {
+  prepareTableChange, prepareTextReplacement, type TableCall,
+} from "../../src/docs-table-actions";
 import { tableGateRefusal, tableIdentity } from "../../src/docs-tables";
 import type { DriveApi } from "../../src/drive-api";
+import { GoogleApiError } from "../../src/google-response";
 import { docTabToMarkdown, MARKDOWN_RENDERING_VERSION } from "../../src/markdown-converter";
 import {
-  buildTab, cardField, grid, item, NUMBERED_LIST, para, tableAt, type BlockSpec,
+  buildTab, cardField, diceOf, grid, item, NUMBERED_LIST, para, presetLevels, tableAt,
+  type BlockSpec, type Dice,
 } from "../doc-fixture";
 
 type Append = Parameters<typeof DOC_DEFINITIONS.appendText.describe>[0];
@@ -31,15 +39,28 @@ const BASE = {
 };
 const APPEND: Append = { ...BASE, type: "appendText", markdown: "More", display: { tab: "\"Main\" (tab-1)" } };
 
-/** A host over one document whose Docs API is a stub; `landed` and `unapplyable` are recorded. */
-function host(document: GoogleDocsDocument, receipt?: { actionId: number; markerId: string }) {
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
+
+/**
+ * A host over one document whose Docs API is a stub; `landed`, `unapplyable` and `spendCopy` are
+ * recorded. `held` is the copy `heldCopy` answers, until a batch is built from it.
+ */
+function host(
+  document: GoogleDocsDocument, receipt?: { actionId: number; markerId: string },
+  held?: GoogleDocSnapshot,
+) {
   let api = {
     getDocument: vi.fn(async () => document),
-    deleteNamedRange: vi.fn(async () => {}),
-    batchUpdate: vi.fn(async () => ({ writeMarkerId: "marker-new", replies: [] })),
+    deleteNamedRange: vi.fn<GoogleDocsApi["deleteNamedRange"]>(async () => {}),
+    batchUpdate: vi.fn<GoogleDocsApi["batchUpdate"]>(
+      async () => ({ revisionId: "r-next", writeMarkerId: "marker-new", replies: [] })),
   };
   let landed = vi.fn<DocHost["landed"]>();
   let unapplyable = vi.fn<DocHost["unapplyable"]>(async () => {});
+  let spendCopy = vi.fn<DocHost["spendCopy"]>(() => { held = undefined; });
   let docHost: DocHost = {
     api: api as unknown as DocHost["api"],
     documentId: "doc-1",
@@ -49,8 +70,10 @@ function host(document: GoogleDocsDocument, receipt?: { actionId: number; marker
     saved: () => {},
     landed,
     unapplyable,
+    heldCopy: () => held,
+    spendCopy,
   };
-  return { api, landed, unapplyable, docHost };
+  return { api, landed, unapplyable, spendCopy, docHost };
 }
 
 function document(text: string): GoogleDocsDocument {
@@ -59,6 +82,38 @@ function document(text: string): GoogleDocsDocument {
     tabs: [{ ...buildTab([{ runs: [`${text}\n`] }]), title: "Main" }],
   };
 }
+
+/** `document(text)` at revision `revisionId`. */
+const docAt = (revisionId: string, text: string): GoogleDocsDocument =>
+  ({ ...document(text), revisionId });
+
+/** `doc` with the markers `ids` of write `writeId` in its first tab. */
+function withMarkers(doc: GoogleDocsDocument, writeId: string, ...ids: string[]): GoogleDocsDocument {
+  let name = `gadgets-write-${writeId}`;
+  let [first, ...rest] = doc.tabs;
+  let namedRanges = { [name]: { namedRanges: ids.map(namedRangeId => ({ namedRangeId, name })) } };
+  return { ...doc, tabs: [{ ...first, namedRanges }, ...rest] };
+}
+
+/** What `landed` was told, call by call: the edit, its marker and the tab an add made. */
+const landings = (landed: MockInstance<DocHost["landed"]>) => landed.mock.calls.map(
+  ([id, marker, addedTab]) => ({ id, ...marker && { marker }, ...addedTab && { addedTab } }));
+
+/** The lines logged of a batch built from the copy held that was not accepted. */
+const copyRefusals = (warn: MockInstance<typeof console.warn>) =>
+  warn.mock.calls.map(([line]) => line as Record<string, unknown>)
+    .filter(line => line?.event === "google.doc.action.apply.copy-refused");
+
+/** A refusal of a Docs batch with `status`, as the Docs API throws one. */
+const docsRefusal = (status: string | undefined) =>
+  new GoogleApiError("Google Docs batchUpdate failed [http=400]", status);
+/** Google's refusal of a batch pinned to a revision the document has moved past. */
+const STALE_PIN = () => docsRefusal("INVALID_ARGUMENT");
+/** Google's answer to the batch that adds a tab. */
+const ADDED_TAB_REPLY = {
+  revisionId: "r-next", writeMarkerId: "marker-new",
+  replies: [{ addDocumentTab: { tabProperties: { tabId: "tab-made" } } }],
+};
 
 describe("Google Doc edit definitions", () => {
   it("declares text edits, new tabs and table changes under their three kinds, applied without a claim", () => {
@@ -230,6 +285,614 @@ describe("Google Doc edit definitions", () => {
     expect(unapplyable).toHaveBeenCalledWith(
       2, replace, expect.stringMatching(/^Pending Google Doc edit could not be applied: /));
     expect(api.batchUpdate).not.toHaveBeenCalled();
+  });
+
+  // -------------------------------------------------------------------------
+  // An edit built from the copy the connection holds
+  // -------------------------------------------------------------------------
+
+  it("builds an edit from the copy held and pins it to the copy's revision, reading no document", async () => {
+    let held = googleDocSnapshot(docAt("r-copy", "Draft"));
+    let { api, landed, spendCopy, docHost } = host(docAt("r-now", "Other"), undefined, held);
+    await DOC_DEFINITIONS.appendText.apply(APPEND, docHost, { id: 4 });
+    expect(api.getDocument).not.toHaveBeenCalled();
+    expect(api.batchUpdate).toHaveBeenCalledTimes(1);
+    expect(api.batchUpdate.mock.calls[0]).toMatchObject(
+      ["doc-1", expect.any(Array), "r-copy", { name: "gadgets-write-w-1", tabId: "tab-1" }]);
+    expect(spendCopy).toHaveBeenCalledWith(held);
+    expect(landings(landed)).toEqual([{ id: 4, marker: { id: "marker-new", tabId: "tab-1" } }]);
+  });
+
+  it.each<[string, (api: ReturnType<typeof host>["api"]) => void]>([
+    ["is answered", () => {}],
+    ["is refused with INVALID_ARGUMENT", api => api.batchUpdate.mockRejectedValueOnce(STALE_PIN())],
+    ["is refused with no status", api => api.batchUpdate.mockRejectedValueOnce(docsRefusal(undefined))],
+    ["fails with a plain Error", api => api.batchUpdate.mockRejectedValueOnce(new Error("socket closed"))],
+    ["is answered without a marker id",
+      api => api.batchUpdate.mockResolvedValueOnce({ revisionId: "r-next", replies: [] })],
+  ])("spends the copy before its batch leaves, when the batch %s", async (_name, arrange) => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let held = googleDocSnapshot(docAt("r-copy", "Draft"));
+    let { api, spendCopy, docHost } = host(docAt("r-now", "Draft"), undefined, held);
+    arrange(api);
+    await DOC_DEFINITIONS.appendText.apply(APPEND, docHost, { id: 4 }).catch(() => {});
+    expect(spendCopy).toHaveBeenCalledTimes(1);
+    expect(spendCopy).toHaveBeenCalledWith(held);
+    expect(api.batchUpdate.mock.calls[0][2]).toBe("r-copy");
+    expect(spendCopy.mock.invocationCallOrder[0])
+      .toBeLessThan(api.batchUpdate.mock.invocationCallOrder[0]);
+  });
+
+  it("does not spend a copy it builds no batch from", async () => {
+    // The copy holds the write's marker.
+    let settled = host(docAt("r-now", "Draft"), undefined,
+      googleDocSnapshot(withMarkers(docAt("r-copy", "Draft"), "w-1", "marker-1")));
+    await DOC_DEFINITIONS.appendText.apply(APPEND, settled.docHost, { id: 4 });
+    expect(settled.spendCopy).not.toHaveBeenCalled();
+
+    // The copy cannot say.
+    let unpinned = host(docAt("r-now", "Draft"), undefined,
+      { ...googleDocSnapshot(docAt("r-copy", "Draft")), revisionId: undefined });
+    await DOC_DEFINITIONS.appendText.apply(APPEND, unpinned.docHost, { id: 4 });
+    expect(unpinned.spendCopy).not.toHaveBeenCalled();
+
+    // An add of a tab.
+    let added = host(docAt("r-now", "Draft"), undefined, googleDocSnapshot(docAt("r-copy", "Draft")));
+    added.api.batchUpdate.mockResolvedValueOnce(ADDED_TAB_REPLY);
+    await DOC_DEFINITIONS.addTab.apply(add("pending-tab-1", {}), added.docHost, { id: 4 });
+    expect(added.spendCopy).not.toHaveBeenCalled();
+
+    // A receipt waits.
+    let waiting = host(docAt("r-now", "Draft"), { actionId: 9, markerId: "marker-old" },
+      googleDocSnapshot(docAt("r-copy", "Draft")));
+    await DOC_DEFINITIONS.appendText.apply(APPEND, waiting.docHost, { id: 4 });
+    expect(waiting.spendCopy).not.toHaveBeenCalled();
+    for (let { landed } of [settled, unpinned, added, waiting]) expect(landed).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads the document and builds again when Google refuses the batch built from a stale copy", async () => {
+    let warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let fresh = docAt("r-now", "Draft and what a collaborator wrote since");
+    let { api, landed, docHost } = host(fresh, undefined, googleDocSnapshot(docAt("r-copy", "Draft")));
+    api.batchUpdate.mockRejectedValueOnce(STALE_PIN());
+    await DOC_DEFINITIONS.appendText.apply(APPEND, docHost, { id: 4 });
+
+    expect(api.getDocument).toHaveBeenCalledTimes(1);
+    expect(api.batchUpdate).toHaveBeenCalledTimes(2);
+    let [[, staleRequests, staleRevision, staleMarker], [, requests, revision, marker]] =
+      api.batchUpdate.mock.calls;
+    expect(staleRevision).toBe("r-copy");
+    expect(revision).toBe("r-now");
+    // Built against the document as it is: the append goes at its end, past where the copy ended.
+    expect(requests).toEqual(materializeDocEdit(fresh.tabs, APPEND).requests);
+    expect(requests).not.toEqual(staleRequests);
+    expect(marker!.rangeStart).toBeGreaterThan(staleMarker!.rangeStart);
+    expect(landings(landed)).toEqual([{ id: 4, marker: { id: "marker-new", tabId: "tab-1" } }]);
+
+    expect(copyRefusals(warn)).toHaveLength(1);
+    expect(copyRefusals(warn)[0]).toMatchObject({
+      actionId: 4, operation: "appendText", failure: "absent",
+      providerStatus: "INVALID_ARGUMENT", fallback: "read",
+    });
+  });
+
+  it("logs a batch built from the copy that was not accepted, with nothing of the document", async () => {
+    let warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let replace: Replace = {
+      ...BASE, type: "replaceText", oldMarkdown: "Quokka", newMarkdown: "Numbat", display: { tab: "x" },
+    };
+    let held = googleDocSnapshot(docAt("revision-wombat", "Quokka wanders"));
+    let { api, docHost } = host(docAt("r-now", "Quokka wanders"), undefined, held);
+    // A message Google's errors never have: the caught value is not what is logged.
+    api.batchUpdate.mockRejectedValueOnce(
+      new GoogleApiError("Google refused to move the Tamarin past Quokka", "INVALID_ARGUMENT"));
+    await DOC_DEFINITIONS.replaceText.apply(replace, docHost, { id: 7 });
+
+    let [line, ...more] = copyRefusals(warn);
+    expect(more).toEqual([]);
+    // Beside what the logger writes on every line, the line holds these fields and no other.
+    let { component: _c, vendorId: _v, message: _m, level: _l, ...own } = line;
+    expect(own).toStrictEqual({
+      event: "google.doc.action.apply.copy-refused", actionId: 7, operation: "replaceText",
+      failure: "absent", providerStatus: "INVALID_ARGUMENT", fallback: "read",
+    });
+    let written = JSON.stringify(line);
+    for (let word of ["Quokka", "wanders", "Numbat", "Tamarin", "revision-wombat"]) {
+      expect(written, word).not.toContain(word);
+    }
+  });
+
+  it("logs nothing of the copy where no batch built from it fails", async () => {
+    let warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let copy = () => googleDocSnapshot(docAt("r-copy", "Draft"));
+    // The copy's batch is answered.
+    await DOC_DEFINITIONS.appendText.apply(
+      APPEND, host(docAt("r-now", "Draft"), undefined, copy()).docHost, { id: 4 });
+    // The copy holds the write's marker.
+    await DOC_DEFINITIONS.appendText.apply(APPEND, host(docAt("r-now", "Draft"), undefined,
+      googleDocSnapshot(withMarkers(docAt("r-copy", "Draft"), "w-1", "marker-1"))).docHost, { id: 4 });
+    // The copy cannot say.
+    await DOC_DEFINITIONS.appendText.apply(APPEND, host(docAt("r-now", "Draft"), undefined,
+      { ...copy(), revisionId: undefined }).docHost, { id: 4 });
+    // An add of a tab.
+    let added = host(docAt("r-now", "Draft"), undefined, copy());
+    added.api.batchUpdate.mockResolvedValueOnce(ADDED_TAB_REPLY);
+    await DOC_DEFINITIONS.addTab.apply(add("pending-tab-1", {}), added.docHost, { id: 4 });
+    // No copy is held, and the batch built from the document is refused.
+    let refused = host(docAt("r-now", "Draft"));
+    refused.api.batchUpdate.mockRejectedValueOnce(STALE_PIN());
+    await expect(DOC_DEFINITIONS.appendText.apply(APPEND, refused.docHost, { id: 4 })).rejects.toThrow();
+    expect(copyRefusals(warn)).toEqual([]);
+  });
+
+  it("fails as it does on a fresh read when the document no longer takes the edit", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    let replace: Replace = {
+      ...BASE, type: "replaceText", oldMarkdown: "Draft", newMarkdown: "Final", display: { tab: "x" },
+    };
+    let { api, landed, unapplyable, docHost } =
+      host(docAt("r-now", "Rewritten"), undefined, googleDocSnapshot(docAt("r-copy", "Draft")));
+    api.batchUpdate.mockRejectedValueOnce(STALE_PIN());
+    let applied = DOC_DEFINITIONS.replaceText.apply(replace, docHost, { id: 2 });
+    await expect(applied).rejects.toBeInstanceOf(ActionApplyError);
+    await expect(applied).rejects.toThrow("oldMarkdown was not found");
+    expect(unapplyable).toHaveBeenCalledWith(
+      2, replace, expect.stringMatching(/^Pending Google Doc edit could not be applied: /));
+    expect(api.batchUpdate).toHaveBeenCalledTimes(1);
+    expect(landed).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, () => Error, string, string | undefined]>([
+    ["a failure that is no answer", () => new Error("socket closed"), "unknown", undefined],
+    ["a refusal for rate", () => docsRefusal("RESOURCE_EXHAUSTED"), "rateLimited", "RESOURCE_EXHAUSTED"],
+    ["a refusal that carries no status", () => docsRefusal(undefined), "unknown", undefined],
+  ])("reads the document at the next approval, not in this one, after %s",
+    async (_name, failed, failure, providerStatus) => {
+      let warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      // The document as the retry finds it: without the write's marker, and with it.
+      for (let fresh of [docAt("r-now", "Draft"), withMarkers(docAt("r-now", "DraftMore"), "w-1", "marker-1")]) {
+        warn.mockClear();
+        let { api, landed, docHost } =
+          host(fresh, undefined, googleDocSnapshot(docAt("r-copy", "Draft")));
+        let error = failed();
+        api.batchUpdate.mockRejectedValueOnce(error);
+        await expect(DOC_DEFINITIONS.appendText.apply(APPEND, docHost, { id: 4 })).rejects.toBe(error);
+        expect(api.getDocument).not.toHaveBeenCalled();
+        expect(api.batchUpdate).toHaveBeenCalledTimes(1);
+        expect(landed).not.toHaveBeenCalled();
+        let [line, ...more] = copyRefusals(warn);
+        expect(more).toEqual([]);
+        expect(line).toMatchObject({ actionId: 4, operation: "appendText", failure, fallback: "retry" });
+        expect(line.providerStatus).toBe(providerStatus);
+
+        await DOC_DEFINITIONS.appendText.apply(APPEND, docHost, { id: 4 });
+        expect(api.getDocument).toHaveBeenCalledTimes(1);
+        if (fresh.tabs[0].namedRanges["gadgets-write-w-1"]) {
+          expect(api.batchUpdate).toHaveBeenCalledTimes(1);
+          expect(landings(landed)).toEqual([{ id: 4, marker: { id: "marker-1", tabId: "tab-1" } }]);
+        } else {
+          expect(api.batchUpdate).toHaveBeenCalledTimes(2);
+          expect(api.batchUpdate.mock.calls[1][2]).toBe("r-now");
+          expect(landings(landed)).toEqual([{ id: 4, marker: { id: "marker-new", tabId: "tab-1" } }]);
+        }
+        expect(copyRefusals(warn)).toHaveLength(1);
+      }
+    });
+
+  it("settles from the marker the copy holds, writing and reading nothing", async () => {
+    let held = googleDocSnapshot(withMarkers(docAt("r-copy", "DraftMore"), "w-1", "marker-1"));
+    let { api, landed, docHost } = host(docAt("r-now", "DraftMore"), undefined, held);
+    await DOC_DEFINITIONS.appendText.apply(APPEND, docHost, { id: 4 });
+    expect(landings(landed)).toEqual([{ id: 4, marker: { id: "marker-1", tabId: "tab-1" } }]);
+    expect(api.batchUpdate).not.toHaveBeenCalled();
+    expect(api.getDocument).not.toHaveBeenCalled();
+  });
+
+  it("finds the marker in the document when the copy predates the write", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let fresh = withMarkers(docAt("r-now", "DraftMore"), "w-1", "marker-1");
+    let { api, landed, docHost } = host(fresh, undefined, googleDocSnapshot(docAt("r-copy", "Draft")));
+    // The write landed and moved the document past the copy.
+    api.batchUpdate.mockRejectedValueOnce(STALE_PIN());
+    await DOC_DEFINITIONS.appendText.apply(APPEND, docHost, { id: 4 });
+    expect(landings(landed)).toEqual([{ id: 4, marker: { id: "marker-1", tabId: "tab-1" } }]);
+    expect(api.batchUpdate).toHaveBeenCalledTimes(1);
+    expect(api.getDocument).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads the document while a receipt waits, and deletes its marker first", async () => {
+    let fresh = withMarkers(docAt("r-now", "Draft"), "w-earlier", "marker-old");
+    let { api, landed, spendCopy, docHost } = host(
+      fresh, { actionId: 9, markerId: "marker-old" }, googleDocSnapshot(docAt("r-copy", "Draft")));
+    await DOC_DEFINITIONS.appendText.apply(APPEND, docHost, { id: 4 });
+    expect(spendCopy).not.toHaveBeenCalled();
+    expect(api.deleteNamedRange).toHaveBeenCalledWith("doc-1", "marker-old", "tab-1");
+    // Once to find the marker, and again without it.
+    expect(api.getDocument).toHaveBeenCalledTimes(2);
+    expect(api.deleteNamedRange.mock.invocationCallOrder[0])
+      .toBeLessThan(api.batchUpdate.mock.invocationCallOrder[0]);
+    expect(api.batchUpdate).toHaveBeenCalledTimes(1);
+    expect(api.batchUpdate.mock.calls[0][2]).toBe("r-now");
+    expect(landings(landed)).toEqual([{ id: 4, marker: { id: "marker-new", tabId: "tab-1" } }]);
+  });
+
+  it("reads the document for an add of a tab, whatever copy is held", async () => {
+    let { api, landed, spendCopy, docHost } =
+      host(docAt("r-now", "Draft"), undefined, googleDocSnapshot(docAt("r-copy", "Draft")));
+    api.batchUpdate.mockResolvedValueOnce(ADDED_TAB_REPLY);
+    await DOC_DEFINITIONS.addTab.apply(add("pending-tab-1", {}), docHost, { id: 4 });
+    expect(api.getDocument).toHaveBeenCalledTimes(1);
+    expect(spendCopy).not.toHaveBeenCalled();
+    expect(api.batchUpdate).toHaveBeenCalledTimes(1);
+    expect(api.batchUpdate.mock.calls[0][2]).toBe("r-now");
+    expect(landings(landed)).toEqual([{
+      id: 4, marker: { id: "marker-new", tabId: "tab-1" },
+      addedTab: { provisionalTabId: "pending-tab-1", tabId: "tab-made" },
+    }]);
+  });
+
+  /** The copy of "Draft" at `r-copy`, with its tabs read through `tab`. */
+  const copyReadBy = (tab: (part: DocTabCopy) => DocTabCopy | undefined): GoogleDocSnapshot => {
+    let snapshot = googleDocSnapshot(docAt("r-copy", "Draft"));
+    let { outline } = snapshot.copy;
+    return { ...snapshot, copy: { outline, tab: tabId => tab(snapshot.copy.tab(tabId)!) } };
+  };
+  const REPLACE_DRAFT: Replace = {
+    ...BASE, type: "replaceText", oldMarkdown: "Draft", newMarkdown: "Final", display: { tab: "x" },
+  };
+
+  it.each<[string, () => GoogleDocSnapshot, Append | Replace, GoogleDocsDocument, "written" | "nothing to write"]>([
+    ["has no revision", () => ({ ...googleDocSnapshot(docAt("r-copy", "Draft")), revisionId: undefined }),
+      APPEND, docAt("r-now", "Draft"), "written"],
+    ["has an empty revision", () => googleDocSnapshot(docAt("", "Draft")),
+      APPEND, docAt("r-now", "Draft"), "written"],
+    ["lacks the edit's tab", () => googleDocSnapshot({
+      ...docAt("r-copy", "Draft"), tabs: [{ ...docAt("r-copy", "Draft").tabs[0], tabId: "tab-9" }],
+    }), APPEND, docAt("r-now", "Draft"), "written"],
+    ["cannot index it", () => copyReadBy(part => ({ ...part, unindexed: true })),
+      APPEND, docAt("r-now", "Draft"), "written"],
+    ["throws reading it back", () => copyReadBy(() => { throw new Error(DOC_COPY_UNREADABLE); }),
+      APPEND, docAt("r-now", "Draft"), "written"],
+    // The copy lacks the text the edit replaces, and the document holds it.
+    ["refuses the edit", () => googleDocSnapshot(docAt("r-copy", "Sketch")),
+      REPLACE_DRAFT, docAt("r-now", "Draft"), "written"],
+    ["builds no request for it", () => googleDocSnapshot(docAt("r-copy", "Draft")),
+      { ...REPLACE_DRAFT, newMarkdown: "Draft" }, docAt("r-now", "Draft"), "nothing to write"],
+    ["holds two markers of the write",
+      () => googleDocSnapshot(withMarkers(docAt("r-copy", "Draft"), "w-1", "marker-1", "marker-2")),
+      APPEND, docAt("r-now", "Draft"), "written"],
+  ])("reads the document when the copy %s", async (_name, held, action, fresh, outcome) => {
+    let { api, landed, spendCopy, docHost } = host(fresh, undefined, held());
+    await docDefinition(action).apply(action, docHost, { id: 4 });
+    expect(api.getDocument).toHaveBeenCalledTimes(1);
+    expect(spendCopy).not.toHaveBeenCalled();
+    if (outcome === "written") {
+      // Whatever the copy's revision, the one batch sent is pinned to the document's.
+      expect(api.batchUpdate.mock.calls.map(([, , revision]) => revision)).toEqual(["r-now"]);
+      expect(landings(landed)).toEqual([{ id: 4, marker: { id: "marker-new", tabId: "tab-1" } }]);
+    } else {
+      expect(api.batchUpdate).not.toHaveBeenCalled();
+      expect(landings(landed)).toEqual([{ id: 4 }]);
+    }
+  });
+});
+
+describe("how long a revision id pins a write", () => {
+  it("pins for 24 hours after Google returned it, and not a millisecond longer", () => {
+    expect(DOC_REVISION_PIN_MS).toBe(24 * 60 * 60 * 1000);
+    let t = Date.UTC(2026, 0, 1);
+    expect(docRevisionPins(t, t)).toBe(true);
+    expect(docRevisionPins(t, t + DOC_REVISION_PIN_MS - 1)).toBe(true);
+    expect(docRevisionPins(t, t + DOC_REVISION_PIN_MS)).toBe(true);
+    expect(docRevisionPins(t, t + DOC_REVISION_PIN_MS + 1)).toBe(false);
+
+    // With no time given, the clock is read.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(t + DOC_REVISION_PIN_MS);
+    expect(docRevisionPins(t)).toBe(true);
+    vi.setSystemTime(t + DOC_REVISION_PIN_MS + 1);
+    expect(docRevisionPins(t)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The copy held and a fresh read build the same batch
+// ---------------------------------------------------------------------------
+
+const GENERATED_LISTS: GoogleDocsTab["lists"] = {
+  bullets: { listProperties: { nestingLevels: presetLevels() } },
+  numbers: { listProperties: { nestingLevels: presetLevels(true) } },
+};
+
+/**
+ * The style of a run in an explicit font: bold, which a text style request of the builders
+ * names, beside fields the copy does not keep.
+ */
+const EXPLICIT_FONT = {
+  bold: true, smallCaps: true,
+  weightedFontFamily: { fontFamily: "Lora", weight: 700 },
+  backgroundColor: { color: { rgbColor: { red: 1, green: 0.9, blue: 0.6 } } },
+};
+
+/** A tab of a generated document, with the words its generators name. */
+type GeneratedTab = {
+  tab: GoogleDocsTab;
+  /** The word of the paragraph whose run is in an explicit font. */
+  fonted: string;
+  /** The word of each paragraph outside the tables, the items of its lists among them. */
+  paragraphs: string[];
+  /** The words of the paragraphs that are no item of a list. */
+  prose: string[];
+  /** The tables no cell of which is merged: the index among the tab's tables, and the cells' words. */
+  tables: { at: number; cells: string[][] }[];
+};
+
+/** A generated document as Google returns it. Every word in it is there once. */
+type Generated = {
+  document: GoogleDocsDocument;
+  /** The tabs that hold text. The first one's first table has a merged region at its first cell. */
+  tabs: GeneratedTab[];
+  blank: GoogleDocsTab;
+  /** A word the document does not hold. */
+  word: () => string;
+  /** The stored edit `edit` of `tab`, under a write id of its own. */
+  stored: (tab: GoogleDocsTab, edit: DocEdit) => GoogleDocEditAction;
+};
+
+/**
+ * A document of one or two tabs of text and a blank one, drawn from `dice`: paragraphs, one of
+ * them in an explicit font, a heading, two lists and one or two tables of drawn sizes in each, a
+ * merged region in the first tab, and named ranges the copy does not keep (one that marks no
+ * write, one of another write).
+ */
+function generatedDocument(dice: Dice, seed: number): Generated {
+  let fresh = 0;
+  let writes = 0;
+  let tabs = Array.from({ length: 1 + dice.below(2) }, (_, index): GeneratedTab => {
+    let count = 0;
+    let word = () => `${"ab"[index]}w${String(count++).padStart(3, "0")}`;
+    let paragraphs: string[] = [];
+    let prose: string[] = [];
+    let outside = (words = prose) => {
+      let text = word();
+      paragraphs.push(text);
+      if (words === prose) prose.push(text);
+      return text;
+    };
+    let listed = (listId: string) => ({ runs: [`${outside([])}\n`], bullet: { listId } });
+    let tables: GeneratedTab["tables"] = [];
+    let fonted = word();
+    let blocks: BlockSpec[] = [
+      para(outside()), listed("bullets"), listed("bullets"),
+      { runs: [`${outside()}\n`], namedStyleType: "HEADING_2" },
+      { runs: [{ text: `${fonted}\n`, style: EXPLICIT_FONT }] },
+    ];
+    let table = (plain: boolean) => {
+      let columns = 2 + dice.below(2);
+      let cells = Array.from({ length: 2 + dice.below(3) }, () => Array.from({ length: columns }, word));
+      if (plain) tables.push({ at: blocks.filter(block => "table" in block).length, cells });
+      blocks.push(grid(...cells), para(outside()));
+    };
+    // The first tab's first table is the one a region is merged in.
+    if (index === 0) table(false);
+    blocks.push(listed("numbers"), listed("numbers"), para(outside()));
+    for (let more = 1 + dice.below(2); more > 0; more--) table(true);
+    let tab: GoogleDocsTab = {
+      ...buildTab(blocks, GENERATED_LISTS), tabId: `tab-${index + 1}`, title: `Tab ${index + 1}`, index,
+    };
+    if (index === 0) {
+      tab = {
+        ...applyDocEdit(tab, prepareTableChange(tab, {
+          method: "mergeTableCells", cells: { table: 0, row: 0, column: 0, rows: 1, columns: 2 },
+        }, "x").change),
+        namedRanges: {
+          "someone's": { namedRanges: [{ namedRangeId: "range.1", name: "someone's" }] },
+          "gadgets-write-earlier": {
+            namedRanges: [{ namedRangeId: "range.2", name: "gadgets-write-earlier" }],
+          },
+        },
+      };
+    }
+    return { tab, fonted, paragraphs, prose, tables };
+  });
+  let blank = { ...blankDocsTab("tab-blank", "Blank"), index: tabs.length };
+  return {
+    document: {
+      documentId: "doc-1", title: "Plan", revisionId: `revision-${seed}`,
+      tabs: [...tabs.map(({ tab }) => tab), blank],
+    },
+    tabs, blank,
+    word: () => `nw${String(fresh++).padStart(3, "0")}`,
+    stored: (tab, edit) => ({ ...BASE, tabId: tab.tabId, writeId: `w-${seed}-${writes++}`, ...edit }),
+  };
+}
+
+/** A tab of `generated` and one of its tables that has no merged cell. */
+function drawnTable(dice: Dice, generated: Generated) {
+  let { tab, tables } = dice.pick(generated.tabs);
+  let { at, cells } = dice.pick(tables);
+  return { tab, at, cells, row: dice.below(cells.length), column: dice.below(cells[0].length) };
+}
+
+/** The stored change `call` makes to a table of `tab`, recording the table as the tab has it. */
+const tableChangeOf = (generated: Generated, tab: GoogleDocsTab, call: TableCall) =>
+  generated.stored(tab, prepareTableChange(tab, call, "x").change);
+
+/**
+ * The edits compared for each kind, drawn against a generated document. A kind added to
+ * `DocEdit` fails the type check here until it has a generator.
+ */
+const EDITS = {
+  replaceText(dice, generated) {
+    let outside = dice.pick(generated.tabs);
+    let { tab, cells, row, column } = drawnTable(dice, generated);
+    let cell = `<p>${cells[row][column]}</p>`;
+    let replacement = `<p>${generated.word()}</p>`;
+    expect(prepareTextReplacement(tab, cell, replacement, "x").inTable).toBe(true);
+    return [
+      generated.stored(outside.tab, {
+        type: "replaceText", oldMarkdown: dice.pick(outside.paragraphs), newMarkdown: generated.word(),
+      }),
+      generated.stored(tab, {
+        type: "replaceText", oldMarkdown: cell, newMarkdown: replacement, inTable: true,
+      }),
+      // Inside the run in an explicit font, whose style the text written takes.
+      generated.stored(outside.tab, {
+        type: "replaceText", oldMarkdown: outside.fonted, newMarkdown: generated.word(),
+      }),
+    ];
+  },
+  appendText: (dice, generated) => [
+    generated.stored(dice.pick(generated.tabs).tab, {
+      type: "appendText", markdown: `${dice.pick(["", "- ", "1. "])}${generated.word()}`,
+    }),
+    generated.stored(generated.blank, { type: "appendText", markdown: generated.word() }),
+  ],
+  insertTable(dice, generated) {
+    let { tab, prose } = dice.pick(generated.tabs);
+    return [tableChangeOf(generated, tab, {
+      method: "insertTable",
+      table: {
+        rows: 1 + dice.below(2), columns: 2, cells: [[generated.word(), generated.word()]],
+        ...(dice.random() < 0.5 ? { after: dice.pick(prose) } : {}),
+      },
+    })];
+  },
+  insertTableRows(dice, generated) {
+    let { tab, at, cells } = drawnTable(dice, generated);
+    return [tableChangeOf(generated, tab, {
+      method: "insertTableRows",
+      lines: { table: at, at: dice.below(cells.length + 1), cells: [cells[0].map(generated.word)] },
+    })];
+  },
+  insertTableColumns(dice, generated) {
+    let { tab, at, cells } = drawnTable(dice, generated);
+    return [tableChangeOf(generated, tab, {
+      method: "insertTableColumns",
+      lines: {
+        table: at, at: dice.below(cells[0].length + 1), cells: cells.map(() => [generated.word()]),
+      },
+    })];
+  },
+  deleteTableRows(dice, generated) {
+    let { tab, at, row } = drawnTable(dice, generated);
+    return [tableChangeOf(generated, tab, { method: "deleteTableRows", lines: { table: at, at: row } })];
+  },
+  deleteTableColumns(dice, generated) {
+    let { tab, at, column } = drawnTable(dice, generated);
+    return [tableChangeOf(
+      generated, tab, { method: "deleteTableColumns", lines: { table: at, at: column } })];
+  },
+  deleteTable(dice, generated) {
+    let { tab, at } = drawnTable(dice, generated);
+    return [tableChangeOf(generated, tab, { method: "deleteTable", table: at })];
+  },
+  mergeTableCells(dice, generated) {
+    let { tab, at, cells } = drawnTable(dice, generated);
+    let across = dice.random() < 0.5;
+    return [tableChangeOf(generated, tab, {
+      method: "mergeTableCells",
+      cells: across
+        ? { table: at, row: dice.below(cells.length), column: dice.below(cells[0].length - 1), rows: 1, columns: 2 }
+        : { table: at, row: dice.below(cells.length - 1), column: dice.below(cells[0].length), rows: 2, columns: 1 },
+    })];
+  },
+  // The region merged in the first tab's first table.
+  unmergeTableCells: (_dice, generated) => [tableChangeOf(generated, generated.tabs[0].tab, {
+    method: "unmergeTableCells", cell: { table: 0, row: 0, column: 0 },
+  })],
+  setTableCellStyle(dice, generated) {
+    let { tab, at, row, column } = drawnTable(dice, generated);
+    return [tableChangeOf(generated, tab, {
+      method: "setTableCellStyle",
+      cells: { table: at, row, column, style: { background: `#${String(100000 + dice.below(899999))}` } },
+    })];
+  },
+  setTableColumnWidths(dice, generated) {
+    let { tab, at, column } = drawnTable(dice, generated);
+    return [tableChangeOf(generated, tab, {
+      method: "setTableColumnWidths", columns: { table: at, at: column, width: 40 + dice.below(100) },
+    })];
+  },
+  setTableRowHeights(dice, generated) {
+    let { tab, at, row } = drawnTable(dice, generated);
+    return [tableChangeOf(generated, tab, {
+      method: "setTableRowHeights", rows: { table: at, at: row, height: 20 + dice.below(40) },
+    })];
+  },
+} satisfies Record<DocEdit["type"], (dice: Dice, generated: Generated) => GoogleDocEditAction[]>;
+
+type BatchCall = Parameters<GoogleDocsApi["batchUpdate"]>;
+
+/**
+ * The batch `call` sends as Google reads it, and what it does not read. A text style request
+ * sets the fields its mask names and no other, so each one's style is cut to those in `call`,
+ * and the fields cut are `unread`.
+ */
+function asGoogleReads([documentId, requests, ...pinAndMarker]: BatchCall) {
+  let unread: string[] = [];
+  let read = requests.map(request => {
+    if (!("updateTextStyle" in request)) return request;
+    let { textStyle, fields } = request.updateTextStyle;
+    let named = fields.split(",");
+    let set = Object.entries(textStyle).filter(([field]) => {
+      if (!named.includes(field)) unread.push(field);
+      return named.includes(field);
+    });
+    return { updateTextStyle: { ...request.updateTextStyle, textStyle: Object.fromEntries(set) } };
+  });
+  return { call: [documentId, read, ...pinAndMarker], unread };
+}
+
+// The copy keeps what the builders read of a tab, so the batch an approval builds from it is the
+// batch it builds from the document at the same revision, but for one thing: a text style request
+// carries the whole style of the run it was read from, of which the copy keeps a part. The mask
+// of the request names the fields Google sets, the copy keeps each of those, and the two batches
+// are compared as Google reads them. Held here for documents and edits nobody wrote by hand.
+describe("a Doc edit built from the copy held and from a fresh read", () => {
+  const SEEDS = Array.from({ length: 25 }, (_, index) => index + 1);
+  /** How many edits of each kind were compared. */
+  const compared = new Map<string, number>();
+  /** The style fields the fresh read's batches carried unread that the copy's did not. */
+  const dropped = new Set<string>();
+
+  it.each(SEEDS)("is the same batch, pinned to the same revision (seed %i)", async seed => {
+    let dice = diceOf(seed);
+    let generated = generatedDocument(dice, seed);
+    for (let [kind, edits] of Object.entries(EDITS)) {
+      for (let action of edits(dice, generated)) {
+        let fresh = host(generated.document);
+        let copy = host(generated.document, undefined, googleDocSnapshot(generated.document));
+        // An edit the document refuses, or that changes nothing in it, is a defect of the
+        // generator: it fails here, and is never left out.
+        await docDefinition(action).apply(action, fresh.docHost, { id: 4 });
+        await docDefinition(action).apply(action, copy.docHost, { id: 4 });
+        expect(fresh.api.batchUpdate, kind).toHaveBeenCalledTimes(1);
+        expect(copy.api.getDocument, kind).not.toHaveBeenCalled();
+        expect(copy.api.batchUpdate, kind).toHaveBeenCalledTimes(1);
+        let fromFresh = asGoogleReads(fresh.api.batchUpdate.mock.calls[0]);
+        let fromCopy = asGoogleReads(copy.api.batchUpdate.mock.calls[0]);
+        // The document, the requests, the revision and the marker's name, place and tab.
+        expect(fromCopy.call, kind).toStrictEqual(fromFresh.call);
+        for (let field of fromFresh.unread) if (!fromCopy.unread.includes(field)) dropped.add(field);
+        // No batch built from the copy leaves unpinned.
+        let [, , pin] = copy.api.batchUpdate.mock.calls[0];
+        expect(pin, kind).toBe(`revision-${seed}`);
+        expect(landings(copy.landed), kind).toEqual(landings(fresh.landed));
+        compared.set(kind, (compared.get(kind) ?? 0) + 1);
+      }
+    }
+  });
+
+  it("compared every kind", () => {
+    for (let kind of Object.keys(EDITS)) {
+      expect(compared.get(kind) ?? 0, kind).toBeGreaterThanOrEqual(SEEDS.length);
+    }
+  });
+
+  it("differs from the fresh read's only in style fields no mask names", () => {
+    expect(dropped).toEqual(new Set(["backgroundColor", "smallCaps", "weightedFontFamily"]));
   });
 });
 
@@ -954,7 +1617,7 @@ describe("a Drive binding's Doc snapshot", () => {
     } as unknown as GoogleDocsApi;
     let newest = 0;
     let source = driveDocSource(docsApi, {} as DriveApi, "doc-1", {
-      writes: () => 0, newestQueued: () => newest,
+      writes: () => 0, newestQueued: () => newest, revisionMoves: () => 0,
     });
 
     let fetched = source.snapshot();
@@ -967,6 +1630,20 @@ describe("a Drive binding's Doc snapshot", () => {
   });
 });
 
+/** A source over a stub Google that counts its requests, with the document at revision `r<n>`. */
+function countedSource() {
+  let state = { revision: 1, gets: 0, probes: 0, writes: 0, newest: 0, moves: 0 };
+  let docsApi = {
+    getDocument: async () => { state.gets++; return docAt(`r${state.revision}`, "Draft"); },
+    getRevisionId: async () => { state.probes++; return `r${state.revision}`; },
+  } as unknown as GoogleDocsApi;
+  let source = driveDocSource(docsApi, {} as DriveApi, "doc-1", {
+    writes: () => state.writes, newestQueued: () => state.newest,
+    revisionMoves: () => state.moves,
+  });
+  return { state, source };
+}
+
 describe("a Drive binding's Doc snapshot, reused", () => {
   // An edit is stamped while it is prepared and may enter the queue only after a snapshot fetched
   // later than that: its time cannot tell the snapshot holds what the edit was checked against.
@@ -977,7 +1654,7 @@ describe("a Drive binding's Doc snapshot, reused", () => {
     } as unknown as GoogleDocsApi;
     let newest = 0;
     let source = driveDocSource(docsApi, {} as DriveApi, "doc-1", {
-      writes: () => 0, newestQueued: () => newest,
+      writes: () => 0, newestQueued: () => newest, revisionMoves: () => 0,
     });
     let first = await source.snapshot();
     source.approved(first);
@@ -985,6 +1662,114 @@ describe("a Drive binding's Doc snapshot, reused", () => {
     newest = 4;
     expect((await source.snapshot()).revisionId).toBe("r2");
     expect(calls).toBe(2);
+  });
+
+  const T = Date.UTC(2026, 0, 1);
+
+  it("is held for a write only while a read could reuse it", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(T);
+    let { state, source } = countedSource();
+    expect(source.held()).toBeUndefined();
+    let first = await source.snapshot();
+    // No read that used it is authorized yet.
+    expect(source.held()).toBeUndefined();
+    source.approved(first);
+    expect(source.held()).toBe(first);
+    // Past the TTL too: the pin to its revision is the check, and nothing is asked.
+    vi.setSystemTime(T + DOC_SNAPSHOT_TTL_MS + 1);
+    expect(source.held()).toBe(first);
+    expect(state).toMatchObject({ gets: 1, probes: 0 });
+
+    state.writes = 1;
+    expect(source.held()).toBeUndefined();
+    let second = await source.snapshot();
+    source.approved(second);
+    expect(source.held()).toBe(second);
+    state.newest = 4;
+    expect(source.held()).toBeUndefined();
+  });
+
+  // Deleting a write's marker moves the revision, and so does a suggestion of the binding's own.
+  it("is not held for a write once the binding moved the revision since its fetch began, and is still read", async () => {
+    let { state, source } = countedSource();
+    let first = await source.snapshot();
+    source.approved(first);
+    state.moves = 1;
+    expect(source.held()).toBeUndefined();
+    expect(await source.snapshot()).toBe(first);
+    expect(state).toMatchObject({ gets: 1, probes: 0 });
+
+  });
+
+  it("is not held for a write when the binding moved the revision while its fetch was out", async () => {
+    let moves = 0;
+    let release: (() => void) | undefined;
+    let docsApi = {
+      getDocument: async () => {
+        let answered = docAt("r1", "Draft");
+        await new Promise<void>(resolve => { release = resolve; });
+        return answered;
+      },
+    } as unknown as GoogleDocsApi;
+    let source = driveDocSource(docsApi, {} as DriveApi, "doc-1", {
+      writes: () => 0, newestQueued: () => 0, revisionMoves: () => moves,
+    });
+    let fetched = source.snapshot();
+    await vi.waitFor(() => expect(release).toBeDefined());
+    moves = 1;
+    release!();
+    let snapshot = await fetched;
+    source.approved(snapshot);
+    expect(source.held()).toBeUndefined();
+    // A read reuses it all the same.
+    expect(await source.snapshot()).toBe(snapshot);
+  });
+
+  it("is held for a write for 24 hours after it was fetched, whatever confirmed it since", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(T);
+    let { state, source } = countedSource();
+    let first = await source.snapshot();
+    source.approved(first);
+    vi.setSystemTime(T + DOC_REVISION_PIN_MS);
+    expect(source.held()).toBe(first);
+    vi.setSystemTime(T + DOC_REVISION_PIN_MS + 1);
+    expect(source.held()).toBeUndefined();
+    expect(state).toMatchObject({ gets: 1, probes: 0 });
+
+    // A read past the TTL confirms the revision and is served the same snapshot, dated now.
+    expect(await source.snapshot()).toBe(first);
+    expect(state).toMatchObject({ gets: 1, probes: 1 });
+    expect(first.fetchedAt).toBe(T + DOC_REVISION_PIN_MS + 1);
+    // The confirmation did not make the revision id younger, and reads go on reusing it.
+    expect(source.held()).toBeUndefined();
+    expect(await source.snapshot()).toBe(first);
+    expect(state).toMatchObject({ gets: 1, probes: 1 });
+
+    // A snapshot fetched since is held.
+    state.writes = 1;
+    let second = await source.snapshot();
+    expect(second).not.toBe(first);
+    source.approved(second);
+    expect(source.held()).toBe(second);
+  });
+
+  it("is not held again once a batch was built from it, and is still read", async () => {
+    let { state, source } = countedSource();
+    let first = await source.snapshot();
+    source.approved(first);
+    source.spend(first);
+    expect(source.held()).toBeUndefined();
+    source.approved(first);
+    expect(source.held()).toBeUndefined();
+    expect(await source.snapshot()).toBe(first);
+    expect(state).toMatchObject({ gets: 1, probes: 0 });
+
+    state.newest = 4;
+    let second = await source.snapshot();
+    source.approved(second);
+    expect(source.held()).toBe(second);
   });
 });
 

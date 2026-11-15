@@ -69,7 +69,7 @@ import {
   googleDocTabLabel, googleDocTabMetadata, GoogleDocWriteMarker, GoogleDocWriteReceipt,
   invalidateGoogleDocAction, invalidateTableChangesBehind, logModelRefusal, MAX_DOC_ADDED_TABS,
   parseGoogleDocWriteReceipt, PROVISIONAL_TAB_PREFIX, REPLAY_CONTEXT, replayGoogleDocActions,
-  storeInvalidator, blankDocTabIdentity, forgetGoogleDocTab, replayGoogleDoc,
+  storeInvalidator, blankDocTabIdentity, docRevisionPins, forgetGoogleDocTab, replayGoogleDoc,
   type GoogleDocReplay, type GoogleDocTabIdentity,
 } from "./doc-actions";
 
@@ -158,13 +158,39 @@ export class GoogleDocGatekeeperImpl
     encode: encodeDocCopy,
     decode: decodeDocCopyPart,
     fetch: async () => {
+      let moves = this.#moves;
       let document = await this.#reader().getDocument(this.#documentId());
+      this.#fetched = { revision: document.revisionId, moves };
       return { base: docCopy(document), revision: document.revisionId };
     },
     // Google withholds the revision from a caller without edit access; the kit then fetches again.
     unchanged: async revision =>
       await this.#reader().getRevisionId(this.#documentId()) === revision,
   });
+  /**
+   * The revision of the stored copy an approved edit's batch was last built from. A copy at
+   * that revision builds no other: where the batch did not land, the document moved or the
+   * answer was lost, and the retry reads the document. Kept in memory, so it lasts as long as
+   * this instance: an instance started again between two attempts builds from the same copy
+   * again. The pin keeps that safe (Google applies the batch only at the copy's revision),
+   * and it costs a refused batch for each such attempt until a read replaces the copy, unless
+   * Google's refusal says nothing was written, which reads the document in the same approval.
+   */
+  #spentRevision: string | undefined;
+  /**
+   * How many writes of this binding's own moved the document's revision and left the stored copy
+   * in place: a comment write applied, a write marker deleted. A copy whose fetch began before
+   * one of them may be at the revision before it, so it builds no approved edit, which would be
+   * refused; reads serve it all the same. Counted when Google has answered, so a fetch begun
+   * after that holds the write.
+   */
+  #moves = 0;
+  /**
+   * The revision the last fetch of the copy answered and `#moves` when that fetch began. Kept in
+   * memory, as `#spentRevision` is: a copy this instance did not fetch builds an edit until the
+   * instance makes such a write.
+   */
+  #fetched: { revision: string | undefined; moves: number } | undefined;
   #simulationCache: GoogleDocSimulationCacheHolder = { writes: 0 };
 
   // The one queue for the document's writes, shared by every session: each write runs whole as
@@ -259,6 +285,8 @@ export class GoogleDocGatekeeperImpl
   #clearDocWriteReceipt(markerId: string): void {
     if (this.#readDocWriteReceipt()?.markerId === markerId) {
       this.ctx.storage.kv.delete(DOC_WRITE_RECEIPT_KEY);
+      // The marker is out of the document, and its deletion moved the revision.
+      this.#moves++;
     }
   }
 
@@ -414,7 +442,13 @@ export class GoogleDocGatekeeperImpl
       if (this.#commentJournal.get(actionId)?.state === "claimed") {
         this.#commentJournal.restorePending(actionId);
       }
-      await this.#comments.apply(actionId);
+      try {
+        await this.#comments.apply(actionId);
+      } finally {
+        // A comment anchored to text and a suggestion are batches of the document, and a send
+        // that failed may have landed: the copy held builds no edit after any of them.
+        this.#moves++;
+      }
       this.#commentAttempts.delete(actionId);
     });
   }
@@ -476,6 +510,11 @@ export class GoogleDocGatekeeperImpl
     }
     let api = new GoogleDocsApi(opts => this.#getAccessToken(opts));
     let landed: { writeMarker?: GoogleDocWriteMarker } | undefined;
+    // The definition builds the write from the stored copy, pinned to the copy's revision, where
+    // the copy can say (it keeps each tab's write markers and what the requests are built from),
+    // once for each copy, only one fetched since this binding last moved the revision itself,
+    // and no older than a revision id pins a write. Otherwise, and where
+    // Google refuses that batch, it fetches the document and builds against it as it is then.
     await docDefinition(action).apply(action, {
       api,
       documentId,
@@ -507,6 +546,16 @@ export class GoogleDocGatekeeperImpl
           this.#copy.recheck();
         }
       },
+      heldCopy: () => {
+        let held = this.#copy.held();
+        if (!held || held.revision === this.#spentRevision || !docRevisionPins(held.fetchedAt)) {
+          return undefined;
+        }
+        // A copy this instance did not fetch counts as fetched before every write it made.
+        let fetched = this.#fetched?.revision === held.revision ? this.#fetched : undefined;
+        return (fetched?.moves ?? 0) === this.#moves ? storedDocSnapshot(held) : undefined;
+      },
+      spendCopy: copy => { this.#spentRevision = copy.revisionId; },
     }, { id: actionId });
     let { writeMarker } = landed!;
     if (writeMarker) {
@@ -1410,6 +1459,27 @@ export type DocFreshness = {
   writes(): number;
   /** The newest pending edit's number, or 0: any edit queued since changes it. */
   newestQueued(): number;
+  /**
+   * How many writes of the binding's own moved the document's revision and are not counted in
+   * `writes`: a write marker deleted, a comment write applied. A snapshot whose fetch began
+   * before one is reused by reads all the same and builds no write.
+   */
+  revisionMoves(): number;
+};
+
+/** The source of a Doc opened from Drive, which also says what a write may be built from. */
+export type DriveDocSource = DocSource & {
+  /**
+   * The snapshot a read made now could still reuse, whether or not it is past the TTL, or
+   * `undefined` for none: no read of it was authorized, a write landed, the binding moved the
+   * revision (`revisionMoves`) or an edit was queued since its fetch began, a batch was built
+   * from it (`spend`), or it was fetched longer ago than a write may be pinned to its revision
+   * (`docRevisionPins`; a confirmation that it is still current does not make its revision id
+   * younger). Asks Google nothing: for a write pinned to its revision.
+   */
+  held(): GoogleDocSnapshot | undefined;
+  /** Records that a batch was built from `snapshot`: `held()` never answers it again. */
+  spend(snapshot: GoogleDocSnapshot): void;
 };
 
 /**
@@ -1422,15 +1492,24 @@ export type DocFreshness = {
  * document share the snapshot as they share its edits; a read-only session keeps its own. With
  * `freshness` a snapshot is not reused once a write has landed since it was fetched, or once an
  * edit was queued after it, which may have been checked against a newer revision; and a fetch a
- * write landed during is made again.
+ * write landed during is made again. A snapshot a read could still reuse builds one approved
+ * write, pinned to its revision, for as long after its fetch as a revision id pins one, unless
+ * the binding itself moved the revision since that fetch began (`held`).
  */
 export function driveDocSource(
   docsApi: GoogleDocReader, driveApi: DriveApi, documentId: string, freshness?: DocFreshness,
-): DocSource {
+): DriveDocSource {
   let writes = () => freshness?.writes() ?? 0;
   let queued = () => freshness?.newestQueued() ?? 0;
-  /** The writes landed, and the newest edit queued, when each snapshot was fetched. */
-  let fetchedAfter = new WeakMap<GoogleDocSnapshot, { landed: number; newest: number }>();
+  let revisionMoves = () => freshness?.revisionMoves() ?? 0;
+  /**
+   * The writes landed, the newest edit queued and the revision's moves when each snapshot was
+   * fetched, and when that was: a confirmation moves the snapshot's own `fetchedAt`.
+   */
+  let fetchedAfter = new WeakMap<
+    GoogleDocSnapshot, { landed: number; newest: number; moves: number; at: number }>();
+  /** The snapshots a write's batch was built from. Reads do not look at it. */
+  let spent = new WeakSet<GoogleDocSnapshot>();
   /** A fetch still in flight, so reads issued together observe one revision. */
   let inFlight: Promise<GoogleDocSnapshot> | undefined;
   /** The last revision a completed scope check approved, the only one a later read may reuse. */
@@ -1439,6 +1518,7 @@ export function driveDocSource(
     for (;;) {
       let landed = writes();
       let newest = queued();
+      let moves = revisionMoves();
       // An edit queued while a request was out may have been checked against a newer revision
       // than the one it answers, so the replay over it would fail that edit.
       let moved = () => landed !== writes() || newest !== queued();
@@ -1457,7 +1537,7 @@ export function driveDocSource(
       let snapshot = googleDocSnapshot(await docsApi.getDocument(documentId));
       // Fetched before a write landed, it would read the edit as neither made nor pending.
       if (moved()) continue;
-      fetchedAfter.set(snapshot, { landed, newest });
+      fetchedAfter.set(snapshot, { landed, newest, moves, at: snapshot.fetchedAt });
       return snapshot;
     }
   };
@@ -1467,6 +1547,14 @@ export function driveDocSource(
     approved: snapshot => {
       if (snapshot.fetchedAt >= (approved?.fetchedAt ?? 0)) approved = snapshot;
     },
+    held: () => {
+      let seen = approved && fetchedAfter.get(approved);
+      return approved && seen && !spent.has(approved) &&
+          seen.landed === writes() && seen.newest === queued() &&
+          seen.moves === revisionMoves() && docRevisionPins(seen.at)
+        ? approved : undefined;
+    },
+    spend: snapshot => { spent.add(snapshot); },
     metadata: async () => {
       let file = await driveApi.getFile(documentId);
       return { title: file.name, modifiedAt: driveModifiedTime(file).valueOf() };

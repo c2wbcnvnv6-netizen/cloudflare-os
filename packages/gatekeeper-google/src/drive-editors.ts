@@ -23,7 +23,7 @@ import {
   type GoogleDocSimulationCacheHolder, type GoogleDocWriteReceipt,
 } from "./doc-actions";
 import { closesTableGate } from "./docs-tables";
-import type { DocChangeQueue, DocFreshness, DocSource } from "./docs";
+import type { DocChangeQueue, DocFreshness, DocSource, DriveDocSource } from "./docs";
 import type { DriveApi, DriveScopeNode } from "./drive-api";
 import {
   GOOGLE_DOC_MIME_TYPE, GOOGLE_SHEET_MIME_TYPE, GOOGLE_SLIDES_MIME_TYPE,
@@ -343,9 +343,13 @@ export class DriveFileEditors {
    * Each document's replay and writes landed, kept beside its QueuedChanges for the activation:
    * a read waiting on Google when a write lands reads again, and no session reuses a snapshot
    * from before it. `source` is the snapshot its sessions share, held for the documents opened
-   * most recently, which the map's order tells.
+   * most recently, which the map's order tells. `moves` counts the binding's writes that moved
+   * the document's revision and are not among the writes landed: a snapshot fetched before one
+   * builds no write.
    */
-  #docCaches = new Map<string, { cache: GoogleDocSimulationCacheHolder; source?: DocSource }>();
+  #docCaches = new Map<string, {
+    cache: GoogleDocSimulationCacheHolder; source?: DriveDocSource; moves: number;
+  }>();
 
   constructor(options: DriveFileEditorsOptions) {
     this.#options = options;
@@ -442,6 +446,7 @@ export class DriveFileEditors {
     return {
       writes: () => this.#docCache(fileId).writes,
       newestQueued: () => Math.max(0, ...this.#docsPending(fileId).map(({ id }) => id)),
+      revisionMoves: () => this.#docEntry(fileId).moves,
     };
   }
 
@@ -452,7 +457,7 @@ export class DriveFileEditors {
    * keeps those of the `MAX_DOC_SOURCES` documents opened most recently; a session opened on
    * another keeps the source it was given.
    */
-  docsSource(fileId: string, open: (freshness: DocFreshness) => DocSource): DocSource {
+  docsSource(fileId: string, open: (freshness: DocFreshness) => DriveDocSource): DocSource {
     let entry = this.#docEntry(fileId);
     // Insertion order is recency: the entry moves to the end, and only its source is ever cleared,
     // since a session still open on a source let go compares the writes counted in `cache`.
@@ -462,6 +467,17 @@ export class DriveFileEditors {
     let held = [...this.#docCaches.values()].filter(({ source }) => source);
     for (let stale of held.slice(0, -MAX_DOC_SOURCES)) stale.source = undefined;
     return entry.source;
+  }
+
+  /**
+   * Records that a comment write of the binding's reached file `fileId`, or may have. In a
+   * Google Doc one anchored to text, and a suggestion, is a batch of the document, which moves
+   * its revision: the snapshot held of a document then builds no write. Does nothing for a file
+   * no session opened as a document.
+   */
+  commented(fileId: string): void {
+    let entry = this.#docCaches.get(fileId);
+    if (entry) entry.moves++;
   }
 
   /** The host an approved edit to document `fileId` is written with. */
@@ -474,7 +490,10 @@ export class DriveFileEditors {
       mimeType: async () => (await this.#options.drive.getFile(fileId)).mimeType,
       receipt: () => this.#docReceipt(fileId),
       clearReceipt: markerId => {
-        if (this.#docReceipt(fileId)?.markerId === markerId) kv.delete(key);
+        if (this.#docReceipt(fileId)?.markerId !== markerId) return;
+        kv.delete(key);
+        // The marker is out of the document, and its deletion moved the revision.
+        this.#docEntry(fileId).moves++;
       },
       saved: () => { throw new Error("A Drive binding adds no Doc tabs."); },
       // The record is the action set's to retire, once this returns: the marker is deleted only
@@ -493,6 +512,9 @@ export class DriveFileEditors {
         this.#failTableChangesBehind(
           fileId, id, action, `Pending Google Doc edit could not be applied after edit ${id} failed`);
       },
+      // The source's own rules say when its snapshot may build a write.
+      heldCopy: () => this.#docEntry(fileId).source?.held(),
+      spendCopy: copy => this.#docEntry(fileId).source?.spend(copy),
     };
   }
 
@@ -586,7 +608,7 @@ export class DriveFileEditors {
 
   #docEntry(fileId: string) {
     let entry = this.#docCaches.get(fileId);
-    if (!entry) this.#docCaches.set(fileId, entry = { cache: { writes: 0 } });
+    if (!entry) this.#docCaches.set(fileId, entry = { cache: { writes: 0 }, moves: 0 });
     return entry;
   }
 

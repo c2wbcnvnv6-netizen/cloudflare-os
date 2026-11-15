@@ -1,5 +1,7 @@
 import { abortAllDurableObjects, env, runInDurableObject } from "cloudflare:test";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach, beforeEach, describe, expect, it, vi, type MockInstance,
+} from "vitest";
 import type { ActionField } from "@gadgets/workshop-shared/gatekeeper";
 import {
   docTabToMarkdown, LIST_LEVEL_TOO_DEEP, MARKDOWN_RENDERING_VERSION, POSITIONED_ITEM_BEFORE,
@@ -20,6 +22,7 @@ import {
 } from "../doc-fixture";
 import { DriveFiles, DOC_MIME as DRIVE_DOC_MIME, FOLDER_MIME } from "../drive-files";
 import { serveFakes, type ProviderFake } from "../slides-provider";
+import { DOC_REVISION_PIN_MS } from "../../src/doc-actions";
 import { GoogleDocEditSessionImpl } from "../../src/docs";
 
 /**
@@ -440,6 +443,9 @@ class DocsModel {
       return Response.json({
         id: "doc-1", name: "Test document", modifiedTime: this.driveModifiedTime,
         ...this.driveMimeType ? { mimeType: this.driveMimeType } : {},
+        // Only to the request that asks whether the account may comment on the file.
+        ...url.searchParams.get("fields")?.includes("canComment")
+          ? { capabilities: { canComment: this.canComment } } : {},
       });
     }
     if (url.hostname !== "docs.googleapis.com") {
@@ -996,6 +1002,77 @@ type WriteMethod = Parameters<ReturnType<typeof hooks>["submitEdit"]>[1];
 function edit(facet: string, method: WriteMethod, ...args: unknown[]) {
   return Promise.resolve(hooks().submitEdit(facet, method, args));
 }
+
+/** What a request to the Docs API is, as the approval tests order them; `undefined` for another host's. */
+function docsRequestKind(
+  input: string | URL | Request, init?: RequestInit,
+): "read" | "probe" | "content" | "cleanup" | "other" | undefined {
+  let url = new URL(input instanceof Request ? input.url : input.toString());
+  if (url.hostname !== "docs.googleapis.com") return undefined;
+  if (url.pathname.endsWith(":batchUpdate")) {
+    let { requests } = JSON.parse(String(init?.body)) as { requests: object[] };
+    return requests.every(request => "deleteNamedRange" in request) ? "cleanup" : "content";
+  }
+  if (url.searchParams.get("fields") === "revisionId") return "probe";
+  // As the model counts `documentFetches`: a read with no field mask, comments aside.
+  return url.searchParams.has("fields") || url.searchParams.has("commentsViewMode") ? "other" : "read";
+}
+
+/** How many requests the installed model has been sent. */
+const requestsMade = () => vi.mocked(fetch).mock.calls.length;
+
+/**
+ * The requests the Docs API was sent after the first `from` the model received, in order: a full
+ * read of the document, a probe of its revision, a batch that carries content (applied or
+ * refused) and the deletion of a marker.
+ */
+const docsRequestsSince = (from: number) => vi.mocked(fetch).mock.calls.slice(from)
+  .flatMap(([input, init]) => docsRequestKind(input, init) ?? []);
+
+/** Makes `change` once, when the next batch that carries content is on its way to Google. */
+function whileWriting(change: () => void): void {
+  let model = globalThis.fetch;
+  let waiting = true;
+  vi.stubGlobal("fetch", vi.fn((input: string | URL | Request, init?: RequestInit) => {
+    if (waiting && docsRequestKind(input, init) === "content") {
+      waiting = false;
+      change();
+    }
+    return model(input, init);
+  }));
+}
+
+/** The lines logged of a batch built from the copy held that was not accepted. */
+const copyRefusals = (warn: MockInstance<typeof console.warn>) =>
+  warn.mock.calls.map(([line]) => line as Record<string, unknown>)
+    .filter(line => line?.event === "google.doc.action.apply.copy-refused");
+
+/**
+ * A document of two paragraphs, read, with an append queued and read again. Through Drive the
+ * second read fetches the snapshot a write may be built from: the first predates the edit.
+ */
+async function queuedOnCopy(facet: string, arrange: (docs: DocsModel) => void = () => {}) {
+  let docs = new DocsModel();
+  docs.setText(MAIN_TAB, "Alpha\nBeta");
+  arrange(docs);
+  docs.install();
+  expect(await hooks().readContent(facet)).toBe("Alpha\n\nBeta\n");
+  let actionId = await hooks().submitAppend(facet, "Appended");
+  expect(await hooks().readContent(facet)).toBe("Alpha\n\nBeta\n\nAppended\n");
+  return { docs, actionId };
+}
+/** Approves one more append, queued on a read made now and read once more, and tells its requests. */
+async function nextOnCopy(facet: string): Promise<string[]> {
+  await hooks().readContent(facet);
+  let actionId = await hooks().submitAppend(facet, "Third");
+  await hooks().readContent(facet);
+  let from = requestsMade();
+  expect(await hooks().applyAction(facet, actionId)).toBeNull();
+  return docsRequestsSince(from);
+}
+
+/** `queuedOnCopy`'s document once a collaborator has changed its first paragraph. */
+const COLLABORATOR = "Alpha by a collaborator\nBeta";
 
 /** Move the clock past the snapshot's time to live, so the next read asks Google again. */
 function passSnapshotTtl(): void {
@@ -3845,6 +3922,301 @@ describe.each(RUNS)("Google Doc write receipts, $name", r => {
     run.appliedAgain(await hooks().applyAction("ambiguous", actionId));
   });
 
+  // -------------------------------------------------------------------------
+  // An approved edit built from the copy held
+  // -------------------------------------------------------------------------
+
+  it("applies an approved edit from the copy held, reading no document before the write", async () => {
+    let warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let facet = "copy-apply";
+    let { docs, actionId } = await queuedOnCopy(facet);
+    let from = requestsMade();
+    expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    // The batch and the deletion of its marker: nothing is queued behind to read the document for.
+    expect(docsRequestsSince(from)).toEqual(["content", "cleanup"]);
+    expect(docs.contentBatches).toBe(1);
+    expect(docs.markers.size).toBe(0);
+    expect(docs.text()).toBe("Alpha\nBeta\nAppended");
+    expect(copyRefusals(warn)).toEqual([]);
+    expect(await hooks().readContent(facet)).toBe("Alpha\n\nBeta\n\nAppended\n");
+  });
+
+  // The suggestion is a batch of the document, so the copy read before it is a revision behind:
+  // a batch pinned to it would be refused with nobody else editing.
+  // Bound alone: a Drive binding's comment writes are its session's, tried in the Drive block.
+  it.skipIf(r.drive).each(["suggestEdit", "comment"] as const)(
+    "reads the document for an approved edit once the connection's own %s has been applied",
+    async method => {
+      let warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      let facet = `copy-own-${method}`;
+      let { docs, actionId } = await queuedOnCopy(facet);
+      let own = await hooks().callDoc(facet, method,
+        method === "comment" ? ["Really?", { quote: "Alpha" }] : ["Beta", "Gamma"]);
+      expect(await hooks().applyAction(facet, own.actionId!)).toBeNull();
+
+      let from = requestsMade();
+      expect(await hooks().applyAction(facet, actionId)).toBeNull();
+      expect(docsRequestsSince(from)).toEqual(["read", "content", "cleanup"]);
+      expect(copyRefusals(warn)).toEqual([]);
+      expect(docs.contentBatches).toBe(1);
+      // A copy read after it builds a write again.
+      expect(await nextOnCopy(facet)).toEqual(["content", "cleanup"]);
+    });
+
+  // The read fetches the document with the first edit's marker still in it, and the deletion
+  // then moves the revision: nothing else tells that copy from a current one. The answer can
+  // also reach the connection after the deletion's has.
+  it.each([
+    ["while the marker was being deleted", false],
+    ["before the marker was deleted, in an answer that came after", true],
+  ] as const)("reads the document for an approved edit when the copy was read %s", async (_when, late) => {
+    let warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let facet = `copy-read-in-cleanup-${late ? "late" : "inside"}`;
+    let { docs, actionId } = await queuedOnCopy(facet);
+    let second = await hooks().submitAppend(facet, "Second");
+    await hooks().readContent(facet);
+
+    let model = globalThis.fetch;
+    let markersRead: number[] = [];
+    let reading: Promise<string> | undefined;
+    let answered: (() => void) | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      let kind = docsRequestKind(input, init);
+      if (markersRead.length === 0 && kind === "cleanup") {
+        markersRead.push(docs.markers.size);
+        if (late) {
+          let asked = new Promise<void>(resolve => { answered = resolve; });
+          reading = hooks().readContent(facet);
+          await asked;
+        } else {
+          await hooks().readContent(facet);
+        }
+      } else if (answered && kind === "read") {
+        let deliver = answered;
+        answered = undefined;
+        let answer = await model(input, init);
+        deliver();
+        // A timer, which a Drive binding's apply does not hang on as it does on a held promise.
+        await new Promise(resolve => setTimeout(resolve, 50));
+        return answer;
+      }
+      return model(input, init);
+    }));
+    expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    await reading;
+    expect(markersRead).toEqual([1]);
+
+    let from = requestsMade();
+    expect(await hooks().applyAction(facet, second)).toBeNull();
+    expect(docsRequestsSince(from)).toEqual(["read", "content", "cleanup"]);
+    expect(copyRefusals(warn)).toEqual([]);
+    expect(docs.text()).toBe("Alpha\nBeta\nAppended\nSecond");
+    // A copy read after the deletion builds a write again.
+    expect(await nextOnCopy(facet)).toEqual(["content", "cleanup"]);
+  });
+
+  describe("a revision id returned 24 hours ago", () => {
+    const T = Date.UTC(2026, 0, 1);
+
+    it("builds an approved edit from a copy fetched exactly 24 hours ago", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(T);
+      let facet = "copy-day-old";
+      let { docs, actionId } = await queuedOnCopy(facet);
+      vi.setSystemTime(T + DOC_REVISION_PIN_MS);
+      let from = requestsMade();
+      expect(await hooks().applyAction(facet, actionId)).toBeNull();
+      expect(docsRequestsSince(from)).toEqual(["content", "cleanup"]);
+      expect(docs.contentBatches).toBe(1);
+      expect(await hooks().readContent(facet)).toBe("Alpha\n\nBeta\n\nAppended\n");
+    });
+
+    it("reads the document for one fetched a millisecond before that", async () => {
+      let warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(T);
+      let facet = "copy-older-than-a-day";
+      let { docs, actionId } = await queuedOnCopy(facet);
+      vi.setSystemTime(T + DOC_REVISION_PIN_MS + 1);
+      // Past the TTL the copy is confirmed by its revision and not fetched: it is still the copy
+      // held, and the check that confirmed it does not make its revision id younger.
+      let from = requestsMade();
+      expect(await hooks().readContent(facet)).toBe("Alpha\n\nBeta\n\nAppended\n");
+      expect(docsRequestsSince(from)).toEqual(["probe"]);
+
+      from = requestsMade();
+      expect(await hooks().applyAction(facet, actionId)).toBeNull();
+      expect(docsRequestsSince(from)).toEqual(["read", "content", "cleanup"]);
+      expect(docs.contentBatches).toBe(1);
+      expect(copyRefusals(warn)).toEqual([]);
+      expect(await hooks().readContent(facet)).toBe("Alpha\n\nBeta\n\nAppended\n");
+    });
+  });
+
+  // Through Drive too, where this is the test of a collaborator's edit beside a write.
+  it("applies an approved edit over a collaborator's edit made since the copy was fetched", async () => {
+    let warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let facet = "copy-stale";
+    let { docs, actionId } = await queuedOnCopy(facet);
+    docs.externalEdit(MAIN_TAB, COLLABORATOR);
+    let from = requestsMade();
+    expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    // Google refuses the batch pinned to the copy's revision, so the document is read and the
+    // edit built against it: one read more than an approval the copy serves.
+    expect(docsRequestsSince(from)).toEqual(["content", "read", "content", "cleanup"]);
+    expect(docs.contentBatches).toBe(1);
+    expect(docs.text()).toBe(`${COLLABORATOR}\nAppended`);
+    expect(await hooks().readContent(facet)).toBe("Alpha by a collaborator\n\nBeta\n\nAppended\n");
+
+    let [line, ...more] = copyRefusals(warn);
+    expect(more).toEqual([]);
+    expect(line).toMatchObject({
+      actionId, operation: "appendText", failure: "absent", providerStatus: "INVALID_ARGUMENT",
+      fallback: "read",
+    });
+    expect(JSON.stringify(line)).not.toMatch(/Alpha|Beta|collaborator|Appended|revision-/);
+  });
+
+  it("writes nothing over a collaborator's edit that lands while the write is on its way", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    let facet = "copy-raced";
+    let { docs, actionId } = await queuedOnCopy(facet);
+    whileWriting(() => docs.externalEdit(MAIN_TAB, COLLABORATOR));
+    expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    // The batch built from the copy was refused, and the edit applied on top of the collaborator's.
+    expect(docsRequestsSince(0)).toEqual(["content", "read", "content", "cleanup"]);
+    expect(docs.contentBatches).toBe(1);
+    expect(docs.text()).toBe(`${COLLABORATOR}\nAppended`);
+
+    // The collaborator takes the text the edit replaces: it fails as it does on a fresh read.
+    let taken = new DocsModel();
+    taken.setText(MAIN_TAB, "Alpha\nBeta");
+    taken.install();
+    facet = "copy-raced-taken";
+    expect(await hooks().readContent(facet)).toBe("Alpha\n\nBeta\n");
+    let replaced = await hooks().submitReplace(facet, "Beta", "Gamma");
+    expect(await hooks().readContent(facet)).toBe("Alpha\n\nGamma\n");
+    whileWriting(() => taken.externalEdit(MAIN_TAB, "Alpha\nDelta"));
+    expect(await hooks().applyAction(facet, replaced))
+      .toContain("replaceText: oldMarkdown was not found");
+    expect(docsRequestsSince(0)).toEqual(["content", "read"]);
+    expect(taken.contentBatches).toBe(0);
+    expect(taken.text()).toBe("Alpha\nDelta");
+  });
+
+  it("settles a write whose answer was lost from the copy a read stored since", async () => {
+    let facet = "copy-holds-marker";
+    let { docs, actionId } = await queuedOnCopy(facet, model => { model.ambiguousContentResponses = 1; });
+    expect(await hooks().applyAction(facet, actionId)).toMatch(/content response lost/);
+    expect(docs.contentBatches).toBe(1);
+
+    // The read fetches the document the write moved: its copy holds the write's marker.
+    passSnapshotTtl();
+    expect(await hooks().readContent(facet)).toBe("Alpha\n\nBeta\n\nAppended\n");
+    let from = requestsMade();
+    expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    // Settled from the copy: nothing is read or written before the marker is deleted.
+    expect(docsRequestsSince(from)).toEqual(["cleanup"]);
+    expect(docs.contentBatches).toBe(1);
+    expect(docs.markers.size).toBe(0);
+    expect(docs.text()).toBe("Alpha\nBeta\nAppended");
+  });
+
+  it("reads the document at the next approval when the refusal of a stale copy's batch carries no status", async () => {
+    let warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let facet = "copy-stale-no-status";
+    let { docs, actionId } = await queuedOnCopy(facet, model => { model.stalePinStatus = undefined; });
+    docs.externalEdit(MAIN_TAB, COLLABORATOR);
+
+    // A refusal that does not say whether the batch applied fails the approval: the batch may
+    // have applied.
+    let from = requestsMade();
+    let failed = await hooks().applyAction(facet, actionId);
+    expect(failed).toBe("Google Docs batch update document failed [http=400]");
+    expect(docsRequestsSince(from)).toEqual(["content"]);
+    expect(docs.contentBatches).toBe(0);
+    expect(docs.text()).toBe(COLLABORATOR);
+    let [line, ...more] = copyRefusals(warn);
+    expect(more).toEqual([]);
+    expect(line).toMatchObject({ actionId, operation: "appendText", failure: "unknown", fallback: "retry" });
+    expect(line.providerStatus).toBeUndefined();
+
+    // The copy built its one batch: tried again, the approval reads the document.
+    from = requestsMade();
+    expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    expect(docsRequestsSince(from)).toEqual(["read", "content", "cleanup"]);
+    expect(docs.contentBatches).toBe(1);
+    expect(docs.markers.size).toBe(0);
+    expect(docs.text()).toBe(`${COLLABORATOR}\nAppended`);
+    expect(copyRefusals(warn)).toHaveLength(1);
+  });
+
+  it("settles a write whose answer was lost at the next approval when the refusal of a stale pin carries no status", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let facet = "copy-lost-no-status";
+    let { docs, actionId } = await queuedOnCopy(facet, model => {
+      model.stalePinStatus = undefined;
+      model.ambiguousContentResponses = 1;
+    });
+    expect(await hooks().applyAction(facet, actionId)).toMatch(/content response lost/);
+    expect(docs.contentBatches).toBe(1);
+
+    // No read between: the copy is the one the lost write was built from, and builds no other.
+    let from = requestsMade();
+    expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    expect(docsRequestsSince(from)).toEqual(["read", "cleanup"]);
+    expect(docs.contentBatches).toBe(1);
+    expect(docs.markers.size).toBe(0);
+    expect(docs.text()).toBe("Alpha\nBeta\nAppended");
+  });
+
+  // Bound alone: a Drive binding stores no copy for a rejection to replay over.
+  it.skipIf(r.drive)("replays the queue over the copy held when an edit is rejected after its approval failed", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let docs = docsWithBody(tableBody());
+    docs.unsentContentRequests = 1;
+    let facet = "copy-kept-for-rejection";
+    let above = await edit(
+      facet, "insertTable", { rows: 1, columns: 1, cells: [["New"]], after: "Before" });
+    let rows = await edit(facet, "insertTableRows", { table: 1, cells: [["Ship docs", "Open"]] });
+
+    // The batch built from the copy never reached Google. The copy is not retired with it.
+    expect(await hooks().applyAction(facet, above.actionId)).toMatch(/connection dropped/);
+    expect(docs.contentBatches).toBe(0);
+    await hooks().rejectAction(facet, above.actionId);
+
+    // As in 'follows a table past a rejected insertion above it': the change behind is kept.
+    let preview = `Before\n\n${tableOf([...TABLE_ROWS, ["Ship docs", "Open"]])}\n\nAfter\n`;
+    expect(await hooks().readContent(facet)).toBe(preview);
+    expect(await hooks().applyAction(facet, rows.actionId)).toBeNull();
+    passSnapshotTtl();
+    expect(await hooks().readContent(facet)).toBe(preview);
+    expect(docs.contentBatches).toBe(1);
+  });
+
+  it("reads the document to delete an earlier write's marker before the next edit is built", async () => {
+    let docs = new DocsModel();
+    docs.cleanupFailures = 1;
+    docs.install();
+    let facet = "copy-behind-receipt";
+    let firstId = await hooks().submitAppend(facet, "first");
+    expect(await hooks().applyAction(facet, firstId)).toBeNull();
+    let [firstMarker] = docs.markers.keys();
+    expect(firstMarker).toBeDefined();
+
+    expect(await hooks().readContent(facet)).toBe("first\n");
+    let secondId = await hooks().submitAppend(facet, "second");
+    let from = requestsMade();
+    expect(await hooks().applyAction(facet, secondId)).toBeNull();
+    // The marker's deletion moves the revision, so the edit is built against the read after it.
+    expect(docsRequestsSince(from).slice(0, 4)).toEqual(["read", "cleanup", "read", "content"]);
+    expect(docs.deletedMarkerIds).toContain(firstMarker);
+    expect(docs.maxMarkerCount).toBe(1);
+    expect(docs.contentBatches).toBe(2);
+    expect(docs.text()).toBe("first\nsecond");
+  });
+
   // Restarts every object, the Drive binding's receipt included (drive-editors.test.ts).
   it.skipIf(r.drive)("cleans a retained receipt after restart before the next write", async () => {
     let docs = new DocsModel();
@@ -5750,6 +6122,34 @@ describe("Google Doc stored layout", () => {
       .toMatchObject({ meta: { version: 2, formatVersion: 3 } });
   });
 
+  it("reads a copy stored without its write markers as absent, and approves over the document fetched in its place", async () => {
+    let docs = new DocsModel();
+    docs.setText(MAIN_TAB, "base");
+    docs.install();
+    let facet = "stored-layout-no-markers";
+    expect(await hooks().readContent(facet)).toBe("base\n");
+    let actionId = await hooks().submitAppend(facet, "first");
+    let index = (await stored(facet, "docCopy:doc:manifest")).kv as { meta: Record<string, unknown> };
+    expect(index.meta).toMatchObject({ formatVersion: 3 });
+
+    // The format whose tab partitions held the write ids alone: they are never read.
+    await hooks().applyStorage(facet, [{
+      kind: "put", key: "docCopy:doc:manifest",
+      value: { ...index, meta: { ...index.meta, formatVersion: 2 } },
+    }]);
+    await hooks().restartDoc(facet);
+
+    let from = requestsMade();
+    expect(await hooks().applyAction(facet, actionId)).toBeNull();
+    // No copy could build the write, so the document was fetched before it.
+    expect(docsRequestsSince(from)).toEqual(["read", "content", "cleanup"]);
+    expect(docs.text()).toBe("base\nfirst");
+
+    expect(await hooks().readContent(facet)).toBe("base\n\nfirst\n");
+    expect((await stored(facet, "docCopy:doc:manifest")).kv)
+      .toMatchObject({ meta: { version: 2, formatVersion: 3 } });
+  });
+
   it("fetches the document again after a stored copy whose outline does not match its tabs", async () => {
     let docs = nestedDocs();
     let facet = "stored-layout-outline-mismatch";
@@ -5915,6 +6315,47 @@ describe("Google Doc edits through a read and write Drive binding", () => {
       action: { kind: string; payload: { change: { writeId: string } } };
     };
   }
+
+  // The snapshot the binding's sessions share builds a write under the rules that let a read
+  // reuse it: fetched since the newest edit was queued, and no write landed since.
+  it("builds an approved edit from the snapshot its sessions share only while a read could reuse it", async () => {
+    let docs = draft();
+    let facet = "drive-copy-apply";
+    let appended = await hooks().submitAppend(facet, "Appended");
+    expect(await hooks().readContent(facet)).toBe("Draft\n\nAppended\n");
+    let from = requestsMade();
+    expect(await hooks().applyAction(facet, appended)).toBeNull();
+    expect(docsRequestsSince(from)).toEqual(["content", "cleanup"]);
+
+    // Queued on the read that prepared it, with no read since: the document is fetched.
+    let replaced = await hooks().submitReplace(facet, "Draft", "Final");
+    from = requestsMade();
+    expect(await hooks().applyAction(facet, replaced)).toBeNull();
+    expect(docsRequestsSince(from)).toEqual(["read", "content", "cleanup"]);
+    expect(docs.text()).toBe("Final\nAppended");
+    expect(docs.contentBatches).toBe(2);
+  });
+
+  // The binding's own suggestion is a batch of the document, which no count of its edits tells.
+  it.each([
+    ["suggestEdit", ["doc-1", "Draft", "Final"]],
+    ["comment", ["doc-1", "Really?", { quote: "Draft" }]],
+  ] as const)("reads the document for an approved edit once the binding's own %s has been applied", async (method, args) => {
+    let warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let docs = draft();
+    let facet = `drive-copy-own-${method}`;
+    let appended = await hooks().submitAppend(facet, "Appended");
+    expect(await hooks().readContent(facet)).toBe("Draft\n\nAppended\n");
+    let own = await rawHooks().callDrive(`drive:${facet}`, DRIVE_DOC, method, [...args]);
+    expect(own.error).toBeUndefined();
+    expect(await hooks().applyAction(facet, own.actionId!)).toBeNull();
+
+    let from = requestsMade();
+    expect(await hooks().applyAction(facet, appended)).toBeNull();
+    expect(docsRequestsSince(from)).toEqual(["read", "content", "cleanup"]);
+    expect(copyRefusals(warn)).toEqual([]);
+    expect(docs.contentBatches).toBe(1);
+  });
 
   // The write has landed and the action set has retired the record, so nothing replays the
   // append; its marker is still in the document. Reads are made from inside the marker's deletion

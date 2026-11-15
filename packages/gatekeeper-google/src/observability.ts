@@ -9,6 +9,10 @@ export type GoogleObservabilityFields = {
   commentId: string;
   conversionKind: string;
   copyFileId: string;
+  /** How a write that failed was read (`docsWriteFailure`): refused whole, refused for rate, or unknown. */
+  failure: string;
+  /** What an operation does after an attempt of it was not accepted. */
+  fallback: string;
   fileId: string;
   folderId: string;
   /** Whether a converted PDF had a text layer. */
