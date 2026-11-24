@@ -1,0 +1,3 @@
+Retired 2026-11-24 with Josh's approval to handle Cloudflare OS Lab at the agent's recommendation.
+The third-party lab was COOLING with no running process or LaunchAgent and is not an estate production dependency.
+Custom estate commits are preserved on the existing fork branch estate-cleanup-20261124. Kokoro remains a separate reference checkout.
